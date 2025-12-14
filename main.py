@@ -620,6 +620,7 @@ async def update_db_structure():
                 'referral_count': 'INTEGER DEFAULT 0',
                 'total_referral_earned': 'BIGINT DEFAULT 0',
                 'has_started_bonus': 'BOOLEAN DEFAULT 0',
+                'last_collected': 'INTEGER DEFAULT 0',
                 'plasma': 'BIGINT DEFAULT 0',
                 'bitcoin': 'REAL DEFAULT 0',
                 'mining_gpu_count': 'INTEGER DEFAULT 0',
@@ -1220,6 +1221,50 @@ async def buy_business(uid: int, business_id: int):
         print(f"❌ Ошибка: {e}")
         return False, f"❌ Ошибка покупки: {e}"
 
+        # === БИЗНЕС: РАСЧЁТ ДОХОДА ===
+import time
+
+def calculate_business_income(business):
+    now = int(time.time())
+    last_collect = business['last_collect']
+
+    elapsed = now - last_collect
+    if elapsed < 60:
+        return 0, 0
+
+    minutes = elapsed // 60
+    income = minutes * business['income_per_minute']
+    return income, minutes
+
+    # === БИЗНЕС: СБОР ДОХОДА ===
+async def collect_business_income(uid: int, business_id: int):
+    business = await get_business(uid, business_id)
+
+    income, minutes = calculate_business_income(business)
+
+    if income <= 0:
+        return False, "⏳ Доход пока не накопился"
+
+    now = int(time.time())
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE businesses
+            SET last_collect = ?
+            WHERE id = ? AND user_id = ?
+        """, (now, business_id, uid))
+
+        await db.execute("""
+            UPDATE users
+            SET balance = balance + ?
+            WHERE id = ?
+        """, (income, uid))
+
+        await db.commit()
+
+    return True, f"💰 Получено {format_money(income)} за {minutes} мин."
+
+
 async def upgrade_business(uid: int, business_id: int):
     """Улучшить бизнес"""
     user_businesses = await get_user_businesses(uid)
@@ -1293,7 +1338,7 @@ async def refill_products(uid: int, business_id: int):
         return False, f"Ошибка пополнения: {e}"
 
 async def collect_business_profit(uid: int, business_id: int):
-    """Собрать прибыль с бизнеса (ИСПРАВЛЕННАЯ ВЕРСИЯ)"""
+    """Собрать прибыль с бизнеса (С ОГРАНИЧЕНИЕМ ВРЕМЕНИ - 1 раз в час)"""
     user_businesses = await get_user_businesses(uid)
     if business_id not in user_businesses:
         return False, "У вас нет этого бизнеса"
@@ -1305,27 +1350,39 @@ async def collect_business_profit(uid: int, business_id: int):
     if user_business['product_amount'] <= 0:
         return False, "Недостаточно продуктов. Пополните бизнес."
     
-    # Полностью используем все продукты
+    # Проверяем время с последнего сбора
+    current_time = int(time.time())
+    last_collected = user_business.get('last_collected', 0)
+    
+    # Минимальное время между сборами - 1 час (3600 секунд)
+    time_since_last_collect = current_time - last_collected
+    
+    if time_since_last_collect < 3600:
+        remaining_time = 3600 - time_since_last_collect
+        minutes = remaining_time // 60
+        seconds = remaining_time % 60
+        return False, f"⏳ Прибыль можно собирать раз в час!\nПодождите еще: {minutes}:{seconds:02d}"
+    
+    # Рассчитываем прибыль
     profit_per_hour = business_data['profit_per_hour'] * (business_data['upgrade_multiplier'] ** (user_business['level'] - 1))
     
-    # Прибыль = продукты * (прибыль_в_час / емкость)
-    # Это означает, что если продукты заполнены на 100%, то можно собрать прибыль за 1 час
-    profit_multiplier = user_business['product_amount'] / business_data['product_capacity']
-    profit = int(profit_per_hour * profit_multiplier)
+    # Используем все продукты за один раз (прибыль за 1 час)
+    profit = int(profit_per_hour * (user_business['product_amount'] / business_data['product_capacity']))
     
     if profit <= 0:
         return False, "Недостаточно продуктов. Пополните бизнес."
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
+            # Начисляем прибыль
             await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (profit, uid))
             
-            # Продукты полностью расходуются
+            # Обнуляем продукты и обновляем время сбора
             await db.execute("""
                 UPDATE businesses 
                 SET product_amount = 0, last_collected = ?
                 WHERE user_id = ? AND business_id = ?
-            """, (int(time.time()), uid, business_id))
+            """, (current_time, uid, business_id))
             
             await db.commit()
             return True, profit
@@ -2013,24 +2070,6 @@ async def handle_all_commands(msg: Message):
     if cmd in ['инвестировать', 'инвест', 'investment']:
         await show_investments_panel(msg)
         return
-    
-    # Админ команды
-    if msg.from_user.id in ADMIN_IDS:
-        if cmd == 'выдать' and len(parts) >= 2:
-            if msg.reply_to_message:
-                await process_admin_give_reply(msg, parts)
-                return
-            elif len(parts) >= 3:
-                await process_admin_give(msg, parts)
-                return
-        
-        if cmd == 'забрать' and len(parts) >= 2:
-            if msg.reply_to_message:
-                await process_admin_take_reply(msg, parts)
-                return
-            elif len(parts) >= 3:
-                await process_admin_take(msg, parts)
-                return
     
     # Сложные команды с аргументами
     if len(parts) >= 2:
@@ -3585,6 +3624,11 @@ async def process_admin_take(msg: Message, parts: list):
 # =======================================
 @router.message(F.text.lower().startswith("выдать"))
 async def cmd_give_text(msg: Message):
+    # Проверяем права администратора
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
     parts = msg.text.split()
     if msg.reply_to_message:
         await process_admin_give_reply(msg, parts)
@@ -3593,6 +3637,11 @@ async def cmd_give_text(msg: Message):
 
 @router.message(F.text.lower().startswith("забрать"))
 async def cmd_take_text(msg: Message):
+    # Проверяем права администратора
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
     parts = msg.text.split()
     if msg.reply_to_message:
         await process_admin_take_reply(msg, parts)
@@ -3747,11 +3796,29 @@ async def cmd_transfer_slash(msg: Message, command: CommandObject):
 
 @router.message(Command("выдать"))
 async def cmd_give_slash(msg: Message):
-    await handle_all_commands(msg)
+    # Проверяем права администратора
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    parts = msg.text.split()
+    if msg.reply_to_message:
+        await process_admin_give_reply(msg, parts)
+    else:
+        await process_admin_give(msg, parts)
 
 @router.message(Command("забрать"))
 async def cmd_take_slash(msg: Message):
-    await handle_all_commands(msg)
+    # Проверяем права администратора
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    parts = msg.text.split()
+    if msg.reply_to_message:
+        await process_admin_take_reply(msg, parts)
+    else:
+        await process_admin_take(msg, parts)
 
 @router.message(Command("бизнесы", "business"))
 async def cmd_businesses_slash(msg: Message):
@@ -3949,7 +4016,7 @@ async def show_my_businesses_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("mybiz_"))
 async def my_business_callback(cb: CallbackQuery):
-    """Обработка выбора бизнеса - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    """Обработка выбора бизнеса - с временем до сбора"""
     try:
         biz_id = int(cb.data.split("_")[1])
         uid = cb.from_user.id
@@ -3969,11 +4036,26 @@ async def my_business_callback(cb: CallbackQuery):
         # Процент заполнения продуктов
         product_percent = int((biz_data['product_amount'] / business_info['product_capacity']) * 100)
         
-        # Создаем клавиатуру для управления
+        # Проверяем время до следующего сбора
+        current_time = int(time.time())
+        last_collected = biz_data.get('last_collected', 0)
+        time_since_last_collect = current_time - last_collected
+        
+        can_collect = time_since_last_collect >= 3600
+        if not can_collect:
+            remaining_time = 3600 - time_since_last_collect
+            minutes = remaining_time // 60
+            seconds = remaining_time % 60
+            time_until_collect = f"⏳ До сбора: {minutes:02d}:{seconds:02d}"
+        else:
+            time_until_collect = "✅ Готово к сбору"
+        
+        # Создаем клавиатуру
         keyboard = [
             [
                 InlineKeyboardButton(text="🔄 Пополнить", callback_data=f"biz_refill_{biz_id}"),
-                InlineKeyboardButton(text="💰 Собрать", callback_data=f"biz_collect_{biz_id}")
+                InlineKeyboardButton(text="💰 Собрать" if can_collect else "⏳ Подожди", 
+                                   callback_data=f"biz_collect_{biz_id}" if can_collect else "no_action")
             ],
             [
                 InlineKeyboardButton(text="📈 Улучшить", callback_data=f"biz_upgrade_{biz_id}"),
@@ -3996,18 +4078,13 @@ async def my_business_callback(cb: CallbackQuery):
 {progress_bar} {product_percent}%
 • Прибыль в час: {format_money(profit_per_hour)}
 • Стоимость пополнения: {format_money(business_info['product_refill_cost'])}
+• {time_until_collect}
 """
         
         try:
             await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except:
             await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
-        await cb.answer()
-    except Exception as e:
-        logger.error(f"Ошибка в my_business_callback: {e}")
-        await cb.answer("❌ Ошибка")
-        
-        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         await cb.answer()
     except Exception as e:
         logger.error(f"Ошибка в my_business_callback: {e}")
@@ -5015,7 +5092,10 @@ async def buy_business_cmd(msg: Message):
     else:
         await msg.reply(f"❌ {result}")
 
-
+@router.callback_query(F.data == "no_action")
+async def no_action_callback(cb: CallbackQuery):
+    """Обработчик для заблокированных кнопок (когда нельзя собирать прибыль)"""
+    await cb.answer("⏳ Подождите, пока истечет время до следующего сбора!", show_alert=True)
 
 # ========== ТЕСТОВЫЙ ХЕНДЛЕР ==========
 @router.message(F.text.lower() == "тест")
