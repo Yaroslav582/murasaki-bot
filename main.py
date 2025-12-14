@@ -5,6 +5,7 @@ import time
 import logging
 import hashlib
 import math
+import re
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Dice
@@ -92,6 +93,10 @@ async def referrals_cmd(msg: Message):
         "🎁 <b>Награда за друга:</b> 30–100М\n"
         "⚠️ Засчитывается только первый /start"
     )
+    
+    # ДОБАВЛЯЕМ ОТПРАВКУ СООБЩЕНИЯ:
+    await msg.reply(text, parse_mode="HTML")
+
 @router.message(F.text.lower() == "профиль")
 async def profile_cmd(msg: Message):
     uid = msg.from_user.id
@@ -111,6 +116,37 @@ async def profile_cmd(msg: Message):
 
     await msg.reply(text, parse_mode="HTML")
 
+@router.message(F.text.lower() == "тестреф")
+async def test_ref_cmd(msg: Message):
+    """Тест реферальной системы"""
+    uid = msg.from_user.id
+    user = await get_user(uid)
+    
+    bot_username = (await msg.bot.get_me()).username
+    referral_code = user['referral_code']
+    referral_link = f"https://t.me/{bot_username}?start={referral_code}"
+    
+    text = f"""
+🔍 <b>ТЕСТ РЕФЕРАЛЬНОЙ СИСТЕМЫ</b>
+
+👤 <b>Ваш ID:</b> {uid}
+🔗 <b>Ваш код:</b> {user['referral_code']}
+📊 <b>Пригласил вас:</b> {user.get('referred_by', 'Никто')}
+💰 <b>Рефералов у вас:</b> {user.get('referral_count', 0)}
+💵 <b>Заработано на рефералах:</b> {format_money(user.get('total_referral_earned', 0))}
+
+🔗 <b>Ваша ссылка:</b>
+<code>{referral_link}</code>
+
+📝 <b>Как проверить:</b>
+1. Отправьте ссылку другу
+2. Попросите друга нажать на нее
+3. Друг должен написать /start в боте
+4. Вы должны получить 30-100М
+
+⚠️ <b>Примечание:</b> Работает только первый /start
+"""
+    await msg.reply(text, parse_mode="HTML")
 
 @router.message(F.text.lower() == "меню")
 async def menu_cmd(msg: Message):
@@ -139,6 +175,10 @@ async def planets_cmd(msg: Message):
 
 # ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
 WORK_COOLDOWN = 30  # 30 секунд вместо 60
+BONUS_COOLDOWN = 1800  # ⬅ ДОБАВИТЬ: 30 минут в секундах (было 3600)
+# ⬇ ДОБАВИТЬ НОВЫЕ КОНСТАНТЫ:
+GAMES_COOLDOWN = 5  # 5 секунд для всех азартных игр
+BOSS_COOLDOWN = 5   # 5 секунд для атаки босса
 
 # ========== МАЙНИНГ БИТКОИНОВ ==========
 class BitcoinMining:
@@ -146,33 +186,82 @@ class BitcoinMining:
     @staticmethod
     def calculate_hashrate(gpu_count: int, gpu_level: int) -> float:
         """Вычисляет хешрейт на основе видеокарт"""
-        base_hashrate = 100  # MH/s на одну базовую видеокарту
-        return gpu_count * base_hashrate * (1 + gpu_level * 0.8)
+        base_hashrate = 10_000_000
+        
+        # Множители - высшие уровни ВЫГОДНЕЕ
+        level_multipliers = {
+            1: 1.0,    # ×1 (база)
+            2: 4.0,    # ×4 (в 4 раза мощнее уровня 1)
+            3: 20.0,   # ×20 (в 5 раз мощнее уровня 2)
+            4: 120.0,  # ×120 (в 6 раз мощнее уровня 3)
+            5: 840.0   # ×840 (в 7 раз мощнее уровня 4)
+        }
+        
+        multiplier = level_multipliers.get(gpu_level, 1.0)
+        return gpu_count * base_hashrate * multiplier
     
     @staticmethod
     def calculate_btc_per_hour(hashrate: float) -> float:
         """Вычисляет сколько BTC добывается в час"""
-        # Улучшенная формула: 100 MH/s = 0.00001 BTC/час (в 10 раз больше)
-        return (hashrate / 100) * 0.00001
+        # 10 миллионов MH/s = 0.04 BTC/час
+        return (hashrate / 10_000_000) * 0.04
     
     @staticmethod
     def get_bitcoin_price() -> float:
         """Текущая цена биткоина в $"""
-        base_price = 60000
-        fluctuation = random.uniform(-0.05, 0.05)
+        base_price = 150_000  # 90к$ за BTC (было 60к)
+        fluctuation = random.uniform(-0.05, 0.05)  # ±5%
         return base_price * (1 + fluctuation)
     
     @staticmethod
     def get_gpu_price(gpu_level: int) -> int:
-        """Цена видеокарты в зависимости от уровня"""
+        """Цена видеокарты"""
         base_prices = {
-            1: 500_000,      # 500к
-            2: 2_500_000,    # 2.5М
-            3: 10_000_000,   # 10М
-            4: 50_000_000,   # 50М
-            5: 200_000_000   # 200М
+            1: 7_200_000,      # 7.2М
+            2: 20_000_000,     # 20М (в 2.78 раза дороже уровня 1)
+            3: 80_000_000,     # 80М (в 4 раза дороже уровня 2)
+            4: 400_000_000,    # 400М (в 5 раз дороже уровня 3)
+            5: 2_400_000_000   # 2.4Б (в 6 раз дороже уровня 4)
         }
-        return base_prices.get(gpu_level, 500_000)
+        return base_prices.get(gpu_level, 7_200_000)
+    
+    # ========== КРАШ ИГРА ==========
+class CrashGame:
+    @staticmethod
+    def generate_multiplier():
+        """Генерирует множитель с вероятностью краха"""
+        # Базовый алгоритм: 95% шанс что множитель будет от 1.1x до 10x
+        if random.random() < 0.95:
+            # Плавное распределение: чаще маленькие множители
+            base = random.uniform(1.1, 3.0)
+            # 30% шанс на большой множитель
+            if random.random() < 0.3:
+                base = random.uniform(2.0, 10.0)
+            return round(base, 2)
+        else:
+            # 5% шанс на крах (множитель 0)
+            return 0
+    
+    @staticmethod
+    def get_potential_win(bet: int, multiplier: float):
+        """Рассчитать потенциальный выигрыш"""
+        if multiplier == 0:
+            return 0
+        return int(bet * multiplier)
+    
+    @staticmethod
+    def get_crash_point():
+        """Генерирует точку краха (когда игра остановится)"""
+        # Сделаем так, чтобы чаще были множители 1.5x-3x
+        rand = random.random()
+        if rand < 0.4:  # 40% шанс на маленький множитель
+            return round(random.uniform(1.1, 2.0), 2)
+        elif rand < 0.7:  # 30% шанс на средний
+            return round(random.uniform(2.0, 4.0), 2)
+        elif rand < 0.9:  # 20% шанс на большой
+            return round(random.uniform(4.0, 8.0), 2)
+        else:  # 10% шанс на огромный
+            return round(random.uniform(8.0, 15.0), 2)
 
 # ========== БИЗНЕСЫ ==========
 BUSINESSES = {
@@ -394,6 +483,17 @@ INVESTMENTS = {
         'success_rate': 0.95,
         'profit_multiplier': 1.2
     }
+}
+
+# ========== ЕЖЕДНЕВНАЯ НАГРАДА ==========
+DAILY_REWARDS = {
+    1: 50_000_000,    # День 1: 50М
+    2: 100_000_000,   # День 2: 100М
+    3: 150_000_000,   # День 3: 150М
+    4: 250_000_000,   # День 4: 250М
+    5: 500_000_000,   # День 5: 500М
+    6: 750_000_000,   # День 6: 750М
+    7: 1_000_000_000, # День 7: 1Б
 }
 
 # ========== БЛЭКДЖЕК ==========
@@ -627,7 +727,11 @@ async def update_db_structure():
                 'mining_gpu_level': 'INTEGER DEFAULT 1',
                 'last_mining_claim': 'INTEGER DEFAULT 0',
                 'wins': 'INTEGER DEFAULT 0',
-                'losses': 'INTEGER DEFAULT 0'
+                'losses': 'INTEGER DEFAULT 0',
+                # ⬇ ДОБАВИТЬ ЭТИ ДВЕ СТРОКИ:
+                'last_daily_claim': 'INTEGER DEFAULT NULL',
+                'daily_streak': 'INTEGER DEFAULT 0',
+                'last_game_time': 'INTEGER DEFAULT 0'
             }
             
             for column, col_type in new_columns.items():
@@ -708,15 +812,103 @@ async def init_db():
         logger.error(f"Ошибка БД: {e}")
 
 async def get_user(uid: int):
-    """Получить пользователя из БД - ВСЕГДА СВЕЖИЕ ДАННЫЕ"""
+    """Получить пользователя из БД - с автоматическим созданием если нет"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM users WHERE id = ?", (uid,))
             row = await cursor.fetchone()
             
+            # Если пользователя нет - создаем
+            if not row:
+                referral_code = generate_referral_code(uid)
+                await db.execute(
+                    "INSERT INTO users (id, referral_code) VALUES (?, ?)",
+                    (uid, referral_code)
+                )
+                await db.commit()
+                
+                # Получаем созданного пользователя
+                cursor = await db.execute("SELECT * FROM users WHERE id = ?", (uid,))
+                row = await cursor.fetchone()
+            
             if row:
                 user_dict = dict(row)
+                
+                # ========== АВТОМАТИЧЕСКОЕ НАКОПЛЕНИЕ BTC ==========
+                if user_dict.get('mining_gpu_count', 0) > 0:
+                    current_time = int(time.time())
+                    last_claim = user_dict.get('last_mining_claim', 0) or current_time
+                    
+                    # Рассчитываем сколько BTC накопилось
+                    hashrate = BitcoinMining.calculate_hashrate(
+                        user_dict.get('mining_gpu_count', 0),
+                        user_dict.get('mining_gpu_level', 1)
+                    )
+                    btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+                    
+                    time_passed = current_time - last_claim
+                    btc_mined = btc_per_hour * (time_passed / 3600)
+                    
+                    if btc_mined > 0:
+                        # Автоматически начисляем BTC
+                        await db.execute(
+                            "UPDATE users SET bitcoin = bitcoin + ? WHERE id = ?",
+                            (btc_mined, uid)
+                        )
+                        # Обновляем время последнего сбора
+                        await db.execute(
+                            "UPDATE users SET last_mining_claim = ? WHERE id = ?",
+                            (current_time, uid)
+                        )
+                        await db.commit()
+                        
+                        # Обновляем данные пользователя
+                        user_dict['bitcoin'] = user_dict.get('bitcoin', 0) + btc_mined
+                        user_dict['last_mining_claim'] = current_time
+
+                                        # ========== АВТОМАТИЧЕСКОЕ НАКОПЛЕНИЕ ПЛАЗМЫ С ПЛАНЕТ ==========
+                user_planets = await get_user_planets(uid)
+                
+                if user_planets:
+                    current_time = int(time.time())
+                    total_plasma_mined = 0
+                    
+                    for planet_id, planet_data in user_planets.items():
+                        if planet_id in PLANETS:
+                            planet_info = PLANETS[planet_id]
+                            last_collected = planet_data.get('last_collected', 0) or current_time
+                            
+                            # Рассчитываем сколько плазмы накопилось
+                            time_passed = current_time - last_collected
+                            if time_passed > 0:
+                                plasma_per_hour = planet_info['plasma_per_hour']
+                                plasma_mined = int((time_passed / 3600) * plasma_per_hour)
+                                
+                                if plasma_mined > 0:
+                                    total_plasma_mined += plasma_mined
+                                    # Обновляем время последнего сбора для планеты
+                                    await db.execute("""
+                                        UPDATE planets 
+                                        SET last_collected = ?
+                                        WHERE user_id = ? AND planet_id = ?
+                                    """, (current_time, uid, planet_id))
+                    
+                    if total_plasma_mined > 0:
+                        # Автоматически начисляем плазму
+                        await db.execute(
+                            "UPDATE users SET plasma = plasma + ? WHERE id = ?",
+                            (total_plasma_mined, uid)
+                        )
+                        await db.commit()
+                        
+                        # Обновляем данные пользователя
+                        user_dict['plasma'] = user_dict.get('plasma', 0) + total_plasma_mined
+                        
+                        # Логируем если много накопилось
+                        if total_plasma_mined > 100:
+                            logger.info(f"Автонакопление плазмы для {uid}: +{total_plasma_mined}")
+                
                 # Заполняем недостающие поля
                 default_fields = {
                     'work_time': 0,
@@ -750,43 +942,34 @@ async def get_user(uid: int):
                     await db.execute("UPDATE users SET referral_code = ? WHERE id = ?", (referral_code, uid))
                     await db.commit()
                 
-                return user_dict  # ВОЗВРАЩАЕМ СВЕЖИЕ ДАННЫЕ
+                return user_dict
             
-            # Если пользователя нет, создаем
-            salt = "murasaki_empire_2024"
-            hash_str = hashlib.md5(f"{uid}{salt}".encode()).hexdigest()[:8].upper()
-            referral_code = f"REF{hash_str}"
+            return None
             
-            await db.execute(
-                "INSERT INTO users (id, balance, referral_code, has_started_bonus) VALUES (?, ?, ?, ?)",
-                (uid, 0, referral_code, 0)
-            )
-            await db.commit()
-            
-            return {
-                'id': uid, 
-                'balance': 0, 
-                'bonus_time': 0, 
-                'work_time': 0,
-                'wins': 0, 
-                'losses': 0, 
-                'total_bonus': 0, 
-                'total_work': 0, 
-                'username': None,
-                'referral_code': referral_code,
-                'referred_by': None,
-                'referral_count': 0,
-                'total_referral_earned': 0,
-                'has_started_bonus': False,
-                'plasma': 0,
-                'bitcoin': 0.0,
-                'mining_gpu_count': 0,
-                'mining_gpu_level': 1,
-                'last_mining_claim': 0
-            }
     except Exception as e:
         logger.error(f"Ошибка get_user: {e}")
         return None
+
+async def create_user_if_not_exists(uid: int, username: str = None):
+    """Создать пользователя если не существует"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT id FROM users WHERE id = ?", (uid,))
+            user_exists = await cursor.fetchone()
+            
+            if not user_exists:
+                referral_code = generate_referral_code(uid)
+                await db.execute(
+                    "INSERT INTO users (id, username, referral_code) VALUES (?, ?, ?)",
+                    (uid, username, referral_code)
+                )
+                await db.commit()
+                logger.info(f"✅ Создан новый пользователь: {uid}")
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка создания пользователя: {e}")
+        return False
 
 async def update_username(uid: int, username: str):
     """Обновить имя пользователя"""
@@ -903,6 +1086,57 @@ async def get_total_money_in_system():
     except Exception as e:
         logger.error(f"Ошибка get_total_money_in_system: {e}")
         return 0
+    
+async def auto_accumulate_bitcoin(uid: int):
+    """Автоматическое накопление BTC для пользователя при каждом обращении"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT mining_gpu_count, mining_gpu_level, bitcoin, last_mining_claim FROM users WHERE id = ?", 
+                (uid,)
+            )
+            row = await cursor.fetchone()
+            
+            if not row or row['mining_gpu_count'] == 0:
+                return 0  # Нет видеокарт - нечего накапливать
+            
+            user_data = dict(row)
+            current_time = int(time.time())
+            last_claim = user_data.get('last_mining_claim', 0) or current_time
+            
+            # Рассчитываем накопления
+            hashrate = BitcoinMining.calculate_hashrate(
+                user_data['mining_gpu_count'],
+                user_data['mining_gpu_level']
+            )
+            btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+            
+            time_passed = current_time - last_claim
+            if time_passed < 60:  # Минимум 1 минута для накопления
+                return 0
+            
+            # Максимум 720 часов (30 дней) накопления
+            max_hours = 720
+            hours_passed = min(time_passed / 3600, max_hours)
+            
+            btc_mined = btc_per_hour * hours_passed
+            
+            if btc_mined > 0:
+                # Начисляем BTC
+                await db.execute(
+                    "UPDATE users SET bitcoin = bitcoin + ?, last_mining_claim = ? WHERE id = ?",
+                    (btc_mined, current_time, uid)
+                )
+                await db.commit()
+                
+                logger.debug(f"Автонакопление для {uid}: {btc_mined:.6f} BTC за {hours_passed:.1f} часов")
+                return btc_mined
+            
+            return 0
+    except Exception as e:
+        logger.error(f"Ошибка auto_accumulate_bitcoin: {e}")
+        return 0
 
 # ========== РЕФЕРАЛЬНАЯ СИСТЕМА ==========
 def generate_referral_code(user_id: int) -> str:
@@ -926,117 +1160,116 @@ async def get_user_by_referral_code(code: str):
         return None
 
 async def process_referral(new_user_id: int, referral_code: str, bot: Bot = None):
-    """Обработка реферального приглашения"""
+    """Обработка реферального приглашения - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
     try:
-        logger.info(f"Начинаем обработку реферала: новый пользователь {new_user_id}, код {referral_code}")
+        logger.info(f"🔍 Начинаем обработку реферала: пользователь {new_user_id}, код {referral_code}")
         
-        referrer = await get_user_by_referral_code(referral_code)
-        if not referrer:
-            logger.error(f"Реферер с кодом {referral_code} не найден")
+        # Проверяем, есть ли код
+        if not referral_code or referral_code == "start":
             return False, 0, None
         
-        referrer_id = referrer['id']
-        referrer_username = referrer.get('username', f"ID {referrer_id}")
-        
-        if referrer_id == new_user_id:
-            logger.error(f"Пользователь пытается пригласить сам себя: {new_user_id}")
-            return False, 0, None
-        
+        # Находим реферера по коду
         async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT id, username FROM users WHERE referral_code = ?", (referral_code,))
+            referrer_data = await cursor.fetchone()
+            
+            if not referrer_data:
+                logger.error(f"❌ Реферер с кодом {referral_code} не найден")
+                return False, 0, None
+            
+            referrer_id = referrer_data['id']
+            
+            # Проверяем, не пытается ли пользователь пригласить сам себя
+            if referrer_id == new_user_id:
+                logger.error(f"❌ Пользователь пытается пригласить сам себя")
+                return False, 0, None
+            
+            # Проверяем, был ли уже приглашен этот пользователь
+            cursor = await db.execute("SELECT referred_by FROM users WHERE id = ?", (new_user_id,))
+            existing_user = await cursor.fetchone()
+            
+            if existing_user and existing_user[0] is not None:
+                logger.error(f"❌ Пользователь {new_user_id} уже был приглашен ранее")
+                return False, 0, None
+            
+            logger.info(f"✅ Найден реферер: {referrer_id}")
+            
+            # Генерируем награду
+            reward_amount = random.randint(30_000_000, 100_000_000)
+            logger.info(f"💰 Награда за реферала: {reward_amount:,}")
+            
+            # Начинаем транзакцию
             await db.execute("BEGIN")
             
             try:
-                cursor = await db.execute("SELECT referred_by FROM users WHERE id = ?", (new_user_id,))
-                existing_row = await cursor.fetchone()
+                # 1. Устанавливаем кто пригласил (В СТРОКУ КОТОРАЯ СОЗДАЕТ ПОЛЬЗОВАТЕЛЯ)
+                cursor = await db.execute("SELECT * FROM users WHERE id = ?", (new_user_id,))
+                user_exists = await cursor.fetchone()
                 
-                if existing_row and existing_row[0] is not None:
-                    logger.error(f"Пользователь {new_user_id} уже был приглашен ранее")
-                    await db.rollback()
-                    return False, 0, None
+                if user_exists:
+                    # Пользователь уже есть, обновляем поле
+                    await db.execute("UPDATE users SET referred_by = ? WHERE id = ?", (referrer_id, new_user_id))
+                else:
+                    # Создаем нового пользователя с реферером
+                    referral_code_new = generate_referral_code(new_user_id)
+                    await db.execute(
+                        "INSERT INTO users (id, referred_by, referral_code) VALUES (?, ?, ?)",
+                        (new_user_id, referrer_id, referral_code_new)
+                    )
                 
-                await db.execute("UPDATE users SET referred_by = ? WHERE id = ?", (referrer_id, new_user_id))
-                
-                cursor = await db.execute(
-                    "SELECT referral_count, total_referral_earned FROM users WHERE id = ?", 
-                    (referrer_id,)
-                )
-                referrer_data = await cursor.fetchone()
-                
-                current_referral_count = referrer_data[0] if referrer_data else 0
-                new_referral_count = current_referral_count + 1
-                
-                reward_amount = random.randint(30_000_000, 100_000_000)
-                
-                cursor = await db.execute(
-                    "SELECT balance, total_referral_earned FROM users WHERE id = ?", 
-                    (referrer_id,)
-                )
-                balance_data = await cursor.fetchone()
-                
-                current_balance = balance_data[0] if balance_data else 0
-                current_total_earned = balance_data[1] if balance_data else 0
-                
-                new_balance = current_balance + reward_amount
-                new_total_earned = current_total_earned + reward_amount
-                
+                # 2. Обновляем данные реферера (прибавляем к балансу и счетчику)
                 await db.execute("""
                     UPDATE users 
-                    SET balance = ?,
-                        referral_count = ?,
-                        total_referral_earned = ?
+                    SET balance = balance + ?,
+                        referral_count = referral_count + 1,
+                        total_referral_earned = total_referral_earned + ?
                     WHERE id = ?
-                """, (new_balance, new_referral_count, new_total_earned, referrer_id))
+                """, (reward_amount, reward_amount, referrer_id))
                 
                 await db.commit()
+                logger.info(f"✅ Транзакция успешно завершена!")
                 
-                logger.info(f"✅ Реферал успешно обработан!")
-                logger.info(f"   Новый пользователь: {new_user_id}")
-                logger.info(f"   Реферер: {referrer_id} ({referrer_username})")
-                logger.info(f"   Награда: {reward_amount:,}")
-                logger.info(f"   Новый баланс реферера: {new_balance:,}")
-                logger.info(f"   Новое количество рефералов: {new_referral_count}")
+                # 3. Получаем обновленные данные для проверки
+                cursor = await db.execute(
+                    "SELECT balance, referral_count, total_referral_earned, username FROM users WHERE id = ?", 
+                    (referrer_id,)
+                )
+                updated_data = await cursor.fetchone()
                 
-                async with aiosqlite.connect(DB_PATH) as verify_db:
-                    verify_db.row_factory = aiosqlite.Row
-                    cursor = await verify_db.execute(
-                        "SELECT balance, referral_count, total_referral_earned FROM users WHERE id = ?", 
-                        (referrer_id,)
-                    )
-                    verify_data = await cursor.fetchone()
-                    
-                    if verify_data:
-                        logger.info(f"✅ Проверка данных:")
-                        logger.info(f"   Баланс в БД: {verify_data['balance']:,}")
-                        logger.info(f"   Рефералов в БД: {verify_data['referral_count']}")
-                        logger.info(f"   Заработано в БД: {verify_data['total_referral_earned']:,}")
+                referrer_username = updated_data['username'] or f"ID {referrer_id}"
                 
+                logger.info(f"📊 Данные после обновления:")
+                logger.info(f"   Баланс: {updated_data['balance']:,}")
+                logger.info(f"   Рефералов: {updated_data['referral_count']}")
+                logger.info(f"   Заработано на рефералах: {updated_data['total_referral_earned']:,}")
+                
+                # 4. Отправляем уведомление рефереру
                 if bot:
                     try:
                         await bot.send_message(
                             referrer_id,
                             f"🎉 <b>НОВЫЙ РЕФЕРАЛ!</b>\n\n"
-                            f"👤 <b>Новый пользователь присоединился по вашей ссылке!</b>\n\n"
-                            f"💰 <b>Вы получили:</b> <code>{reward_amount:,}</code>\n"
-                            f"📊 <b>Новый баланс:</b> <code>{new_balance:,}</code>\n"
-                            f"👥 <b>Всего рефералов:</b> {new_referral_count}\n"
-                            f"🏦 <b>Всего заработано на рефералах:</b> <code>{new_total_earned:,}</code>\n\n"
-                            f"🎯 <b>Продолжайте приглашать друзей!</b>\n"
-                            f"Каждый новый реферал приносит 30-100 миллионов!",
+                            f"👤 Кто-то присоединился по вашей ссылке!\n\n"
+                            f"💰 <b>Вы получили:</b> {format_money(reward_amount)}\n"
+                            f"📊 <b>Новый баланс:</b> {format_money(updated_data['balance'])}\n"
+                            f"👥 <b>Всего рефералов:</b> {updated_data['referral_count']}\n"
+                            f"🏦 <b>Всего заработано на рефералах:</b> {format_money(updated_data['total_referral_earned'])}",
                             parse_mode="HTML"
                         )
                         logger.info(f"✅ Уведомление отправлено рефереру {referrer_id}")
                     except Exception as e:
-                        logger.error(f"❌ Не удалось отправить уведомление рефереру {referrer_id}: {e}")
+                        logger.error(f"❌ Не удалось отправить уведомление: {e}")
                 
                 return True, reward_amount, referrer_username
                 
             except Exception as e:
                 await db.rollback()
-                logger.error(f"❌ Ошибка в транзакции при обработке реферала: {e}")
+                logger.error(f"❌ Ошибка в транзакции: {e}")
                 return False, 0, None
                 
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка обработки реферала: {e}")
+        logger.error(f"❌ Критическая ошибка process_referral: {e}")
         return False, 0, None
 
 # ========== ОБРАБОТКА РЕФЕРАЛЬНОГО СТАРТА ==========
@@ -1303,7 +1536,7 @@ async def upgrade_business(uid: int, business_id: int):
         return False, f"Ошибка улучшения: {e}"
 
 async def refill_products(uid: int, business_id: int):
-    """Пополнить продукты бизнеса"""
+    """Пополнить продукты бизнеса (полностью)"""
     user_businesses = await get_user_businesses(uid)
     if business_id not in user_businesses:
         return False, "У вас нет этого бизнеса"
@@ -1312,9 +1545,9 @@ async def refill_products(uid: int, business_id: int):
     user_business = user_businesses[business_id]
     
     refill_cost = business_data['product_refill_cost']
-    refill_amount = business_data['product_capacity'] - user_business['product_amount']
     
-    if refill_amount <= 0:
+    # Если продукты уже полные
+    if user_business['product_amount'] >= business_data['product_capacity']:
         return False, "Продукты уже заполнены"
     
     user = await get_user(uid)
@@ -1323,8 +1556,10 @@ async def refill_products(uid: int, business_id: int):
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
+            # Снимаем деньги
             await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (refill_cost, uid))
             
+            # ПОЛНОСТЬЮ заполняем продукты (до максимальной емкости)
             await db.execute("""
                 UPDATE businesses 
                 SET product_amount = ?
@@ -1332,13 +1567,13 @@ async def refill_products(uid: int, business_id: int):
             """, (business_data['product_capacity'], uid, business_id))
             
             await db.commit()
-            return True, f"Продукты бизнеса '{business_data['name']}' пополнены!"
+            return True, f"✅ Продукты бизнеса '{business_data['name']}' полностью пополнены!\nТеперь он может работать {business_data['product_capacity']} часов."
     except Exception as e:
         logger.error(f"Ошибка refill_products: {e}")
-        return False, f"Ошибка пополнения: {e}"
+        return False, f"❌ Ошибка пополнения: {e}"
 
 async def collect_business_profit(uid: int, business_id: int):
-    """Собрать прибыль с бизнеса (С ОГРАНИЧЕНИЕМ ВРЕМЕНИ - 1 раз в час)"""
+    """Собрать прибыль с бизнеса (продукты расходуются по времени)"""
     user_businesses = await get_user_businesses(uid)
     if business_id not in user_businesses:
         return False, "У вас нет этого бизнеса"
@@ -1350,39 +1585,58 @@ async def collect_business_profit(uid: int, business_id: int):
     if user_business['product_amount'] <= 0:
         return False, "Недостаточно продуктов. Пополните бизнес."
     
-    # Проверяем время с последнего сбора
     current_time = int(time.time())
     last_collected = user_business.get('last_collected', 0)
     
-    # Минимальное время между сборами - 1 час (3600 секунд)
-    time_since_last_collect = current_time - last_collected
+    # Если никогда не собирали, начинаем с текущего времени
+    if last_collected == 0:
+        last_collected = current_time
     
-    if time_since_last_collect < 3600:
-        remaining_time = 3600 - time_since_last_collect
-        minutes = remaining_time // 60
-        seconds = remaining_time % 60
-        return False, f"⏳ Прибыль можно собирать раз в час!\nПодождите еще: {minutes}:{seconds:02d}"
+    # Рассчитываем сколько часов прошло с последнего сбора
+    time_passed = current_time - last_collected
+    hours_passed = time_passed / 3600  # в часах
     
-    # Рассчитываем прибыль
+    if hours_passed <= 0:
+        return False, "⏳ Еще не прошло время для сбора прибыли"
+    
+    # Рассчитываем прибыль в час
     profit_per_hour = business_data['profit_per_hour'] * (business_data['upgrade_multiplier'] ** (user_business['level'] - 1))
     
-    # Используем все продукты за один раз (прибыль за 1 час)
-    profit = int(profit_per_hour * (user_business['product_amount'] / business_data['product_capacity']))
+    # Сколько продуктов можно использовать (1 час работы = 1 единица продукта)
+    # products_per_hour = business_data['product_capacity'] / 24  # Если бы за день
+    # Проще: процент заполнения определяет сколько часов может работать бизнес
+    max_working_hours = user_business['product_amount']  # Каждый продукт = 1 час работы
+    
+    # Ограничиваем часы работы доступными продуктами
+    working_hours = min(hours_passed, max_working_hours)
+    
+    if working_hours <= 0:
+        return False, "Недостаточно продуктов для работы"
+    
+    # Прибыль = прибыль_в_час × отработанные_часы
+    profit = int(profit_per_hour * working_hours)
     
     if profit <= 0:
-        return False, "Недостаточно продуктов. Пополните бизнес."
+        return False, "Недостаточно продуктов или время не прошло."
+    
+    # Сколько продуктов израсходовано
+    products_used = int(working_hours)  # Каждый час = 1 продукт
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             # Начисляем прибыль
             await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (profit, uid))
             
-            # Обнуляем продукты и обновляем время сбора
+            # Расходуем продукты и обновляем время
+            new_product_amount = user_business['product_amount'] - products_used
+            if new_product_amount < 0:
+                new_product_amount = 0
+            
             await db.execute("""
                 UPDATE businesses 
-                SET product_amount = 0, last_collected = ?
+                SET product_amount = ?, last_collected = ?
                 WHERE user_id = ? AND business_id = ?
-            """, (current_time, uid, business_id))
+            """, (new_product_amount, current_time, uid, business_id))
             
             await db.commit()
             return True, profit
@@ -1524,7 +1778,7 @@ async def buy_planet(uid: int, planet_id: int):
         return False, f"Ошибка покупки: {e}"
 
 async def collect_planet_plasma(uid: int, planet_id: int):
-    """Собрать плазму с планеты"""
+    """Собрать плазму с планеты - учитывает автонакопление"""
     user_planets = await get_user_planets(uid)
     if planet_id not in user_planets:
         return False, "У вас нет этой планеты"
@@ -1533,11 +1787,15 @@ async def collect_planet_plasma(uid: int, planet_id: int):
     user_planet = user_planets[planet_id]
     
     current_time = int(time.time())
-    last_collected = user_planet['last_collected'] or current_time
-    time_passed = current_time - last_collected
+    last_collected = user_planet.get('last_collected', 0) or current_time
     
-    plasma_per_hour = planet_data['plasma_per_hour']
-    plasma_collected = int((time_passed / 3600) * plasma_per_hour)
+    # Если время не обновлялось (автонакопление уже сделало это)
+    if last_collected >= current_time - 60:  # Если обновлялось менее минуты назад
+        plasma_collected = 0
+    else:
+        plasma_per_hour = planet_data['plasma_per_hour']
+        time_passed = current_time - last_collected
+        plasma_collected = int((time_passed / 3600) * plasma_per_hour)
     
     if plasma_collected <= 0:
         return False, "Плазма еще не накопилась"
@@ -1675,33 +1933,33 @@ async def upgrade_gpu(uid: int):
         return False, f"❌ Ошибка улучшения: {e}"
 
 async def claim_mining_profit(uid: int):
-    """Забрать намайненые биткоины"""
+    """Забрать намайненые биткоины - С АВТОНАКОПЛЕНИЕМ"""
+    # Сначала автонакопление
+    await auto_accumulate_bitcoin(uid)
+    
     user = await get_user(uid)
     
     if user['mining_gpu_count'] == 0:
         return False, 0, "У вас нет майнинг фермы. Купите видеокарты!"
     
-    current_time = int(time.time())
-    last_claim = user['last_mining_claim'] or current_time
-    time_passed = current_time - last_claim
+    # Текущие накопления (после автонакопления)
+    btc_to_claim = user['bitcoin']
     
-    hashrate = BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level'])
-    btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
-    btc_mined = btc_per_hour * (time_passed / 3600)
-    
-    if btc_mined <= 0:
+    if btc_to_claim <= 0:
         return False, 0, "Биткоины еще не намайнились"
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET bitcoin = bitcoin + ?, last_mining_claim = ? WHERE id = ?", (btc_mined, current_time, uid))
+            # Обнуляем баланс BTC (все забираем)
+            await db.execute("UPDATE users SET bitcoin = 0, last_mining_claim = ? WHERE id = ?", 
+                           (int(time.time()), uid))
             
             await db.commit()
             
             btc_price = BitcoinMining.get_bitcoin_price()
-            usd_value = btc_mined * btc_price
+            usd_value = btc_to_claim * btc_price
             
-            return True, btc_mined, usd_value
+            return True, btc_to_claim, usd_value
     except Exception as e:
         logger.error(f"Ошибка claim_mining_profit: {e}")
         return False, 0, f"Ошибка: {e}"
@@ -1820,7 +2078,7 @@ async def complete_investment(uid: int, investment_db_id: int):
 
 # ========== БОНУСНАЯ СИСТЕМА ==========
 async def check_bonus_cooldown(uid: int):
-    """Проверка кулдауна на бонус (1 час) - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    """Проверка кулдауна на бонус (30 минут) - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
     try:
         user = await get_user(uid)
         last_bonus = user.get('bonus_time', 0) or 0
@@ -1833,10 +2091,10 @@ async def check_bonus_cooldown(uid: int):
         
         time_passed = current_time - last_bonus
         
-        if time_passed >= 3600:  # 1 час
+        if time_passed >= BONUS_COOLDOWN:  # ⬅ ИЗМЕНИТЬ: 1800 секунд (30 минут)
             return True, 0, {'bonus_time': last_bonus, 'total_bonus': total_bonus}
         
-        remaining = 3600 - time_passed
+        remaining = BONUS_COOLDOWN - time_passed  # ⬅ ИЗМЕНИТЬ
         return False, remaining, {'bonus_time': last_bonus, 'total_bonus': total_bonus}
     except Exception as e:
         logger.error(f"Ошибка check_bonus_cooldown: {e}")
@@ -1865,7 +2123,7 @@ async def give_bonus(uid: int):
         return 0, False
 
 async def check_work_cooldown(uid: int):
-    """Проверка кулдауна на работу (30 секунд)"""
+    """Проверка кулдауна на работу (5 секунд)"""  # ⬅ Обновить комментарий
     try:
         user = await get_user(uid)
         last_work = user.get('work_time', 0)
@@ -1878,14 +2136,54 @@ async def check_work_cooldown(uid: int):
         
         time_passed = current_time - last_work
         
-        if time_passed >= WORK_COOLDOWN:
+        if time_passed >= WORK_COOLDOWN:  # ⬅ Теперь 5 секунд
             return True, 0, {'work_time': last_work, 'total_work': total_work}
         
-        remaining = WORK_COOLDOWN - time_passed
+        remaining = WORK_COOLDOWN - time_passed  # ⬅ Теперь максимум 5 секунд
         return False, remaining, {'work_time': last_work, 'total_work': total_work}
     except Exception as e:
         logger.error(f"Ошибка check_work_cooldown: {e}")
         return True, 0, {'work_time': 0, 'total_work': 0}
+    
+async def check_game_cooldown(uid: int, game_type: str):
+    """Проверка кулдауна для игр (5 секунд)"""
+    try:
+        # Создаем ключ для хранения времени последней игры
+        cooldown_key = f"last_{game_type}_time"
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT last_game_time FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            
+            current_time = time.time()
+            
+            if not row or not row['last_game_time']:
+                return True, 0
+            
+            last_game = row['last_game_time']
+            time_passed = current_time - last_game
+            
+            if time_passed >= GAMES_COOLDOWN:  # 5 секунд
+                return True, 0
+            
+            remaining = GAMES_COOLDOWN - time_passed
+            return False, remaining
+            
+    except Exception as e:
+        logger.error(f"Ошибка check_game_cooldown: {e}")
+        return True, 0
+
+async def update_game_cooldown(uid: int, game_type: str):
+    """Обновить время последней игры"""
+    try:
+        current_time = int(time.time())
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET last_game_time = ? WHERE id = ?", 
+                           (current_time, uid))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка update_game_cooldown: {e}")
 
 async def give_work_reward(uid: int):
     """Выдать награду за работу (1-5 миллионов)"""
@@ -1939,8 +2237,101 @@ async def give_start_bonus(uid: int):
     except Exception as e:
         logger.error(f"Ошибка выдачи стартового бонуса: {e}")
         return False, f"Ошибка: {e}", 0
+    
+async def claim_daily_reward(uid: int):
+    """Получить ежедневную награду"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT last_daily_claim, daily_streak FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            
+            current_time = int(time.time())
+            
+            if not row or row['last_daily_claim'] is None:
+                # Первая награда
+                streak = 1
+                reward = DAILY_REWARDS.get(1, 50_000_000)
+                
+                await db.execute("""
+                    UPDATE users 
+                    SET balance = balance + ?, 
+                        last_daily_claim = ?,
+                        daily_streak = ?
+                    WHERE id = ?
+                """, (reward, current_time, streak, uid))
+                
+                await db.commit()
+                return True, reward, streak, "Первый день!"
+                
+            else:
+                last_claim = row['last_daily_claim']
+                streak = row['daily_streak'] or 1
+                
+                # Проверяем, прошло ли больше 24 часов
+                hours_passed = (current_time - last_claim) / 3600
+                
+                if hours_passed >= 24:
+                    # Можно забрать награду
+                    if hours_passed >= 48:
+                        # Пропущен день - сбрасываем серию
+                        streak = 1
+                    else:
+                        # Продолжаем серию
+                        streak += 1
+                        if streak > 7:
+                            streak = 7  # Максимум 7 дней
+                    
+                    reward = DAILY_REWARDS.get(streak, 50_000_000)
+                    
+                    await db.execute("""
+                        UPDATE users 
+                        SET balance = balance + ?, 
+                            last_daily_claim = ?,
+                            daily_streak = ?
+                        WHERE id = ?
+                    """, (reward, current_time, streak, uid))
+                    
+                    await db.commit()
+                    return True, reward, streak, "Продолжаем серию!"
+                else:
+                    # Еще не прошло 24 часа
+                    next_claim = last_claim + 86400
+                    remaining = next_claim - current_time
+                    return False, remaining, streak, "Еще рано!"
+                    
+    except Exception as e:
+        logger.error(f"Ошибка claim_daily_reward: {e}")
+        return False, 0, 0, f"Ошибка: {e}"
 
 # ========== ОБРАБОТКА КОМАНД С / И БЕЗ ==========
+# В самое начало функции handle_all_commands (или в каждую игровую функцию):
+async def handle_all_commands(msg: Message):
+    """Обработчик всех команд с глобальным КД 5 секунд"""
+    text = msg.text.strip()
+    
+    if not text:
+        return
+    
+    # Проверяем, это игровая команда?
+    game_commands = ['монетка', 'кости', 'слоты', 'рулетка', 'дротик', 
+                     'блекджек', 'краш', 'босс', 'атака']
+    
+    cmd = text.lower().split()[0]
+    
+    if cmd in game_commands:
+        # Проверяем глобальный КД
+        can_play, remaining = await check_game_cooldown(msg.from_user.id, "global_game")
+        if not can_play:
+            seconds = int(remaining)
+            await msg.reply(f"⏳ Подождите {seconds} секунд перед следующей игрой!")
+            return
+    
+    # ... остальной код ...
+    
+    # После каждой игры:
+    if cmd in game_commands:
+        await update_game_cooldown(msg.from_user.id, "global_game")
 async def handle_all_commands(msg: Message):
     """Обработчик всех команд - и с / и без /"""
     text = msg.text.strip()
@@ -1951,14 +2342,29 @@ async def handle_all_commands(msg: Message):
     parts = text.split()
     cmd = text.lower()
     
-    # Обработка /start с реферальным кодом
-    if cmd.startswith('/start'):
-        if len(parts) > 1:
-            referral_code = parts[1]
-            await handle_referral_start(msg, referral_code)
-        else:
-            await send_welcome_message(msg)
-        return
+@router.message(Command("start"))
+async def cmd_start(msg: Message, command: CommandObject = None):
+    """Обработка команды /start с реферальным кодом"""
+    uid = msg.from_user.id
+    username = msg.from_user.username or msg.from_user.first_name
+    
+    # Получаем или создаем пользователя
+    user = await get_user(uid)
+    
+    # Если есть аргумент (реферальный код)
+    if command and command.args:
+        referral_code = command.args
+        
+        # Если пользователь уже существует и у него нет реферера
+        if not user.get('referred_by') and referral_code:
+            success, reward_amount, referrer_username = await process_referral(uid, referral_code, msg.bot)
+            
+            if success:
+                # Обновляем данные пользователя
+                user = await get_user(uid)
+    
+    # Показываем приветственное сообщение
+    await send_welcome_message(msg)
     
     # Основные команды без /
     if cmd in ['меню', 'menu', 'старт', 'начать']:
@@ -2859,6 +3265,17 @@ async def show_investments(msg: Message):
 
 # ========== ИГРОВЫЕ ФУНКЦИИ ИЗ ТВОЕГО КОДА ==========
 async def process_coin(msg: Message, parts: list):
+    """Обработка команды монетка с КД 5 секунд"""
+    # Проверяем КД
+    can_play, remaining = await check_game_cooldown(msg.from_user.id, "coin")
+    if not can_play:
+        seconds = int(remaining)
+        await msg.reply(f"⏳ Подождите {seconds} секунд перед следующей игрой!")
+        return
+    
+    
+    # В конце функции ДОБАВЬТЕ:
+    await update_game_cooldown(msg.from_user.id, "coin")
     """Обработка команды монетка"""
     if len(parts) < 2:
         await msg.reply("❌ Укажите ставку!\nПример: <code>монетка 1000</code> или <code>монетка 1к</code> или <code>монетка 1кк</code>", parse_mode="HTML")
@@ -2876,6 +3293,7 @@ async def process_coin(msg: Message, parts: list):
     if bet > user['balance']:
         await msg.reply(f"❌ Не хватает денег. Баланс: {user['balance']:,}", parse_mode="HTML")
         return
+    await update_game_cooldown(msg.from_user.id, "coin")
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🦅 Орел", callback_data=f"coin_{bet}_orel"),
@@ -2892,9 +3310,18 @@ async def process_coin(msg: Message, parts: list):
     )
 
 async def process_dice(msg: Message, parts: list):
+    """Обработка команды кости с КД 5 секунд"""
+    # Проверяем КД
+    can_play, remaining = await check_game_cooldown(msg.from_user.id, "dice")
+    if not can_play:
+        seconds = int(remaining)
+        await msg.reply(f"⏳ Подождите {seconds} секунд перед следующей игрой!")
+        return
+
     """Обработка команды кости"""
     if len(parts) < 2:
         await msg.reply("❌ Укажите ставку!\nПример: <code>кости 1000</code> или <code>кости 1к</code> или <code>кости 1кк</code>", parse_mode="HTML")
+        await update_game_cooldown(msg.from_user.id, "dice")
         return
     
     bet_str = parts[1]
@@ -3390,6 +3817,132 @@ async def process_bj(msg: Message, parts: list):
 """
     await msg.reply(text, parse_mode="HTML", reply_markup=kb)
 
+async def process_crash(msg: Message, parts: list):
+    if len(parts) < 2:
+        await msg.reply(
+            "🚀 <b>Игра: Краш</b>\n\n"
+            "🎯 <b>Правила:</b>\n"
+            "1. Ставка умножается на растущий множитель\n"
+            "2. Заберите деньги ДО краха\n"
+            "3. Если забрали вовремя - получаете ставку × множитель\n"
+            "4. Если не успели - теряете ставку\n\n"
+            "💰 <b>Использование:</b> <code>краш [ставка]</code>\n"
+            "📊 <b>Примеры:</b>\n"
+            "• <code>краш 1000</code>\n"
+            "• <code>краш 1к</code>\n"
+            "• <code>краш 1кк</code>\n\n"
+            "🎮 <b>Лучшая стратегия:</b> Забирайте на 2x-3x\n\n"
+            "⚠️ <b>Внимание:</b> Игра в реальном времени!",
+            parse_mode="HTML"
+        )
+        return
+    
+    bet_str = parts[1]
+    bet = parse_amount(bet_str)
+    
+    if bet <= 0:
+        await msg.reply("❌ Неправильная ставка! Используйте: 1000, 1к, 1кк")
+        return
+    
+    user = await get_user(msg.from_user.id)
+    
+    if bet > user['balance']:
+        await msg.reply(f"❌ Не хватает денег. Баланс: {format_money(user['balance'])}")
+        return
+    
+    # Списываем ставку
+    success = await change_balance(msg.from_user.id, -bet)
+    if not success:
+        await msg.reply("❌ Ошибка при списании средств")
+        return
+    
+    # Генерируем точку краха
+    crash_point = CrashGame.get_crash_point()
+    crash_point_rounded = round(crash_point, 2)
+    
+    # Создаем клавиатуру для игры
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Забрать сейчас", callback_data=f"crash_cashout_{bet}_{msg.from_user.id}")]
+    ])
+    
+    # Начинаем игру
+    message = await msg.reply(
+        f"🚀 <b>КРАШ ИГРА НАЧАЛАСЬ!</b>\n\n"
+        f"💰 Ставка: {format_money(bet)}\n"
+        f"🎯 Точка краха: <b>???</b>\n\n"
+        f"⏳ Множитель растет...\n"
+        f"📈 Текущий: <b>1.00x</b>\n\n"
+        f"<i>Нажми 'Забрать сейчас' чтобы получить выигрыш!</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    
+    # Симуляция роста множителя
+    current_multiplier = 1.0
+    game_active = True
+    
+    for i in range(1, 101):  # Максимум 100 обновлений
+        if not game_active:
+            break
+            
+        # Увеличиваем множитель
+        increment = random.uniform(0.05, 0.15)
+        current_multiplier += increment
+        current_multiplier = round(current_multiplier, 2)
+        
+        # Проверяем крах
+        if current_multiplier >= crash_point_rounded:
+            # КРАХ!
+            game_active = False
+            win_amount = 0
+            result_text = f"💥 <b>КРАХ на {crash_point_rounded}x!</b>\n\nВы проиграли {format_money(bet)}"
+            await update_stats(msg.from_user.id, False)
+            
+            await message.edit_text(
+                f"💥 <b>КРАХ!</b>\n\n"
+                f"💰 Ставка: {format_money(bet)}\n"
+                f"🎯 Точка краха: <b>{crash_point_rounded}x</b>\n"
+                f"📈 Достигнуто: <b>{current_multiplier}x</b>\n\n"
+                f"{result_text}\n\n"
+                f"😢 Не успели забрать деньги",
+                parse_mode="HTML"
+            )
+            break
+        
+        # Обновляем сообщение
+        potential_win = int(bet * current_multiplier)
+        
+        await message.edit_text(
+            f"🚀 <b>КРАШ ИГРА</b>\n\n"
+            f"💰 Ставка: {format_money(bet)}\n"
+            f"🎯 Точка краха: <b>???</b>\n\n"
+            f"📈 Текущий множитель: <b>{current_multiplier}x</b>\n"
+            f"💰 Потенциальный выигрыш: <b>{format_money(potential_win)}</b>\n"
+            f"🎯 Прибыль: <b>+{format_money(potential_win - bet)}</b>\n\n"
+            f"<i>Нажми 'Забрать сейчас' чтобы получить {current_multiplier}x!</i>",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        
+        await asyncio.sleep(0.5)  # Пауза между обновлениями
+    
+    # Если игрок не забрал и не было краха (маловероятно)
+    if game_active:
+        # Автоматический кэшаут на последнем множителе
+        win_amount = int(bet * current_multiplier)
+        await change_balance(msg.from_user.id, win_amount)
+        await update_stats(msg.from_user.id, True)
+        
+        await message.edit_text(
+            f"🔄 <b>АВТОМАТИЧЕСКИЙ ВЫВОД</b>\n\n"
+            f"💰 Ставка: {format_money(bet)}\n"
+            f"🎯 Множитель: <b>{current_multiplier}x</b>\n"
+            f"💰 Выигрыш: <b>{format_money(win_amount)}</b>\n\n"
+            f"✅ <b>+{format_money(win_amount - bet)}</b>\n\n"
+            f"🎉 Вы выиграли!",
+            parse_mode="HTML"
+        )
+
 async def process_transfer(msg: Message, parts: list):
     """Обработка команды передачи денег"""
     if len(parts) < 3:
@@ -3851,6 +4404,53 @@ async def bonus_text_cmd(msg: Message):
 async def work_text_cmd(msg: Message):
     await process_work(msg)
 
+@router.message(F.text.lower().in_(["ежедневная", "ежедневка", "daily", "дэйли"]))
+@router.message(Command("daily", "ежедневная"))
+async def daily_reward_cmd(msg: Message):
+    """Получить ежедневную награду"""
+    success, amount, streak, message = await claim_daily_reward(msg.from_user.id)
+    
+    if success:
+        user = await get_user(msg.from_user.id)
+        
+        text = f"""
+🎁 <b>ЕЖЕДНЕВНАЯ НАГРАДА #{streak}</b>
+
+💰 <b>Получено:</b> {format_money(amount)}
+📊 <b>Серия:</b> {streak}/7 дней
+💵 <b>Новый баланс:</b> {format_money(user['balance'])}
+📝 <b>Статус:</b> {message}
+
+📅 <b>Следующая награда через 24 часа</b>
+🎯 <b>Завтра:</b> {format_money(DAILY_REWARDS.get(min(streak + 1, 7), 50_000_000))}
+"""
+        
+        # Показываем прогресс серии
+        progress_bar = ""
+        for i in range(1, 8):
+            if i <= streak:
+                progress_bar += "🟢"
+            else:
+                progress_bar += "⚫"
+        
+        text += f"\n{progress_bar} {streak}/7"
+        
+        await msg.reply(text, parse_mode="HTML")
+    else:
+        if amount > 0:  # amount содержит оставшееся время
+            hours = int(amount // 3600)
+            minutes = int((amount % 3600) // 60)
+            
+            await msg.reply(
+                f"⏳ <b>Еще рано!</b>\n\n"
+                f"📊 <b>Текущая серия:</b> {streak}/7 дней\n"
+                f"⏰ <b>До следующей награды:</b> {hours}ч {minutes}м\n"
+                f"💡 {message}",
+                parse_mode="HTML"
+            )
+        else:
+            await msg.reply(f"❌ {message}")
+
 @router.message(F.text.lower().startswith(("кд", "cd", "кулдаун")))
 async def cd_text_cmd(msg: Message):
     await check_bonus_cd(msg)
@@ -3905,7 +4505,20 @@ async def bj_text_cmd(msg: Message):
     parts = msg.text.split()
     await process_bj(msg, parts)
 
+@router.message(F.text.lower().startswith("краш"))
+async def crash_text_cmd(msg: Message):
+    """Команда для игры Краш"""
+    parts = msg.text.split()
+    await process_crash(msg, parts)
 
+@router.message(Command("краш", "crash"))
+async def crash_slash_cmd(msg: Message, command: CommandObject = None):
+    """Команда /краш"""
+    if command and command.args:
+        parts = ["краш"] + command.args.split()
+    else:
+        parts = ["краш"]
+    await process_crash(msg, parts)
 
 @router.message(F.text.lower().startswith(("передать", "transfer")))
 async def transfer_text_cmd(msg: Message):
@@ -4016,12 +4629,11 @@ async def show_my_businesses_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("mybiz_"))
 async def my_business_callback(cb: CallbackQuery):
-    """Обработка выбора бизнеса - с временем до сбора"""
+    """Обработка выбора бизнеса - с расходом продуктов по времени"""
     try:
         biz_id = int(cb.data.split("_")[1])
         uid = cb.from_user.id
         
-        # Получаем данные бизнеса
         user_businesses = await get_user_businesses(uid)
         if biz_id not in user_businesses:
             await cb.answer("❌ У вас нет этого бизнеса")
@@ -4033,28 +4645,42 @@ async def my_business_callback(cb: CallbackQuery):
         # Расчет прибыли
         profit_per_hour = business_info['profit_per_hour'] * (business_info['upgrade_multiplier'] ** (biz_data['level'] - 1))
         
+        # Рассчитываем сколько часов может проработать бизнес
+        remaining_hours = biz_data['product_amount']  # Каждый продукт = 1 час работы
+        max_hours = business_info['product_capacity']
+        
         # Процент заполнения продуктов
         product_percent = int((biz_data['product_amount'] / business_info['product_capacity']) * 100)
         
-        # Проверяем время до следующего сбора
+        # Рассчитываем сколько часов прошло с последнего сбора
         current_time = int(time.time())
         last_collected = biz_data.get('last_collected', 0)
-        time_since_last_collect = current_time - last_collected
         
-        can_collect = time_since_last_collect >= 3600
-        if not can_collect:
-            remaining_time = 3600 - time_since_last_collect
-            minutes = remaining_time // 60
-            seconds = remaining_time % 60
-            time_until_collect = f"⏳ До сбора: {minutes:02d}:{seconds:02d}"
+        if last_collected == 0:
+            last_collected = current_time
+        
+        time_passed = current_time - last_collected
+        hours_passed = time_passed / 3600
+        
+        # Сколько часов бизнес реально мог работать
+        possible_working_hours = min(hours_passed, remaining_hours)
+        accumulated_profit = int(profit_per_hour * possible_working_hours)
+        
+        # Статус бизнеса
+        if remaining_hours <= 0:
+            status = "🔴 Нет продуктов"
+        elif remaining_hours < max_hours * 0.3:
+            status = "🟡 Мало продуктов"
         else:
-            time_until_collect = "✅ Готово к сбору"
+            status = "🟢 Работает"
         
         # Создаем клавиатуру
+        can_collect = hours_passed > 0 and remaining_hours > 0 and accumulated_profit > 0
+        
         keyboard = [
             [
                 InlineKeyboardButton(text="🔄 Пополнить", callback_data=f"biz_refill_{biz_id}"),
-                InlineKeyboardButton(text="💰 Собрать" if can_collect else "⏳ Подожди", 
+                InlineKeyboardButton(text="💰 Собрать" if can_collect else "⏳ Нет прибыли", 
                                    callback_data=f"biz_collect_{biz_id}" if can_collect else "no_action")
             ],
             [
@@ -4073,12 +4699,15 @@ async def my_business_callback(cb: CallbackQuery):
 🏢 <b>{business_info['name']} (Уровень {biz_data['level']})</b>
 
 📊 <b>Информация:</b>
+• Статус: {status}
 • Уровень: {biz_data['level']}/{business_info['max_level']}
 • Продукты: {biz_data['product_amount']}/{business_info['product_capacity']}
 {progress_bar} {product_percent}%
+• Осталось часов работы: {remaining_hours} ч
 • Прибыль в час: {format_money(profit_per_hour)}
+• Накоплено прибыли: {format_money(accumulated_profit)}
+• Часов с прошлого сбора: {hours_passed:.1f} ч
 • Стоимость пополнения: {format_money(business_info['product_refill_cost'])}
-• {time_until_collect}
 """
         
         try:
@@ -4304,6 +4933,16 @@ async def get_bonus_cb(cb: CallbackQuery):
     await process_bonus(cb.message)
     await cb.answer()
 
+@router.callback_query(F.data == "get_daily")
+async def get_daily_callback(cb: CallbackQuery):
+    await daily_reward_cmd(cb.message)
+    await cb.answer()
+
+@router.callback_query(F.data == "play_crash")
+async def play_crash_callback(cb: CallbackQuery):
+    """Обработка нажатия на кнопку Краш"""
+    await cb.answer("🎮 Введите: краш [ставка]\nНапример: краш 1000 или краш 1к")
+
 @router.callback_query(F.data == "get_work")
 async def get_work_cb(cb: CallbackQuery):
     await process_work(cb.message)
@@ -4489,6 +5128,72 @@ async def bj_stand_cb(cb: CallbackQuery):
 """
     await cb.message.edit_text(text, parse_mode="HTML")
 
+@router.callback_query(F.data.startswith("crash_cashout_"))
+async def crash_cashout_callback(cb: CallbackQuery):
+    """Обработка кэшаута в игре Краш"""
+    try:
+        # callback_data: "crash_cashout_1000_123456789"
+        parts = cb.data.split("_")
+        bet = int(parts[2])
+        player_id = int(parts[3])
+        
+        # Проверяем, что это тот же пользователь
+        if cb.from_user.id != player_id:
+            await cb.answer("❌ Это не ваша игра!", show_alert=True)
+            return
+        
+        # Получаем текущий множитель из текста сообщения
+        import re
+        message_text = cb.message.text
+        
+        # Ищем множитель в тексте
+        multiplier_match = re.search(r'Текущий множитель:.*?<b>(\d+\.\d+)', message_text)
+        
+        if not multiplier_match:
+            # Пробуем другой паттерн
+            multiplier_match = re.search(r'(\d+\.\d+)x</b>', message_text)
+        
+        if multiplier_match:
+            multiplier = float(multiplier_match.group(1))
+            win_amount = int(bet * multiplier)
+            
+            # Начисляем выигрыш
+            await change_balance(player_id, win_amount)
+            await update_stats(player_id, True)
+            
+            # Показываем результат
+            await cb.message.edit_text(
+                f"💰 <b>ВЫВОД УСПЕШЕН!</b>\n\n"
+                f"🎯 Множитель: <b>{multiplier}x</b>\n"
+                f"💰 Ставка: {format_money(bet)}\n"
+                f"💵 Выигрыш: <b>{format_money(win_amount)}</b>\n\n"
+                f"✅ <b>+{format_money(win_amount - bet)}</b>\n\n"
+                f"🎉 Поздравляем с победой!",
+                parse_mode="HTML"
+            )
+            
+            await cb.answer(f"✅ Выигрыш: {format_money(win_amount)}!")
+        else:
+            # Если не нашли множитель, используем безопасный
+            safe_multiplier = 1.5
+            win_amount = int(bet * safe_multiplier)
+            await change_balance(player_id, win_amount)
+            
+            await cb.message.edit_text(
+                f"💰 <b>ВЫВОД УСПЕШЕН!</b>\n\n"
+                f"🎯 Множитель: <b>{safe_multiplier}x</b> (безопасный)\n"
+                f"💰 Ставка: {format_money(bet)}\n"
+                f"💵 Выигрыш: <b>{format_money(win_amount)}</b>\n\n"
+                f"✅ <b>+{format_money(win_amount - bet)}</b>",
+                parse_mode="HTML"
+            )
+            
+            await cb.answer(f"✅ Получено {format_money(win_amount)} (безопасный множитель)")
+            
+    except Exception as e:
+        logger.error(f"Ошибка crash_cashout_callback: {e}")
+        await cb.answer("❌ Ошибка вывода", show_alert=True)
+
 @router.callback_query(F.data.startswith("coin_"))
 async def coin_flip_cb(cb: CallbackQuery):
     try:
@@ -4543,39 +5248,35 @@ async def update_username_handler(msg: Message):
 # ========== ФУНКЦИИ ИЗ ДОПОЛНЕНИЯ ==========
 
 async def show_mining_panel(msg: Message = None, cb: CallbackQuery = None):
-    """Показать красивую inline-панель майнинга - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
-    # Получаем ID пользователя из сообщения или callback
+    """Показать красивую inline-панель майнинга - С РАСЧЕТОМ ОКУПАЕМОСТИ"""
     if msg:
         uid = msg.from_user.id
         message_obj = msg
     elif cb:
         uid = cb.from_user.id
         message_obj = cb.message
-    else:
-        return
+    accumulated = await auto_accumulate_bitcoin(uid)
+    if accumulated > 0:
+        logger.info(f"Автонакопление для {uid}: {accumulated:.6f} BTC")
     
-    # ПРИНУДИТЕЛЬНО ОБНОВЛЯЕМ ДАННЫЕ ИЗ БД
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT mining_gpu_count, mining_gpu_level, bitcoin, last_mining_claim FROM users WHERE id = ?", 
-                (uid,)
-            )
-            row = await cursor.fetchone()
-            
-            if row:
-                user = dict(row)
-            else:
-                user = {'mining_gpu_count': 0, 'mining_gpu_level': 1, 'bitcoin': 0.0, 'last_mining_claim': 0}
-    except Exception as e:
-        logger.error(f"Ошибка получения данных для майнинга: {e}")
-        user = {'mining_gpu_count': 0, 'mining_gpu_level': 1, 'bitcoin': 0.0, 'last_mining_claim': 0}
+    user = await get_user(uid)
     
     hashrate = BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level'])
     btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
     btc_price = BitcoinMining.get_bitcoin_price()
+    usd_per_hour = btc_per_hour * btc_price
     
+    # Расчет окупаемости
+    total_investment = 0
+    for level in range(1, user['mining_gpu_level'] + 1):
+        cards_at_level = user['mining_gpu_count'] if level == user['mining_gpu_level'] else 0
+        if cards_at_level > 0:
+            total_investment += BitcoinMining.get_gpu_price(level) * cards_at_level
+    
+    daily_income = usd_per_hour * 24
+    roi_days = total_investment / daily_income if daily_income > 0 else 0
+    
+    # Текущие накопления
     current_time = int(time.time())
     last_claim = user['last_mining_claim'] or current_time
     time_passed = current_time - last_claim
@@ -4583,49 +5284,56 @@ async def show_mining_panel(msg: Message = None, cb: CallbackQuery = None):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🛒 Купить видеокарту", callback_data="mining_buy_gpu"),
-            InlineKeyboardButton(text="⚡ Улучшить видеокарты", callback_data="mining_upgrade_gpu")
+            InlineKeyboardButton(text="🛒 Купить 1 видеокарту", callback_data="mining_buy_gpu_1"),
+            InlineKeyboardButton(text="🛒 Купить 10 видеокарт", callback_data="mining_buy_gpu_10")
         ],
         [
-            InlineKeyboardButton(text="💰 Забрать BTC", callback_data="mining_claim"),
-            InlineKeyboardButton(text="💸 Продать BTC", callback_data="mining_sell")
+            InlineKeyboardButton(text="⚡ Улучшить видеокарты", callback_data="mining_upgrade_gpu"),
+            InlineKeyboardButton(text="💰 Забрать BTC", callback_data="mining_claim")
         ],
         [
-            InlineKeyboardButton(text="📊 Обновить", callback_data="mining_refresh"),
-            InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")
-        ]
+            InlineKeyboardButton(text="💸 Продать BTC", callback_data="mining_sell"),
+            InlineKeyboardButton(text="📊 Обновить", callback_data="mining_refresh")
+        ],
+        [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
     ])
     
     text = f"""
-⛏️ <b>МАЙНИНГ ФЕРМА</b>
+⛏️ <b>МАЙНИНГ ФЕРМА - СУПЕР ВЫГОДНАЯ!</b>
 
-📊 <b>Статистика:</b>
-• 🎮 Видеокарт: <b>{user['mining_gpu_count']} шт.</b>
-• ⭐ Уровень видеокарт: <b>{user['mining_gpu_level']}/5</b>
-• ⚡ Хешрейт: <b>{hashrate:.1f} MH/s</b>
-• ₿ BTC/час: <b>{btc_per_hour:.8f}</b>
-• 💰 Курс BTC: <b>{format_money(int(btc_price))}$</b>
+📊 <b>Ваша ферма:</b>
+• 🎮 Видеокарт: {user['mining_gpu_count']} шт.
+• ⭐ Уровень: {user['mining_gpu_level']}/5
+• ⚡ Хешрейт: {hashrate:,.0f} MH/s
 
-💰 <b>Балансы:</b>
-• 💎 BTC: <b>{user.get('bitcoin', 0.0):.8f}</b>
-• ⏳ Накоплено: <b>{btc_mined:.8f} BTC</b>
-• 💵 Стоимость: <b>~{format_money(int(btc_mined * btc_price))}$</b>
+💰 <b>Доходность:</b>
+• ₿ BTC/час: {btc_per_hour:.4f}
+• 💰 $/час: {format_money(int(usd_per_hour))}
+• 💵 $/день: {format_money(int(daily_income))}
+• 📈 Окупаемость: {roi_days:.1f} дней
 
-💡 <b>Доступные действия:</b>
+💎 <b>Ваши активы:</b>
+• Накоплено BTC: {btc_mined:.6f} (~{format_money(int(btc_mined * btc_price))}$)
+• Всего BTC: {user['bitcoin']:.6f}
+
+🎯 <b>Стоимость видеокарт:</b>
+• Уровень 1: {format_money(BitcoinMining.get_gpu_price(1))}
+• Уровень 2: {format_money(BitcoinMining.get_gpu_price(2))}
+• Уровень 3: {format_money(BitcoinMining.get_gpu_price(3))}
+• Уровень 4: {format_money(BitcoinMining.get_gpu_price(4))}
+• Уровень 5: {format_money(BitcoinMining.get_gpu_price(5))}
 """
     
-    # Если это callback, редактируем существующее сообщение
     if cb:
         try:
             await message_obj.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
         except:
             await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
-    # Если это сообщение, отправляем новое
     elif msg:
         await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 async def show_my_planets_panel(msg: Message = None, cb: CallbackQuery = None):
-    """Показать панель 'Мои планеты' (исправленная версия)"""
+    """Показать панель 'Мои планеты' с автонакоплением плазмы"""
     # Получаем ID пользователя из сообщения или callback
     if msg:
         uid = msg.from_user.id
@@ -4636,9 +5344,18 @@ async def show_my_planets_panel(msg: Message = None, cb: CallbackQuery = None):
     else:
         return
     
+    # 🔥 ВАЖНО: ГАРАНТИРУЕМ автонакопление плазмы при открытии панели
+    # Просто вызываем get_user() - он автоматически начислит плазму
+    await get_user(uid)
+    
+    # Получаем обновленные данные пользователя (с автонакопленной плазмой)
+    user = await get_user(uid)
+    
+    # Получаем список планет пользователя
     user_planets = await get_user_planets(uid)
     
     if not user_planets:
+        # Если нет планет - показываем сообщение с кнопками
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🪐 Смотреть все планеты", callback_data="show_planets"),
              InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
@@ -4647,47 +5364,108 @@ async def show_my_planets_panel(msg: Message = None, cb: CallbackQuery = None):
         # Если это callback, редактируем сообщение
         if cb:
             try:
-                await message_obj.edit_text("🪐 У вас пока нет планет. Купите первую планету!", parse_mode="HTML", reply_markup=keyboard)
+                await message_obj.edit_text(
+                    "🪐 <b>У вас пока нет планет</b>\n\n"
+                    "Купите первую планету, чтобы начать получать плазму!\n\n"
+                    "💡 <b>Как купить:</b>\n"
+                    "• Напишите <code>планеты</code> - список планет\n"
+                    "• Напишите <code>купить планету [id]</code>\n\n"
+                    "⚡ <b>Плазма накапливается автоматически!</b>\n"
+                    "Просто зайдите сюда, и плазма добавится к балансу.",
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
             except:
-                await message_obj.answer("🪐 У вас пока нет планет. Купите первую планету!", parse_mode="HTML", reply_markup=keyboard)
-        else:
-            await message_obj.reply("🪐 У вас пока нет планет. Купите первую планету!", parse_mode="HTML", reply_markup=keyboard)
+                await message_obj.answer(
+                    "🪐 <b>У вас пока нет планет</b>\n\n"
+                    "Купите первую планету, чтобы начать получать плазму!\n\n"
+                    "💡 <b>Как купить:</b>\n"
+                    "• Напишите <code>планеты</code> - список планет\n"
+                    "• Напишите <code>купить планету [id]</code>\n\n"
+                    "⚡ <b>Плазма накапливается автоматически!</b>\n"
+                    "Просто зайдите сюда, и плазма добавится к балансу.",
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+        # Если это сообщение, отправляем новое
+        elif msg:
+            await message_obj.answer(
+                "🪐 <b>У вас пока нет планет</b>\n\n"
+                "Купите первую планету, чтобы начать получать плазму!\n\n"
+                "💡 <b>Как купить:</b>\n"
+                    "• Напишите <code>планеты</code> - список планет\n"
+                    "• Напишите <code>купить планету [id]</code>\n\n"
+                    "⚡ <b>Плазма накапливается автоматически!</b>\n"
+                    "Просто зайдите сюда, и плазма добавится к балансу.",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
         return
     
+    # 🔥 СОЗДАЕМ ТЕКСТ ДЛЯ ПАНЕЛИ С ПЛАНЕТАМИ
     text = "🪐 <b>МОИ ПЛАНЕТЫ</b>\n\n"
     
+    # Показываем общее количество плазмы (уже с автонакоплением)
+    text += f"⚡ <b>Ваша плазма:</b> {user['plasma']} единиц\n\n"
+    
+    # Создаем кнопки для inline-клавиатуры
     keyboard_buttons = []
+    
+    # Показываем информацию о каждой планете
     for planet_id, planet_data in user_planets.items():
         if planet_id in PLANETS:
             planet_info = PLANETS[planet_id]
             
-            current_time = int(time.time())
-            last_collected = planet_data['last_collected'] or current_time
-            time_passed = current_time - last_collected
-            plasma_accumulated = int((time_passed / 3600) * planet_info['plasma_per_hour'])
+            # 🔥 ВАЖНО: Не показываем "накоплено плазмы", так как она уже начислена
+            # Вместо этого показываем только генерацию в час
             
+            # Добавляем информацию о планете в текст
             text += f"• <b>{planet_info['name']}</b>\n"
-            text += f"  ⚡ Генерация: {planet_info['plasma_per_hour']}/час\n"
-            text += f"  💎 Накоплено: ~{plasma_accumulated} плазмы\n\n"
+            text += f"  ⚡ Генерация: {planet_info['plasma_per_hour']} плазмы/час\n"
+            text += f"  📝 {planet_info['description']}\n\n"
             
-    keyboard_buttons.append([
-        InlineKeyboardButton(
-            text=f"🪐 {planet_info['name']} - Собрать",
-            callback_data=f"planet_collect_{planet_id}"
+            # 🔥 ИЗМЕНЕНИЕ: Вместо кнопки "Собрать" делаем кнопку "Инфо"
+            # Потому что плазма теперь накапливается автоматически
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    text=f"🪐 {planet_info['name']} - Информация",
+                    callback_data=f"planet_info_{planet_id}"
                 )
-    ])
-
+            ])
+    
+    # 🔥 ОБНОВЛЕННЫЕ КНОПКИ ДЛЯ ПАНЕЛИ:
+    # 1. Продать плазму
+    # 2. Обновить панель
     keyboard_buttons.append([
         InlineKeyboardButton(text="💰 Продать плазму", callback_data="sell_plasma_menu"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data="planets_refresh")
     ])
-
+    
+    # 3. Кнопка назад в меню
     keyboard_buttons.append([
-        InlineKeyboardButton(text="🔄 Обновить", callback_data="planets_refresh"),
         InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")
     ])
     
+    # Создаем inline-клавиатуру
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    # 🔥 ДОБАВЛЯЕМ ПОЯСНЕНИЕ ОБ АВТОНАКОПЛЕНИИ
+    text += "💡 <b>Плазма теперь накапливается автоматически!</b>\n"
+    text += "Просто зайдите в профиль или откройте эту панель, и плазма будет добавлена к вашему балансу.\n\n"
+    text += "💰 <b>Продать плазму:</b> 1 единица = ~5-6М$\n"
+    text += f"💵 <b>Примерная стоимость:</b> {format_money(user['plasma'] * get_plasma_price())}$"
+    
+    # 🔥 ОТПРАВЛЯЕМ ИЛИ РЕДАКТИРУЕМ СООБЩЕНИЕ
+    # Если это callback, редактируем существующее сообщение
+    if cb:
+        try:
+            await message_obj.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except:
+            # Если не получается редактировать (старое сообщение), отправляем новое
+            await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    # Если это сообщение, отправляем новое
+    elif msg:
+        await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
     
     user = await get_user(uid)
     text += f"📊 <b>Общая статистика:</b>\n"
@@ -4787,16 +5565,56 @@ async def show_investments_panel(msg: Message = None, cb: CallbackQuery = None):
 
 # ========== CALLBACK ОБРАБОТЧИКИ ИЗ ДОПОЛНЕНИЯ ==========
 
-@router.callback_query(F.data == "mining_buy_gpu")
+@router.callback_query(F.data.startswith("mining_buy_gpu_"))
 async def mining_buy_gpu_callback(cb: CallbackQuery):
-    success, message = await buy_gpu(cb.from_user.id)
-    await cb.answer(message)
-    if success:
-        # Даем время базе данных обновиться
-        await asyncio.sleep(1)
-        # ПЕРЕД показом панели обновляем данные
-        await refresh_user_data(cb.from_user.id)
+    """Купить видеокарты (1 или 10)"""
+    try:
+        # Извлекаем количество из callback_data: mining_buy_gpu_1 или mining_buy_gpu_10
+        parts = cb.data.split("_")
+        count = int(parts[3])  # последняя часть - количество
+        
+        uid = cb.from_user.id
+        user = await get_user(uid)
+        gpu_level = user['mining_gpu_level']
+        
+        # Получаем цену одной видеокарты
+        single_gpu_price = BitcoinMining.get_gpu_price(gpu_level)
+        total_price = single_gpu_price * count
+        
+        if user['balance'] < total_price:
+            await cb.answer(f"❌ Не хватает {format_money(total_price - user['balance'])}")
+            return
+        
+        # Покупка
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Снимаем деньги
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (total_price, uid))
+            
+            # Увеличиваем количество видеокарт
+            new_gpu_count = user['mining_gpu_count'] + count
+            await db.execute("UPDATE users SET mining_gpu_count = ? WHERE id = ?", (new_gpu_count, uid))
+            
+            await db.commit()
+        
+        # Рассчитываем новую доходность
+        new_hashrate = BitcoinMining.calculate_hashrate(new_gpu_count, gpu_level)
+        new_btc_per_hour = BitcoinMining.calculate_btc_per_hour(new_hashrate)
+        btc_price = BitcoinMining.get_bitcoin_price()
+        new_usd_per_hour = new_btc_per_hour * btc_price
+        new_daily_income = new_usd_per_hour * 24
+        
+        # Расчет окупаемости
+        total_investment = single_gpu_price * new_gpu_count  # упрощенный расчет
+        roi_days = total_investment / new_daily_income if new_daily_income > 0 else 0
+        
+        await cb.answer(f"✅ Куплено {count} видеокарт уровня {gpu_level} за {format_money(total_price)}!")
+        
+        # Обновляем панель майнинга
         await show_mining_panel(cb=cb)
+        
+    except Exception as e:
+        logger.error(f"Ошибка покупки видеокарт: {e}")
+        await cb.answer("❌ Ошибка покупки")
 
 @router.callback_query(F.data == "mining_upgrade_gpu")
 async def mining_upgrade_gpu_callback(cb: CallbackQuery):
@@ -4873,6 +5691,244 @@ async def view_profile_callback(cb: CallbackQuery):
 async def planets_refresh_callback(cb: CallbackQuery):
     await show_my_planets_panel(cb=cb)
     await cb.answer("🔄 Обновлено")
+
+@router.callback_query(F.data.startswith("planet_info_"))
+async def planet_info_callback(cb: CallbackQuery):
+    """Показать подробную информацию о планете с расчетами доходности"""
+    try:
+        # Извлекаем ID планеты из callback_data: "planet_info_1"
+        planet_id = int(cb.data.split("_")[2])
+        uid = cb.from_user.id
+        
+        # Получаем планеты пользователя
+        user_planets = await get_user_planets(uid)
+        
+        # Проверяем, есть ли у пользователя эта планета
+        if planet_id not in user_planets:
+            await cb.answer("❌ У вас нет этой планеты", show_alert=True)
+            return
+        
+        # Получаем информацию о планете
+        if planet_id not in PLANETS:
+            await cb.answer("❌ Планета не найдена в системе", show_alert=True)
+            return
+        
+        planet_info = PLANETS[planet_id]
+        planet_data = user_planets[planet_id]
+        
+        # Получаем текущую цену плазмы для расчетов
+        plasma_price = get_plasma_price()
+        
+        # 🔥 РАСЧЕТЫ ДОХОДНОСТИ:
+        plasma_per_hour = planet_info['plasma_per_hour']
+        plasma_per_day = plasma_per_hour * 24
+        plasma_per_week = plasma_per_day * 7
+        plasma_per_month = plasma_per_day * 30
+        
+        # Рассчитываем доход в деньгах
+        income_per_hour = plasma_per_hour * plasma_price
+        income_per_day = plasma_per_day * plasma_price
+        income_per_week = plasma_per_week * plasma_price
+        income_per_month = plasma_per_month * plasma_price
+        
+        # 🔥 РАСЧЕТ ОКУПАЕМОСТИ:
+        investment_cost = 0
+        currency_type = ""
+        
+        if planet_info['price_dollars'] > 0:
+            investment_cost = planet_info['price_dollars']
+            currency_type = "$"
+        else:
+            investment_cost = planet_info['price_plasma'] * plasma_price
+            currency_type = "$ (в пересчете)"
+        
+        # Рассчитываем срок окупаемости (в днях)
+        payback_days = 0
+        if income_per_day > 0:
+            payback_days = investment_cost / income_per_day
+        
+        # 🔥 СТАТУС ПЛАНЕТЫ:
+        current_time = int(time.time())
+        last_collected = planet_data.get('last_collected', 0) or current_time
+        
+        # Время с последнего обновления (в часах)
+        hours_since_update = (current_time - last_collected) / 3600
+        
+        # Если плазма собиралась недавно, показываем активный статус
+        if hours_since_update < 1:
+            status = "🟢 АКТИВНА (собирает плазму)"
+            status_desc = f"Планета активно генерирует плазму. Следующее обновление через {60 - int(hours_since_update * 60)} мин."
+        elif hours_since_update < 24:
+            status = "🟡 РАБОТАЕТ (в фоне)"
+            status_desc = "Планета работает в фоновом режиме. Плазма накапливается автоматически."
+        else:
+            status = "🔴 ТРЕБУЕТ ВНИМАНИЯ"
+            status_desc = "Зайдите в бота, чтобы активировать генерацию плазмы."
+        
+        # 🔥 СОЗДАЕМ КЛАВИАТУРУ:
+        keyboard_buttons = [
+            # Кнопка для быстрой продажи плазмы с этой планеты
+            [InlineKeyboardButton(
+                text="💰 Продать плазму сейчас",
+                callback_data=f"sell_plasma_from_planet_{planet_id}"
+            )],
+            # Кнопки навигации
+            [InlineKeyboardButton(text="🪐 Все мои планеты", callback_data="planets_refresh"),
+             InlineKeyboardButton(text="💰 Продать всю плазму", callback_data="sell_plasma_all")],
+            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_menu")]
+        ]
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        
+        # 🔥 СОЗДАЕМ ТЕКСТ С ПОДРОБНОЙ ИНФОРМАЦИЕЙ:
+        text = f"""
+🪐 <b>ПОДРОБНАЯ ИНФОРМАЦИЯ О ПЛАНЕТЕ</b>
+
+📛 <b>Название:</b> {planet_info['name']}
+📝 <b>Описание:</b> {planet_info['description']}
+
+📊 <b>Статус:</b> {status}
+💡 {status_desc}
+
+💰 <b>Инвестиции:</b>
+"""
+        
+        # Показываем стоимость планеты
+        if planet_info['price_dollars'] > 0:
+            text += f"• Стоимость покупки: {format_money(planet_info['price_dollars'])} $\n"
+        else:
+            text += f"• Стоимость покупки: {planet_info['price_plasma']} плазмы\n"
+            text += f"• (~{format_money(investment_cost)} $ по текущему курсу)\n"
+        
+        text += f"""
+⚡ <b>Генерация плазмы:</b>
+• В час: {plasma_per_hour} единиц
+• В день: {plasma_per_day:,} единиц
+• В неделю: {plasma_per_week:,} единиц
+• В месяц: {plasma_per_month:,} единиц
+
+💵 <b>Финансовые показатели:</b>
+"""
+        
+        # Показываем доход в деньгах
+        text += f"• Доход в час: ~{format_money(income_per_hour)} $\n"
+        text += f"• Доход в день: ~{format_money(income_per_day)} $\n"
+        text += f"• Доход в неделю: ~{format_money(income_per_week)} $\n"
+        text += f"• Доход в месяц: ~{format_money(income_per_month)} $\n"
+        
+        # Показываем окупаемость если есть инвестиции
+        if investment_cost > 0:
+            text += f"\n📈 <b>Окупаемость:</b>\n"
+            text += f"• Стоимость: {format_money(investment_cost)} {currency_type}\n"
+            
+            if payback_days > 0:
+                if payback_days < 1:
+                    text += f"• Окупится за: {int(payback_days * 24)} часов\n"
+                elif payback_days < 30:
+                    text += f"• Окупится за: {payback_days:.1f} дней\n"
+                else:
+                    text += f"• Окупится за: {payback_days/30:.1f} месяцев\n"
+                
+                # Показываем дату окупаемости
+                payback_date = time.time() + (payback_days * 24 * 3600)
+                payback_str = time.strftime("%d.%m.%Y", time.localtime(payback_date))
+                text += f"• Дата окупаемости: {payback_str}\n"
+            else:
+                text += f"• Уже окупилась! ✅\n"
+        
+        # 🔥 ПОЛЕЗНЫЕ СОВЕТЫ:
+        text += f"""
+💡 <b>Как это работает:</b>
+1. Плазма генерируется автоматически 24/7
+2. При любой активности в боте плазма начисляется на баланс
+3. Продавайте плазму, когда цена высокая
+
+🎯 <b>Оптимальная стратегия:</b>
+• Продавайте плазму при цене выше {format_money(plasma_price * 1.2)}$ за единицу
+• Накапливайте плазму 2-3 дня для максимальной выгоды
+• Следите за колебаниями цены (она меняется ±10%)
+
+⚡ <b>Текущая цена плазмы:</b> {format_money(plasma_price)}$ за 1 единицу
+"""
+        
+        # 🔥 ОТПРАВЛЯЕМ СООБЩЕНИЕ:
+        try:
+            await cb.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except Exception as e:
+            # Если не получается редактировать, отправляем новое сообщение
+            await cb.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+            logger.error(f"Ошибка редактирования сообщения: {e}")
+        
+        await cb.answer(f"Информация о {planet_info['name']}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка в planet_info_callback: {e}")
+        await cb.answer("❌ Ошибка загрузки информации о планете", show_alert=True)
+
+@router.callback_query(F.data.startswith("sell_plasma_from_planet_"))
+async def sell_plasma_from_planet_callback(cb: CallbackQuery):
+    """Быстрая продажа плазмы с конкретной планеты"""
+    try:
+        planet_id = int(cb.data.split("_")[4])
+        uid = cb.from_user.id
+        
+        # Получаем пользователя (чтобы активировать автонакопление)
+        user = await get_user(uid)
+        
+        # Получаем планеты пользователя
+        user_planets = await get_user_planets(uid)
+        
+        # Проверяем, есть ли планета
+        if planet_id not in user_planets or planet_id not in PLANETS:
+            await cb.answer("❌ Планета не найдена")
+            return
+        
+        planet_info = PLANETS[planet_id]
+        
+        # Рассчитываем примерное количество плазмы за последние 24 часа
+        plasma_per_hour = planet_info['plasma_per_hour']
+        estimated_plasma = plasma_per_hour * 24  # За последние сутки
+        
+        # Ограничиваем максимумом - доступной плазмой пользователя
+        if estimated_plasma > user['plasma']:
+            estimated_plasma = user['plasma']
+        
+        if estimated_plasma <= 0:
+            await cb.answer("❌ Недостаточно плазмы для продажи")
+            return
+        
+        # Продаем рассчитанное количество плазмы
+        success, plasma_sold, money_received, price_per_unit = await sell_plasma(uid, estimated_plasma)
+        
+        if success:
+            # Обновляем данные пользователя
+            updated_user = await get_user(uid)
+            
+            # Создаем клавиатуру для возврата
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🪐 Вернуться к планетам", callback_data="planets_refresh")],
+                [InlineKeyboardButton(text="💰 Продать еще", callback_data=f"sell_plasma_from_planet_{planet_id}")]
+            ])
+            
+            await cb.message.edit_text(
+                f"✅ <b>Плазма продана успешно!</b>\n\n"
+                f"🪐 <b>Планета:</b> {planet_info['name']}\n"
+                f"💎 <b>Продано плазмы:</b> {plasma_sold} единиц\n"
+                f"💰 <b>Цена за единицу:</b> {format_money(price_per_unit)} $\n"
+                f"💵 <b>Получено:</b> {format_money(money_received)} $\n\n"
+                f"⚡ <b>Осталось плазмы:</b> {updated_user['plasma']} единиц\n"
+                f"💸 <b>Новый баланс:</b> {format_money(updated_user['balance'])} $\n\n"
+                f"🔄 <b>Планета продолжает генерировать плазму автоматически!</b>",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            await cb.answer(f"💰 Получено {format_money(money_received)}$!")
+        else:
+            await cb.answer(f"❌ {money_received}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка sell_plasma_from_planet_callback: {e}")
+        await cb.answer("❌ Ошибка продажи плазмы")
 
 @router.callback_query(F.data.startswith("invest_select_"))
 async def invest_select_callback(cb: CallbackQuery):
@@ -5103,6 +6159,31 @@ async def test_handler(msg: Message):
     """Тестовый хендлер для проверки работы бота"""
     await msg.answer("✅ Тест работает! Бот отвечает.")
 
+async def main():
+    await init_db()
+
+    bot = Bot(token=TOKEN)
+    dp = Dispatcher()
+    
+    # Отладочный вывод
+    print("=" * 50)
+    print("📋 ЗАРЕГИСТРИРОВАННЫЕ КОМАНДЫ:")
+    print("=" * 50)
+    
+    dp.include_router(router)
+    
+    # Получаем все зарегистрированные хендлеры
+    for handler in router.message.handlers:
+        if hasattr(handler, 'filters'):
+            for filter in handler.filters:
+                print(f"✅ Команда: {filter}")
+    
+    print("=" * 50)
+    
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info(f"✅ Бот запущен!")
+    # ... остальной код
+
 # ========== ЗАПУСК ==========
 async def main():
     await init_db()
@@ -5135,4 +6216,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main()). нужно сделать кд 5 секунд на сообщение
