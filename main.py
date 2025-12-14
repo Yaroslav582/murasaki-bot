@@ -12,14 +12,105 @@ from aiogram.enums import ChatType
 print("🔥 THIS FILE IS RUNNING")
 
 # ========== НАСТРОЙКИ ==========
-TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA"
+TOKEN = "7558734655:AAEUBQ2FiU-I3838E5q7XO1AmrBIMKBaYK8"
 ADMIN_IDS = {1162907446}  # Твой ID
 DB_PATH = "murasaki.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# Включить подробные логи
+logging.getLogger('aiogram').setLevel(logging.DEBUG)
 
 router = Router()
+
+@router.message(F.text.lower().startswith("купить бизнес"))
+async def buy_business_cmd(msg: Message):
+
+    try:
+        parts = msg.text.split()
+
+        if len(parts) < 3:
+            await msg.reply("❌ Использование:\n<code>купить бизнес [id]</code>", parse_mode="HTML")
+            return
+
+        business_id = int(parts[2])
+
+        success, result = await buy_business(msg.from_user.id, business_id)
+
+        await msg.reply(result if success else f"❌ {result}")
+
+    except Exception as e:
+        await msg.reply(
+            f"❌ <b>КРИТИЧЕСКАЯ ОШИБКА</b>\n<code>{e}</code>",
+            parse_mode="HTML"
+        )
+        raise  # ← ЭТО ВАЖНО
+
+@router.message(F.text.lower().startswith("купить планету"))
+async def buy_planet_cmd(msg: Message):
+    try:
+        parts = msg.text.split()
+
+        if len(parts) < 3:
+            await msg.reply(
+                "❌ Использование:\n<code>купить планету [id]</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        planet_id = int(parts[2])
+
+        success, result = await buy_planet(msg.from_user.id, planet_id)
+
+        await msg.reply(result if success else f"❌ {result}")
+
+    except ValueError:
+        await msg.reply("❌ ID планеты должен быть числом")
+    except Exception as e:
+        await msg.reply(
+            f"❌ <b>Ошибка</b>\n<code>{e}</code>",
+            parse_mode="HTML"
+        )
+        raise
+
+@router.message(F.text.lower().in_(["рефералы", "мои рефералы", "пригласить"]))
+async def referrals_cmd(msg: Message):
+    uid = msg.from_user.id
+    user = await get_user(uid)
+
+    bot_username = (await msg.bot.get_me()).username
+    referral_code = user['referral_code']
+    referral_link = f"https://t.me/{bot_username}?start={referral_code}"
+
+    text = (
+        "👥 <b>РЕФЕРАЛЬНАЯ СИСТЕМА</b>\n\n"
+        f"🔗 <b>Ваша ссылка:</b>\n"
+        f"<code>{referral_link}</code>\n\n"
+        f"📨 <b>Ваш код:</b> <code>{referral_code}</code>\n\n"
+        f"👤 <b>Приглашено:</b> {user.get('referral_count', 0)}\n"
+        f"💰 <b>Заработано:</b> {format_money(user.get('total_referral_earned', 0))}\n\n"
+        "🎁 <b>Награда за друга:</b> 30–100М\n"
+        "⚠️ Засчитывается только первый /start"
+    )
+@router.message(F.text.lower() == "профиль")
+async def profile_cmd(msg: Message):
+    uid = msg.from_user.id
+    user = await get_user(uid)
+
+    text = (
+        "👤 <b>ПРОФИЛЬ</b>\n\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"💰 Баланс: {format_money(user['balance'])}\n"
+        f"💎 Плазма: {user.get('plasma', 0)}\n"
+        f"₿ Биткоины: {user.get('bitcoin', 0):.6f}\n\n"
+        f"👥 Рефералы: {user.get('referral_count', 0)}\n"
+        f"💸 Заработано на рефералах: {format_money(user.get('total_referral_earned', 0))}\n\n"
+        f"🏆 Победы: {user.get('wins', 0)}\n"
+        f"💀 Поражения: {user.get('losses', 0)}"
+    )
+
+    await msg.reply(text, parse_mode="HTML")
+
 
 @router.message(F.text.lower() == "меню")
 async def menu_cmd(msg: Message):
@@ -255,6 +346,16 @@ PLANETS = {
         'description': 'Легендарное оружие'
     }
 }
+
+# ========== ПРОДАЖА ПЛАЗМЫ ==========
+PLASMA_PRICE_PER_UNIT = 5_000_000  # 5М за 1 единицу плазмы
+PLASMA_PRICE_FLUCTUATION = 0.1     # ±10% колебания цены
+
+def get_plasma_price():
+    """Текущая цена плазмы с колебаниями"""
+    base_price = PLASMA_PRICE_PER_UNIT
+    fluctuation = random.uniform(-PLASMA_PRICE_FLUCTUATION, PLASMA_PRICE_FLUCTUATION)
+    return int(base_price * (1 + fluctuation))
 
 # ========== ИНВЕСТИЦИИ ==========
 INVESTMENTS = {
@@ -1071,34 +1172,53 @@ async def get_user_businesses(uid: int):
         return {}
 
 async def buy_business(uid: int, business_id: int):
-    """Купить бизнес"""
+    """Купить бизнес - УПРОЩЕННАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    print(f"🔍 ВЫЗВАНА buy_business: user={uid}, business={business_id}")
+    
     if business_id not in BUSINESSES:
+        print(f"❌ Бизнес {business_id} не найден")
         return False, "Бизнес не найден"
     
     business = BUSINESSES[business_id]
     user = await get_user(uid)
     
+    print(f"💰 Баланс: {user['balance']}, Цена: {business['price']}")
+    
     if user['balance'] < business['price']:
+        print(f"❌ Не хватает денег")
         return False, f"Недостаточно средств. Нужно: {format_money(business['price'])}"
     
     user_businesses = await get_user_businesses(uid)
     if business_id in user_businesses:
+        print(f"❌ Уже есть этот бизнес")
         return False, "У вас уже есть этот бизнес"
     
     try:
+        print(f"✅ Покупаем бизнес {business_id}...")
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (business['price'], uid))
+            # Снимаем деньги
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", 
+                           (business['price'], uid))
             
+            # Добавляем бизнес
             await db.execute("""
                 INSERT INTO businesses (user_id, business_id, level, product_amount, last_collected)
                 VALUES (?, ?, ?, ?, ?)
             """, (uid, business_id, 1, business['product_capacity'], int(time.time())))
             
             await db.commit()
-            return True, f"Бизнес '{business['name']}' успешно куплен!"
+            print(f"✅ Бизнес куплен успешно!")
+            
+            # Получаем обновленный баланс
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            new_balance = row[0] if row else 0
+            
+            return True, f"✅ Бизнес '{business['name']}' успешно куплен за {format_money(business['price'])}!\n\n💰 Новый баланс: {format_money(new_balance)}"
+            
     except Exception as e:
-        logger.error(f"Ошибка buy_business: {e}")
-        return False, f"Ошибка покупки: {e}"
+        print(f"❌ Ошибка: {e}")
+        return False, f"❌ Ошибка покупки: {e}"
 
 async def upgrade_business(uid: int, business_id: int):
     """Улучшить бизнес"""
@@ -1380,6 +1500,46 @@ async def collect_planet_plasma(uid: int, planet_id: int):
     except Exception as e:
         logger.error(f"Ошибка collect_planet_plasma: {e}")
         return False, 0
+
+async def sell_plasma(uid: int, amount: int = None):
+    """Продать плазму за деньги"""
+    user = await get_user(uid)
+    
+    if user['plasma'] <= 0:
+        return False, "У вас нет плазмы"
+    
+    if amount is None:
+        amount = user['plasma']
+    elif amount > user['plasma']:
+        return False, f"Недостаточно плазмы. У вас: {user['plasma']}"
+    elif amount <= 0:
+        return False, "Укажите положительное количество"
+    
+    plasma_price = get_plasma_price()
+    total_price = amount * plasma_price
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET plasma = plasma - ?, balance = balance + ? WHERE id = ?", 
+                           (amount, total_price, uid))
+            await db.commit()
+            return True, amount, total_price, plasma_price
+    except Exception as e:
+        logger.error(f"Ошибка sell_plasma: {e}")
+        return False, 0, 0, 0
+    
+    # db.py (или где у тебя БД-функции)
+
+async def get_active_investments(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT type, name, amount, income, start_time, end_time
+            FROM investments
+            WHERE user_id = ? AND active = 1
+            ORDER BY start_time DESC
+        """, (uid,))
+        return await cursor.fetchall()
+
 
 # ========== МАЙНИНГ СИСТЕМА ==========
 async def buy_gpu(uid: int):
@@ -1883,56 +2043,6 @@ async def handle_all_commands(msg: Message):
             await handle_complex_command(msg, arg_cmd, parts[2:])
             return
 
-async def handle_complex_command(msg: Message, cmd: str, args: list):
-    """Обработка сложных команд с аргументами"""
-    uid = msg.from_user.id
-    
-    if cmd == 'купить бизнес' and args:
-        business_id = int(args[0]) if args[0].isdigit() else 0
-        if 1 <= business_id <= len(BUSINESSES):
-            success, message = await buy_business(uid, business_id)
-            await msg.reply(message, parse_mode="HTML")
-        else:
-            await msg.reply("❌ Неверный ID бизнеса")
-    
-    elif cmd == 'улучшить бизнес' and args:
-        business_id = int(args[0]) if args[0].isdigit() else 0
-        if 1 <= business_id <= len(BUSINESSES):
-            success, message = await upgrade_business(uid, business_id)
-            await msg.reply(message, parse_mode="HTML")
-        else:
-            await msg.reply("❌ Неверный ID бизнеса")
-    
-    elif cmd == 'пополнить бизнес' and args:
-        business_id = int(args[0]) if args[0].isdigit() else 0
-        if 1 <= business_id <= len(BUSINESSES):
-            success, message = await refill_products(uid, business_id)
-            await msg.reply(message, parse_mode="HTML")
-        else:
-            await msg.reply("❌ Неверный ID бизнеса")
-    
-    elif cmd == 'собрать бизнес' and args:
-        business_id = int(args[0]) if args[0].isdigit() else 0
-        if 1 <= business_id <= len(BUSINESSES):
-            success, result = await collect_business_profit(uid, business_id)
-            if success:
-                await msg.reply(f"✅ Прибыль собрана: {format_money(result)}", parse_mode="HTML")
-            else:
-                await msg.reply(f"❌ {result}", parse_mode="HTML")
-        else:
-            await msg.reply("❌ Неверный ID бизнеса")
-    
-    elif cmd == 'продать бизнес' and args:
-        business_id = int(args[0]) if args[0].isdigit() else 0
-        if 1 <= business_id <= len(BUSINESSES):
-            success, amount = await sell_business(uid, business_id)
-            if success:
-                await msg.reply(f"✅ Бизнес продан государству за {format_money(amount)}", parse_mode="HTML")
-            else:
-                await msg.reply(f"❌ {amount}", parse_mode="HTML")
-        else:
-            await msg.reply("❌ Неверный ID бизнеса")
-    
     elif cmd == 'купить планету' and args:
         planet_id = int(args[0]) if args[0].isdigit() else 0
         if 1 <= planet_id <= len(PLANETS):
@@ -1953,7 +2063,7 @@ async def handle_complex_command(msg: Message, cmd: str, args: list):
             await msg.reply("❌ Неверный ID планеты")
     
     elif cmd in ['инвестировать', 'начать инвестицию'] and len(args) >= 1:
-        await show_investments_panel(msg)
+        await show_investments_panel(msg=msg)
         return
     
     elif cmd == 'завершить инвестицию' and args:
@@ -1989,6 +2099,28 @@ async def handle_complex_command(msg: Message, cmd: str, args: list):
             await msg.reply(f"✅ Получено {btc_mined:.8f} BTC ({format_money(int(usd_value))}$)", parse_mode="HTML")
         else:
             await msg.reply(f"❌ {usd_value}", parse_mode="HTML")
+    
+    elif cmd == 'продать плазму' and args:
+        try:
+            amount = int(args[0]) if args[0] != 'все' else None
+            success, plasma_sold, money_received, price_per_unit = await sell_plasma(uid, amount)
+            if success:
+                updated_user = await get_user(uid)
+                await msg.reply(
+                    f"✅ <b>Плазма продана!</b>\n\n"
+                    f"💎 Продано: {plasma_sold} единиц плазмы\n"
+                    f"💰 Цена за единицу: {format_money(price_per_unit)}\n"
+                    f"💵 Получено: {format_money(money_received)}\n\n"
+                    f"⚡ Осталось плазмы: {updated_user['plasma']}",
+                    parse_mode="HTML"
+                )
+            else:
+                await msg.reply(f"❌ {money_received}", parse_mode="HTML")
+        except:
+            await msg.reply("❌ Неверный формат. Используйте: продать плазму [количество] или продать плазму все")
+    
+    else:
+        await msg.reply("❌ Неизвестная команда или неверный формат", parse_mode="HTML")
 
 # ========== ОСНОВНЫЕ ФУНКЦИИ ==========
 async def send_welcome_message(msg: Message):
@@ -3660,7 +3792,11 @@ async def cd_text_cmd(msg: Message):
 async def work_cd_text_cmd(msg: Message):
     await check_work_cd(msg)
 
-@router.message(F.text.lower().startswith(("профиль", "пр", "стата", "profile")))
+@router.message(F.text.lower() == "профиль")
+@router.message(F.text.lower() == "пр")
+@router.message(F.text.lower() == "стата")
+@router.message(F.text.lower() == "profile")
+@router.message(F.text.lower() == "stats")
 async def profile_text_cmd(msg: Message):
     await process_profile(msg)
 
@@ -4457,13 +4593,18 @@ async def show_my_planets_panel(msg: Message = None, cb: CallbackQuery = None):
             text += f"  ⚡ Генерация: {planet_info['plasma_per_hour']}/час\n"
             text += f"  💎 Накоплено: ~{plasma_accumulated} плазмы\n\n"
             
-            keyboard_buttons.append([
-                InlineKeyboardButton(
-                    text=f"🪐 {planet_info['name']} - Собрать",
-                    callback_data=f"planet_collect_{planet_id}"
+    keyboard_buttons.append([
+        InlineKeyboardButton(
+            text=f"🪐 {planet_info['name']} - Собрать",
+            callback_data=f"planet_collect_{planet_id}"
                 )
-            ])
-    
+    ])
+
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="💰 Продать плазму", callback_data="sell_plasma_menu"),
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="planets_refresh")
+    ])
+
     keyboard_buttons.append([
         InlineKeyboardButton(text="🔄 Обновить", callback_data="planets_refresh"),
         InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")
@@ -4755,6 +4896,132 @@ async def show_investments_callback(cb: CallbackQuery):
 async def show_investments_list_callback(cb: CallbackQuery):
     await show_investments(cb.message)
     await cb.answer()
+
+# ========== ФИКС КОМАНДЫ ПРОФИЛЬ ==========
+@router.message(F.text.lower().in_(["профиль", "пр", "стата", "profile", "stats"]))
+async def fix_profile_cmd(msg: Message):
+    """Фикс для команды профиль"""
+    await process_profile(msg)
+
+@router.message(Command("профиль", "пр", "стата", "profile", "stats"))
+async def fix_profile_slash(msg: Message):
+    """Фикс для команды профиль с /"""
+    await process_profile(msg)
+
+# ========== ФИКС ДЛЯ КОМАНДЫ ПРОФИЛЬ ==========
+@router.message(F.text.lower() == "профиль")
+@router.message(F.text.lower() == "пр")
+@router.message(F.text.lower() == "стата")
+@router.message(F.text.lower() == "profile")
+@router.message(F.text.lower() == "stats")
+async def fix_profile_cmd(msg: Message):
+    await process_profile(msg)
+
+@router.callback_query(F.data == "sell_plasma_menu")
+async def sell_plasma_menu_callback(cb: CallbackQuery):
+    """Меню продажи плазмы"""
+    user = await get_user(cb.from_user.id)
+    plasma_price = get_plasma_price()
+    
+    text = f"""
+💰 <b>ПРОДАЖА ПЛАЗМЫ</b>
+
+⚡ <b>Ваша плазма:</b> {user['plasma']} единиц
+💰 <b>Текущая цена:</b> {format_money(plasma_price)} за 1 единицу
+
+💎 <b>Примерная стоимость:</b>
+• 1 плазма → {format_money(plasma_price)}
+• 10 плазмы → {format_money(plasma_price * 10)}
+• 100 плазмы → {format_money(plasma_price * 100)}
+• Вся плазма → {format_money(plasma_price * user['plasma'])}
+
+📝 <b>Команды для продажи:</b>
+• <code>продать плазму 10</code> - продать 10 единиц
+• <code>продать плазму все</code> - продать всю плазму
+• <code>продать плазму 50</code> - продать 50 единиц
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💎 10 единиц", callback_data="sell_plasma_10"),
+            InlineKeyboardButton(text="💎 50 единиц", callback_data="sell_plasma_50")
+        ],
+        [
+            InlineKeyboardButton(text="💎 100 единиц", callback_data="sell_plasma_100"),
+            InlineKeyboardButton(text="💎 Всю плазму", callback_data="sell_plasma_all")
+        ],
+        [InlineKeyboardButton(text="🔙 Назад к планетам", callback_data="planets_refresh")]
+    ])
+    
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("sell_plasma_"))
+async def sell_plasma_callback(cb: CallbackQuery):
+    """Продажа плазмы через кнопку"""
+    try:
+        amount_str = cb.data.split("_")[2]
+        uid = cb.from_user.id
+        user = await get_user(uid)
+        
+        if amount_str == "all":
+            amount = user['plasma']
+        else:
+            amount = int(amount_str)
+        
+        if amount <= 0:
+            await cb.answer("❌ Недостаточно плазмы")
+            return
+        
+        success, plasma_sold, money_received, price_per_unit = await sell_plasma(uid, amount)
+        
+        if success:
+            updated_user = await get_user(uid)
+            await cb.message.edit_text(
+                f"✅ <b>Плазма продана!</b>\n\n"
+                f"💎 Продано: {plasma_sold} единиц плазмы\n"
+                f"💰 Цена за единицу: {format_money(price_per_unit)}\n"
+                f"💵 Получено: {format_money(money_received)}\n\n"
+                f"⚡ Осталось плазмы: {updated_user['plasma']}\n"
+                f"💰 Новый баланс: {format_money(updated_user['balance'])}",
+                parse_mode="HTML"
+            )
+            await cb.answer(f"✅ Получено {format_money(money_received)}!")
+        else:
+            await cb.answer(f"❌ {money_received}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка sell_plasma_callback: {e}")
+        await cb.answer("❌ Ошибка продажи")
+
+@router.message(F.text.lower().startswith("купить бизнес"))
+async def buy_business_cmd(msg: Message):
+    parts = msg.text.split()
+
+    if len(parts) < 3:
+        await msg.reply("❌ Использование:\n<code>купить бизнес [id]</code>", parse_mode="HTML")
+        return
+
+    try:
+        business_id = int(parts[2])
+    except ValueError:
+        await msg.reply("❌ ID бизнеса должен быть числом")
+        return
+
+    success, result = await buy_business(msg.from_user.id, business_id)
+
+    if success:
+        await msg.reply(result)
+    else:
+        await msg.reply(f"❌ {result}")
+
+
+
+# ========== ТЕСТОВЫЙ ХЕНДЛЕР ==========
+@router.message(F.text.lower() == "тест")
+async def test_handler(msg: Message):
+    """Тестовый хендлер для проверки работы бота"""
+    await msg.answer("✅ Тест работает! Бот отвечает.")
 
 # ========== ЗАПУСК ==========
 async def main():
