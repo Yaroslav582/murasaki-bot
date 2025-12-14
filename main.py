@@ -12,7 +12,7 @@ from aiogram.enums import ChatType
 print("🔥 THIS FILE IS RUNNING")
 
 # ========== НАСТРОЙКИ ==========
-TOKEN = "7558734655:AAEUBQ2FiU-I3838E5q7XO1AmrBIMKBaYK8"
+TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA"
 ADMIN_IDS = {1162907446}  # Твой ID
 DB_PATH = "murasaki.db"
 
