@@ -6216,4 +6216,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main()). нужно сделать кд 5 секунд на сообщение
+    asyncio.run(main())
