@@ -17,6 +17,8 @@ TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA"
 ADMIN_IDS = {1162907446}  # Твой ID
 DB_PATH = "murasaki.db"
 
+crash_games = {}  # {user_id: {"active": bool, "message_id": int, "bet": int, "multiplier": float, "crashed": bool}}
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 # Включить подробные логи
@@ -96,6 +98,41 @@ async def referrals_cmd(msg: Message):
     
     # ДОБАВЛЯЕМ ОТПРАВКУ СООБЩЕНИЯ:
     await msg.reply(text, parse_mode="HTML")
+
+# ========== КОМАНДЫ ДЛЯ ЛОТЕРЕИ ==========
+@router.message(F.text.lower().in_(["лотерея", "lottery", "лот", "лотерейка"]))
+async def lottery_cmd(msg: Message):
+    """Команда для показа лотереи"""
+    await show_lottery_info(msg=msg)
+
+@router.message(F.text.lower().startswith("купить лотерейный"))
+async def buy_lottery_cmd(msg: Message):
+    """Команда для покупки лотерейных билетов"""
+    parts = msg.text.split()
+    
+    if len(parts) < 3:
+        await msg.reply(
+            "🎫 <b>Покупка лотерейных билетов</b>\n\n"
+            "📝 <b>Использование:</b>\n"
+            "• <code>купить лотерейный 1</code> - 1 бронзовый билет (50М)\n"
+            "• <code>купить лотерейный 2</code> - 1 золотой билет (100М)\n"
+            "• <code>купить лотерейный 1 5</code> - 5 бронзовых билетов (250М)\n"
+            "• <code>купить лотерейный 2 3</code> - 3 золотых билета (300М)",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        ticket_type = int(parts[2])
+        count = int(parts[3]) if len(parts) > 3 else 1
+        
+        success, message = await buy_lottery_ticket(msg.from_user.id, ticket_type, count)
+        await msg.reply(message, parse_mode="HTML")
+        
+    except ValueError:
+        await msg.reply("❌ Неверный формат. Используйте числа для типа билета и количества.")
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
 
 @router.message(F.text.lower() == "профиль")
 async def profile_cmd(msg: Message):
@@ -224,6 +261,191 @@ class BitcoinMining:
             5: 2_400_000_000   # 2.4Б (в 6 раз дороже уровня 4)
         }
         return base_prices.get(gpu_level, 7_200_000)
+    
+    # ========== КЛАСС ДЛЯ УПРАВЛЕНИЯ ИГРОЙ КРАШ ==========
+class CrashGameManager:
+    @staticmethod
+    def is_game_active(user_id: int) -> bool:
+        """Проверяет, есть ли активная игра у пользователя"""
+        if user_id in crash_games:
+            game = crash_games[user_id]
+            # Проверяем, не устарела ли игра (максимум 5 минут)
+            if "timestamp" in game and time.time() - game["timestamp"] > 300:
+                del crash_games[user_id]
+                return False
+            return game.get("active", False)
+        return False
+    
+    @staticmethod
+    def start_game(user_id: int, bet: int, message_id: int):
+        """Начинает новую игру"""
+        crash_games[user_id] = {
+            "active": True,
+            "message_id": message_id,
+            "bet": bet,
+            "multiplier": 1.0,
+            "crashed": False,
+            "cashed_out": False,
+            "cashout_multiplier": 0,
+            "timestamp": time.time()
+        }
+    
+    @staticmethod
+    def update_multiplier(user_id: int, multiplier: float):
+        """Обновляет текущий множитель"""
+        if user_id in crash_games:
+            crash_games[user_id]["multiplier"] = multiplier
+    
+    @staticmethod
+    def cash_out(user_id: int):
+        """Игрок забирает деньги"""
+        if user_id in crash_games and crash_games[user_id]["active"]:
+            game = crash_games[user_id]
+            game["cashed_out"] = True
+            game["cashout_multiplier"] = game["multiplier"]
+            game["active"] = False
+            return True, game["multiplier"]
+        return False, 0
+    
+    @staticmethod
+    def crash_game(user_id: int):
+        """Игра крашится"""
+        if user_id in crash_games:
+            crash_games[user_id]["crashed"] = True
+            crash_games[user_id]["active"] = False
+    
+    @staticmethod
+    def end_game(user_id: int):
+        """Завершает игру"""
+        if user_id in crash_games:
+            del crash_games[user_id]
+    
+    @staticmethod
+    def get_game_info(user_id: int):
+        """Получает информацию об игре"""
+        return crash_games.get(user_id)
+    
+    # ========== ОТДЕЛЬНЫЕ ФУНКЦИИ ДЛЯ НАКОПЛЕНИЙ ==========
+async def calculate_and_update_mining(uid: int):
+    """Рассчитать и обновить накопленные BTC - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT mining_gpu_count, mining_gpu_level, bitcoin, last_mining_claim FROM users WHERE id = ?", 
+                (uid,)
+            )
+            row = await cursor.fetchone()
+            
+            if not row or row['mining_gpu_count'] == 0:
+                logger.debug(f"⛏️ У пользователя {uid} нет видеокарт для майнинга")
+                return 0
+            
+            current_time = int(time.time())
+            last_claim = row['last_mining_claim'] or current_time
+            
+            # Рассчитываем накопления
+            hashrate = BitcoinMining.calculate_hashrate(
+                row['mining_gpu_count'],
+                row['mining_gpu_level']
+            )
+            btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+            
+            time_passed = current_time - last_claim
+            
+            # Минимум 10 секунд для предотвращения спама
+            if time_passed < 10:
+                logger.debug(f"⏳ Слишком мало времени прошло: {time_passed} сек")
+                return 0
+            
+            # Максимум 30 дней накопления
+            max_seconds = 30 * 24 * 3600
+            time_passed = min(time_passed, max_seconds)
+            
+            btc_mined = btc_per_hour * (time_passed / 3600)
+            
+            logger.info(f"⛏️ Расчет для {uid}: {time_passed} сек = {btc_mined:.8f} BTC")
+            
+            if btc_mined > 0:
+                # НЕ обнуляем last_mining_claim, только начисляем BTC!
+                await db.execute(
+                    "UPDATE users SET bitcoin = bitcoin + ? WHERE id = ?",
+                    (btc_mined, uid)
+                )
+                await db.commit()
+                
+                # Очищаем кэш для этого пользователя
+                cache_key = f"user_{uid}"
+                if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+                    del get_user.cache[cache_key]
+                
+                logger.info(f"✅ Начислено BTC для {uid}: {btc_mined:.6f} за {time_passed/3600:.1f} часов")
+                return btc_mined
+            
+            return 0
+    except Exception as e:
+        logger.error(f"❌ Ошибка calculate_and_update_mining для {uid}: {e}")
+        return 0
+
+async def calculate_and_update_plasma(uid: int):
+    """Рассчитать и обновить накопленную плазму (вызывать только при открытии панели планет)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Получаем планеты пользователя
+            cursor = await db.execute("SELECT * FROM planets WHERE user_id = ?", (uid,))
+            rows = await cursor.fetchall()
+            
+            if not rows:
+                return 0
+            
+            current_time = int(time.time())
+            total_plasma_mined = 0
+            
+            for row in rows:
+                planet_id = row['planet_id']
+                if planet_id in PLANETS:
+                    planet_info = PLANETS[planet_id]
+                    last_collected = row['last_collected'] or current_time
+                    
+                    # Рассчитываем сколько плазмы накопилось
+                    time_passed = current_time - last_collected
+                    if time_passed > 0:
+                        # Максимум 30 дней накопления
+                        max_seconds = 30 * 24 * 3600
+                        time_passed = min(time_passed, max_seconds)
+                        
+                        plasma_per_hour = planet_info['plasma_per_hour']
+                        plasma_mined = int((time_passed / 3600) * plasma_per_hour)
+                        
+                        if plasma_mined > 0:
+                            total_plasma_mined += plasma_mined
+                            # Обновляем время последнего сбора для планеты
+                            await db.execute("""
+                                UPDATE planets 
+                                SET last_collected = ?
+                                WHERE user_id = ? AND planet_id = ?
+                            """, (current_time, uid, planet_id))
+            
+            if total_plasma_mined > 0:
+                # Начисляем плазму
+                await db.execute(
+                    "UPDATE users SET plasma = plasma + ? WHERE id = ?",
+                    (total_plasma_mined, uid)
+                )
+                await db.commit()
+                
+                # Очищаем кэш для этого пользователя
+                cache_key = f"user_{uid}"
+                if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+                    del get_user.cache[cache_key]
+                
+                logger.info(f"✅ Начислено плазмы для {uid}: {total_plasma_mined}")
+                return total_plasma_mined
+            
+            return 0
+    except Exception as e:
+        logger.error(f"❌ Ошибка calculate_and_update_plasma для {uid}: {e}")
+        return 0
     
     # ========== КРАШ ИГРА ==========
 class CrashGame:
@@ -396,6 +618,37 @@ BUSINESSES = {
         'product_refill_cost': 750_000
     }
 }
+
+# ========== ЛОТЕРЕЙНАЯ СИСТЕМА ==========
+LOTTERY_TICKETS = {
+    1: {
+        'name': '🎫 Бронзовый билет',
+        'price': 50_000_000,  # 50М
+        'prize_pool_percent': 0.7,  # 70% от всех продаж идет в призовой фонд
+        'min_prize': 100_000_000,  # Минимальный приз 100М
+        'emoji': '🥉'
+    },
+    2: {
+        'name': '🎫 Золотой билет',
+        'price': 100_000_000,  # 100М
+        'prize_pool_percent': 0.8,  # 80% от всех продаж идет в призовой фонд
+        'min_prize': 250_000_000,  # Минимальный приз 250М
+        'emoji': '🥇'
+    }
+}
+
+# Глобальная переменная для хранения данных лотереи
+lottery_data = {
+    'last_reset': time.time(),
+    'bronze_tickets_sold': 0,
+    'bronze_prize_pool': 0,
+    'bronze_players': [],  # Список кортежей (user_id, ticket_count)
+    'gold_tickets_sold': 0,
+    'gold_prize_pool': 0,
+    'gold_players': [],   # Список кортежей (user_id, ticket_count)
+    'last_winners': []
+}
+
 
 # ========== ПЛАНЕТЫ ==========
 PLANETS = {
@@ -702,6 +955,148 @@ def create_progress_bar(percentage: int, length: int = 10):
     empty_char = "░"
     return f"{filled_char * filled}{empty_char * empty}"
 
+# ========== ОТЛАДОЧНЫЕ КОМАНДЫ ==========
+@router.message(F.text.lower() == "проверка")
+async def simple_check_cmd(msg: Message):
+    """Проверить текущий баланс BTC"""
+    user = await get_user(msg.from_user.id)
+    
+    current_time = int(time.time())
+    last_claim = user.get('last_mining_claim', current_time)
+    
+    text = f"""
+🔍 <b>ПРОВЕРКА МАЙНИНГА</b>
+
+📊 <b>Данные:</b>
+• Видеокарт: {user['mining_gpu_count']}
+• Уровень: {user['mining_gpu_level']}
+• BTC баланс: {user['bitcoin']:.8f}
+• Последний сбор: {last_claim}
+• Прошло времени: {current_time - last_claim} сек
+
+💡 <b>Статус:</b>
+"""
+    
+    if user['mining_gpu_count'] == 0:
+        text += "❌ У вас нет видеокарт\n"
+        text += "Купите: <code>купить видеокарту</code>"
+    elif user['bitcoin'] <= 0:
+        text += "❌ BTC еще не накопились\n"
+        text += "Подождите 2-3 минуты"
+    else:
+        text += f"✅ Можно собрать: {user['bitcoin']:.8f} BTC"
+    
+    await msg.reply(text, parse_mode="HTML")
+
+@router.message(F.text.lower() == "форсфикс")
+async def force_fix_cmd(msg: Message):
+    """Принудительный фикс майнинга - ТОЛЬКО ДЛЯ АДМИНОВ"""
+    # Проверяем права администратора
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    uid = msg.from_user.id
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Устанавливаем время на 1 час назад и даем немного BTC
+            new_time = int(time.time()) - 3600
+            
+            await db.execute("""
+                UPDATE users 
+                SET last_mining_claim = ?, 
+                    bitcoin = 0.001,
+                    mining_gpu_count = CASE WHEN mining_gpu_count = 0 THEN 5 ELSE mining_gpu_count END
+                WHERE id = ?
+            """, (new_time, uid))
+            
+            await db.commit()
+            
+        # Очищаем кэш
+        cache_key = f"user_{uid}"
+        if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+            del get_user.cache[cache_key]
+            
+        await msg.reply(
+            "✅ <b>АДМИН-ФИКС ПРИМЕНЕН!</b>\n\n"
+            "• Время сброшено на 1 час назад\n"
+            "• Добавлено 0.001 BTC\n"
+            "• Если не было видеокарт - добавлено 5 шт\n\n"
+            "🔄 <b>Теперь проверьте:</b>\n"
+            "• <code>проверка</code> - статус майнинга\n"
+            "• <code>забрать биткоины</code> - собрать BTC\n"
+            "• <code>майнинг</code> - панель майнинга",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
+
+@router.message(F.text.lower() == "гарантия")
+async def guarantee_cmd(msg: Message):
+    """Гарантированная выдача BTC"""
+    uid = msg.from_user.id
+    
+    # Устанавливаем гарантированное количество BTC
+    guaranteed_btc = 0.01
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE users 
+            SET bitcoin = bitcoin + ?,
+                mining_gpu_count = CASE WHEN mining_gpu_count = 0 THEN 1 ELSE mining_gpu_count END
+            WHERE id = ?
+        """, (guaranteed_btc, uid))
+        await db.commit()
+    
+    await msg.reply(
+        f"✅ <b>ГАРАНТИЯ!</b>\n\n"
+        f"💰 <b>Добавлено:</b> {guaranteed_btc:.8f} BTC\n"
+        f"🎮 <b>Видеокарты:</b> минимум 1 шт\n\n"
+        f"Теперь попробуйте: <code>забрать биткоины</code>",
+        parse_mode="HTML"
+    )
+
+@router.message(F.text.lower() == "сбросить майнинг")
+async def reset_mining_cmd(msg: Message):
+    """Полный сброс майнинга"""
+    uid = msg.from_user.id
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Полный сброс с начальными значениями
+            await db.execute("""
+                UPDATE users 
+                SET mining_gpu_count = 5,
+                    mining_gpu_level = 1,
+                    bitcoin = 0.01,
+                    last_mining_claim = ?
+                WHERE id = ?
+            """, (int(time.time()) - 7200, uid))
+            
+            await db.commit()
+        
+        # Очищаем кэш
+        cache_key = f"user_{uid}"
+        if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+            del get_user.cache[cache_key]
+        
+        await msg.reply(
+            "🔄 <b>МАЙНИНГ ПОЛНОСТЬЮ СБРОШЕН И НАСТРОЕН!</b>\n\n"
+            "✅ Установлено:\n"
+            "• 5 видеокарт уровня 1\n"
+            "• 0.01 BTC для сбора\n"
+            "• Время на 2 часа назад\n\n"
+            "🎮 <b>Теперь попробуйте:</b>\n"
+            "• <code>забрать биткоины</code> - собрать BTC\n"
+            "• <code>майнинг</code> - открыть панель",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка сброса: {e}")
+
 # ========== БАЗА ДАННЫХ ==========
 async def update_db_structure():
     """Обновить структуру базы данных"""
@@ -728,7 +1123,6 @@ async def update_db_structure():
                 'last_mining_claim': 'INTEGER DEFAULT 0',
                 'wins': 'INTEGER DEFAULT 0',
                 'losses': 'INTEGER DEFAULT 0',
-                # ⬇ ДОБАВИТЬ ЭТИ ДВЕ СТРОКИ:
                 'last_daily_claim': 'INTEGER DEFAULT NULL',
                 'daily_streak': 'INTEGER DEFAULT 0',
                 'last_game_time': 'INTEGER DEFAULT 0'
@@ -738,8 +1132,9 @@ async def update_db_structure():
                 if column not in column_names:
                     await db.execute(f"ALTER TABLE users ADD COLUMN {column} {col_type}")
             
-            await db.commit()
+            await db.commit()  # Фиксируем изменения пользовательской таблицы
             
+            # 1. Создаем таблицу для бизнесов (если еще нет)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS businesses (
                     user_id INTEGER,
@@ -751,6 +1146,7 @@ async def update_db_structure():
                 )
             """)
             
+            # 2. Создаем таблицу для планет (если еще нет)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS planets (
                     user_id INTEGER,
@@ -760,6 +1156,7 @@ async def update_db_structure():
                 )
             """)
             
+            # 3. Создаем таблицу для инвестиций (если еще нет)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS investments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -771,7 +1168,20 @@ async def update_db_structure():
                 )
             """)
             
-            await db.commit()
+            # 4. Таблица для лотереи (уже в правильном месте!)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS lottery_winners (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    ticket_type INTEGER,
+                    prize_amount BIGINT,
+                    position INTEGER,
+                    draw_date INTEGER,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+            """)
+            
+            await db.commit()  # Финальный коммит для всех созданных таблиц
             logger.info("✅ Структура БД обновлена")
             
     except Exception as e:
@@ -811,9 +1221,25 @@ async def init_db():
     except Exception as e:
         logger.error(f"Ошибка БД: {e}")
 
+
+
 async def get_user(uid: int):
-    """Получить пользователя из БД - с автоматическим созданием если нет"""
+    """Получить пользователя из БД - БЕЗ автоматических начислений"""
     try:
+        # Кэширование на 5 секунд для предотвращения частых запросов
+        current_time = time.time()
+        cache_key = f"user_{uid}"
+        
+        # Проверяем кэш
+        if not hasattr(get_user, 'cache'):
+            get_user.cache = {}
+        
+        if cache_key in get_user.cache:
+            cached_data, timestamp = get_user.cache[cache_key]
+            if current_time - timestamp < 5:  # 5 секунд кэш
+                logger.debug(f"📦 Используем кэш для пользователя {uid}")
+                return cached_data.copy()  # Возвращаем копию
+        
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM users WHERE id = ?", (uid,))
@@ -821,10 +1247,11 @@ async def get_user(uid: int):
             
             # Если пользователя нет - создаем
             if not row:
+                logger.info(f"👤 Создаем нового пользователя: {uid}")
                 referral_code = generate_referral_code(uid)
                 await db.execute(
-                    "INSERT INTO users (id, referral_code) VALUES (?, ?)",
-                    (uid, referral_code)
+                    "INSERT INTO users (id, balance, referral_code) VALUES (?, ?, ?)",
+                    (uid, 0, referral_code)
                 )
                 await db.commit()
                 
@@ -835,81 +1262,10 @@ async def get_user(uid: int):
             if row:
                 user_dict = dict(row)
                 
-                # ========== АВТОМАТИЧЕСКОЕ НАКОПЛЕНИЕ BTC ==========
-                if user_dict.get('mining_gpu_count', 0) > 0:
-                    current_time = int(time.time())
-                    last_claim = user_dict.get('last_mining_claim', 0) or current_time
-                    
-                    # Рассчитываем сколько BTC накопилось
-                    hashrate = BitcoinMining.calculate_hashrate(
-                        user_dict.get('mining_gpu_count', 0),
-                        user_dict.get('mining_gpu_level', 1)
-                    )
-                    btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
-                    
-                    time_passed = current_time - last_claim
-                    btc_mined = btc_per_hour * (time_passed / 3600)
-                    
-                    if btc_mined > 0:
-                        # Автоматически начисляем BTC
-                        await db.execute(
-                            "UPDATE users SET bitcoin = bitcoin + ? WHERE id = ?",
-                            (btc_mined, uid)
-                        )
-                        # Обновляем время последнего сбора
-                        await db.execute(
-                            "UPDATE users SET last_mining_claim = ? WHERE id = ?",
-                            (current_time, uid)
-                        )
-                        await db.commit()
-                        
-                        # Обновляем данные пользователя
-                        user_dict['bitcoin'] = user_dict.get('bitcoin', 0) + btc_mined
-                        user_dict['last_mining_claim'] = current_time
-
-                                        # ========== АВТОМАТИЧЕСКОЕ НАКОПЛЕНИЕ ПЛАЗМЫ С ПЛАНЕТ ==========
-                user_planets = await get_user_planets(uid)
+                # ВНИМАНИЕ: УДАЛЕНЫ ВСЕ АВТОМАТИЧЕСКИЕ НАЧИСЛЕНИЯ!
+                # Теперь эта функция ТОЛЬКО читает данные, не изменяет их
                 
-                if user_planets:
-                    current_time = int(time.time())
-                    total_plasma_mined = 0
-                    
-                    for planet_id, planet_data in user_planets.items():
-                        if planet_id in PLANETS:
-                            planet_info = PLANETS[planet_id]
-                            last_collected = planet_data.get('last_collected', 0) or current_time
-                            
-                            # Рассчитываем сколько плазмы накопилось
-                            time_passed = current_time - last_collected
-                            if time_passed > 0:
-                                plasma_per_hour = planet_info['plasma_per_hour']
-                                plasma_mined = int((time_passed / 3600) * plasma_per_hour)
-                                
-                                if plasma_mined > 0:
-                                    total_plasma_mined += plasma_mined
-                                    # Обновляем время последнего сбора для планеты
-                                    await db.execute("""
-                                        UPDATE planets 
-                                        SET last_collected = ?
-                                        WHERE user_id = ? AND planet_id = ?
-                                    """, (current_time, uid, planet_id))
-                    
-                    if total_plasma_mined > 0:
-                        # Автоматически начисляем плазму
-                        await db.execute(
-                            "UPDATE users SET plasma = plasma + ? WHERE id = ?",
-                            (total_plasma_mined, uid)
-                        )
-                        await db.commit()
-                        
-                        # Обновляем данные пользователя
-                        user_dict['plasma'] = user_dict.get('plasma', 0) + total_plasma_mined
-                        
-                        # Логируем если много накопилось
-                        if total_plasma_mined > 100:
-                            logger.info(f"Автонакопление плазмы для {uid}: +{total_plasma_mined}")
-                
-                # Заполняем недостающие поля
+                # Заполняем недостающие поля значениями по умолчанию
                 default_fields = {
                     'work_time': 0,
                     'total_work': 0,
@@ -926,11 +1282,14 @@ async def get_user(uid: int):
                     'mining_gpu_level': 1,
                     'last_mining_claim': 0,
                     'wins': 0,
-                    'losses': 0
+                    'losses': 0,
+                    'last_daily_claim': None,
+                    'daily_streak': 0,
+                    'last_game_time': 0
                 }
                 
                 for field, default in default_fields.items():
-                    if field not in user_dict:
+                    if field not in user_dict or user_dict[field] is None:
                         user_dict[field] = default
                 
                 # Генерируем реферальный код если нет
@@ -942,13 +1301,40 @@ async def get_user(uid: int):
                     await db.execute("UPDATE users SET referral_code = ? WHERE id = ?", (referral_code, uid))
                     await db.commit()
                 
+                # Сохраняем в кэш
+                get_user.cache[cache_key] = (user_dict.copy(), current_time)
+                
                 return user_dict
             
             return None
             
     except Exception as e:
-        logger.error(f"Ошибка get_user: {e}")
+        logger.error(f"❌ Ошибка get_user для {uid}: {e}")
         return None
+
+# Инициализация кэша при загрузке модуля
+get_user.cache = {}
+
+async def reset_lottery():
+    ...
+
+async def buy_lottery_ticket(uid: int, ticket_type: int, count: int = 1):
+    ...
+
+async def draw_lottery():
+    ...
+
+async def save_lottery_winners():
+    ...
+
+async def get_last_winners():
+    ...
+
+async def show_lottery_info(msg: Message = None, cb: CallbackQuery = None):
+    ...
+
+async def show_my_tickets(uid: int, msg: Message = None, cb: CallbackQuery = None):
+    ...
 
 async def create_user_if_not_exists(uid: int, username: str = None):
     """Создать пользователя если не существует"""
@@ -1137,6 +1523,110 @@ async def auto_accumulate_bitcoin(uid: int):
     except Exception as e:
         logger.error(f"Ошибка auto_accumulate_bitcoin: {e}")
         return 0
+
+async def run_simple_crash_game(game_id: int, bet: int, crash_point: float, message: Message):
+    """Запускает игру Краш в фоне"""
+    try:
+        current_multiplier = 1.0
+        
+        for i in range(1, 101):  # 100 обновлений = 50 секунд
+            # Проверяем, активна ли еще игра
+            if game_id not in active_crash_games:
+                break
+            
+            game = active_crash_games[game_id]
+            
+            # Если игрок уже забрал или игра крашнулась
+            if game.get("cashed_out", False) or game.get("crashed", False):
+                break
+            
+            # Увеличиваем множитель
+            increment = random.uniform(0.05, 0.15)
+            current_multiplier += increment
+            current_multiplier = round(current_multiplier, 2)
+            
+            # Обновляем множитель в памяти
+            active_crash_games[game_id]["multiplier"] = current_multiplier
+            
+            # Проверяем крах
+            if current_multiplier >= crash_point:
+                # КРАХ!
+                active_crash_games[game_id]["crashed"] = True
+                
+                if game.get("cashed_out", False):
+                    # Игрок уже забрал
+                    cashout_multiplier = game.get("cashout_multiplier", 1.0)
+                    win_amount = int(bet * cashout_multiplier)
+                    result_text = f"💥 <b>КРАХ на {crash_point}x!</b>\n\n✅ Вы успели забрать {cashout_multiplier}x!\n💰 Выигрыш: {format_money(win_amount)}"
+                else:
+                    # Игрок не успел
+                    result_text = f"💥 <b>КРАХ на {crash_point}x!</b>\n\n❌ Вы проиграли {format_money(bet)}"
+                
+                try:
+                    await message.edit_text(
+                        f"💥 <b>КРАШ!</b>\n\n"
+                        f"💰 Ставка: {format_money(bet)}\n"
+                        f"🎯 Точка краха: <b>{crash_point}x</b>\n"
+                        f"📈 Достигнуто: <b>{current_multiplier}x</b>\n\n"
+                        f"{result_text}\n\n"
+                        f"🎮 Игра завершена",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+                
+                # Удаляем игру через 5 секунд
+                await asyncio.sleep(5)
+                if game_id in active_crash_games:
+                    del active_crash_games[game_id]
+                break
+            
+            # Обновляем сообщение
+            potential_win = int(bet * current_multiplier)
+            
+            try:
+                await message.edit_text(
+                    f"🚀 <b>КРАШ ИГРА</b>\n\n"
+                    f"💰 Ставка: {format_money(bet)}\n"
+                    f"🎯 Точка краха: <b>???</b>\n\n"
+                    f"📈 Текущий множитель: <b>{current_multiplier}x</b>\n"
+                    f"💰 Потенциальный выигрыш: <b>{format_money(potential_win)}</b>\n"
+                    f"🎯 Прибыль: <b>+{format_money(potential_win - bet)}</b>\n\n"
+                    f"<i>Нажми 'Забрать сейчас' чтобы получить {current_multiplier}x!</i>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="💰 Забрать сейчас", callback_data=f"crash_cashout_{game['user_id']}")]
+                    ])
+                )
+            except:
+                pass
+            
+            await asyncio.sleep(0.5)  # Пауза между обновлениями
+        
+        # Если игра не завершилась в цикле
+        if game_id in active_crash_games and not active_crash_games[game_id].get("crashed", False):
+            # Автоматический крах
+            try:
+                await message.edit_text(
+                    f"💥 <b>КРАШ!</b>\n\n"
+                    f"💰 Ставка: {format_money(bet)}\n"
+                    f"🎯 Точка краха: <b>{current_multiplier}x</b>\n\n"
+                    f"❌ Игра завершена по таймауту\n"
+                    f"💸 Проигрыш: {format_money(bet)}",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+            
+            # Удаляем игру
+            if game_id in active_crash_games:
+                del active_crash_games[game_id]
+                
+    except Exception as e:
+        logger.error(f"Ошибка в run_simple_crash_game: {e}")
+        # Очищаем игру в случае ошибки
+        if game_id in active_crash_games:
+            del active_crash_games[game_id]
 
 # ========== РЕФЕРАЛЬНАЯ СИСТЕМА ==========
 def generate_referral_code(user_id: int) -> str:
@@ -1933,62 +2423,167 @@ async def upgrade_gpu(uid: int):
         return False, f"❌ Ошибка улучшения: {e}"
 
 async def claim_mining_profit(uid: int):
-    """Забрать намайненые биткоины - С АВТОНАКОПЛЕНИЕМ"""
-    # Сначала автонакопление
-    await auto_accumulate_bitcoin(uid)
-    
-    user = await get_user(uid)
-    
-    if user['mining_gpu_count'] == 0:
-        return False, 0, "У вас нет майнинг фермы. Купите видеокарты!"
-    
-    # Текущие накопления (после автонакопления)
-    btc_to_claim = user['bitcoin']
-    
-    if btc_to_claim <= 0:
-        return False, 0, "Биткоины еще не намайнились"
-    
+    """Забрать намайненые биткоины - ИСПРАВЛЕННАЯ РАБОЧАЯ ВЕРСИЯ"""
     try:
+        logger.info(f"🔄 CLAIM_MINING_PROFIT вызвана для {uid}")
+        
+        # 1. Получаем данные пользователя
         async with aiosqlite.connect(DB_PATH) as db:
-            # Обнуляем баланс BTC (все забираем)
-            await db.execute("UPDATE users SET bitcoin = 0, last_mining_claim = ? WHERE id = ?", 
-                           (int(time.time()), uid))
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT mining_gpu_count, mining_gpu_level, bitcoin, last_mining_claim 
+                FROM users WHERE id = ?
+            """, (uid,))
+            row = await cursor.fetchone()
             
-            await db.commit()
+            if not row:
+                logger.error(f"❌ Пользователь {uid} не найден")
+                return False, 0, "Пользователь не найден"
             
+            user_data = dict(row)
+        
+        # 2. Проверяем наличие видеокарт
+        if user_data['mining_gpu_count'] == 0:
+            return False, 0, "❌ У вас нет майнинг фермы. Купите видеокарты!"
+        
+        # 3. Проверяем наличие BTC для сбора
+        current_btc = user_data.get('bitcoin', 0) or 0
+        
+        logger.info(f"📊 BTC для {uid}: {current_btc:.8f}")
+        
+        if current_btc <= 0:
+            # Рассчитываем сколько должно быть
+            hashrate = BitcoinMining.calculate_hashrate(
+                user_data['mining_gpu_count'],
+                user_data['mining_gpu_level']
+            )
+            btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+            
+            current_time = int(time.time())
+            last_claim = user_data.get('last_mining_claim', 0) or current_time
+            
+            time_passed = current_time - last_claim
+            potential_btc = btc_per_hour * (time_passed / 3600)
+            
+            logger.info(f"⏳ Рассчитано потенциально: {potential_btc:.8f} BTC")
+            
+            if potential_btc <= 0:
+                return False, 0, (
+                    f"⏳ <b>БИТКОИНЫ ЕЩЕ НЕ НАКОПИЛИСЬ</b>\n\n"
+                    f"🎮 Ваша ферма:\n"
+                    f"• Видеокарт: {user_data['mining_gpu_count']} шт.\n"
+                    f"• Уровень: {user_data['mining_gpu_level']}/5\n\n"
+                    f"⚡ Хешрейт: {hashrate:,.0f} MH/s\n"
+                    f"₿ Майнинг: {btc_per_hour:.8f} BTC/час\n\n"
+                    f"💡 Подождите 2-3 минуты."
+                )
+            else:
+                # Если есть потенциальные BTC - начисляем их!
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("""
+                        UPDATE users 
+                        SET bitcoin = bitcoin + ?,
+                            last_mining_claim = ?
+                        WHERE id = ?
+                    """, (potential_btc, current_time, uid))
+                    await db.commit()
+                
+                # Обновляем current_btc
+                current_btc = potential_btc
+        
+        # 4. Если есть BTC - забираем их
+        if current_btc > 0:
+            current_time = int(time.time())
+            logger.info(f"💰 Собираем {current_btc:.8f} BTC для {uid}")
+            
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Сбрасываем баланс BTC и обновляем время
+                await db.execute("""
+                    UPDATE users 
+                    SET bitcoin = 0,
+                        last_mining_claim = ?
+                    WHERE id = ?
+                """, (current_time, uid))
+                await db.commit()
+            
+            # Очищаем кэш
+            cache_key = f"user_{uid}"
+            if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+                del get_user.cache[cache_key]
+            
+            # Рассчитываем стоимость
             btc_price = BitcoinMining.get_bitcoin_price()
-            usd_value = btc_to_claim * btc_price
+            usd_value = current_btc * btc_price
             
-            return True, btc_to_claim, usd_value
+            logger.info(f"🎉 Успешно собрано для {uid}: {current_btc:.8f} BTC = ${usd_value:.2f}")
+            
+            return True, current_btc, usd_value
+        
+        return False, 0, "❌ Не удалось собрать биткоины"
+            
     except Exception as e:
-        logger.error(f"Ошибка claim_mining_profit: {e}")
-        return False, 0, f"Ошибка: {e}"
+        logger.error(f"❌ КРИТИЧЕСКАЯ ошибка в claim_mining_profit для {uid}: {e}", exc_info=True)
+        return False, 0, f"❌ Произошла ошибка: {str(e)}"
 
 async def sell_bitcoin(uid: int, amount: float = None):
-    """Продать биткоины"""
-    user = await get_user(uid)
-    
-    if user['bitcoin'] <= 0:
-        return False, "У вас нет биткоинов"
-    
-    if amount is None:
-        amount = user['bitcoin']
-    elif amount > user['bitcoin']:
-        return False, "Недостаточно биткоинов"
-    
-    btc_price = BitcoinMining.get_bitcoin_price()
-    usd_amount = amount * btc_price
-    
+    """Продать биткоины - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
     try:
+        logger.info(f"💰 sell_bitcoin вызвана для {uid}, amount={amount}")
+        
+        # 1. Получаем данные пользователя
+        user = await get_user(uid)
+        current_btc = user.get('bitcoin', 0) or 0
+        
+        logger.info(f"📊 Текущий BTC баланс {uid}: {current_btc:.8f}")
+        
+        if current_btc <= 0:
+            return False, "❌ У вас нет биткоинов"
+        
+        # 2. Определяем количество для продажи
+        btc_to_sell = 0
+        
+        if amount is None:
+            btc_to_sell = current_btc
+            logger.info(f"🔄 Продаем ВСЕ BTC: {btc_to_sell:.8f}")
+        elif amount == 'все' or str(amount).lower() == 'all':
+            btc_to_sell = current_btc
+            logger.info(f"🔄 Продаем ВСЕ BTC: {btc_to_sell:.8f}")
+        elif isinstance(amount, (int, float)):
+            if amount > current_btc:
+                return False, f"❌ Недостаточно биткоинов. У вас: {current_btc:.8f} BTC"
+            if amount <= 0:
+                return False, "❌ Укажите положительное количество"
+            btc_to_sell = float(amount)
+            logger.info(f"🔄 Продаем {btc_to_sell:.8f} BTC из {current_btc:.8f}")
+        else:
+            return False, "❌ Неверный формат количества"
+        
+        # 3. Получаем текущую цену
+        btc_price = BitcoinMining.get_bitcoin_price()
+        usd_amount = btc_to_sell * btc_price
+        
+        logger.info(f"💵 Продажа {btc_to_sell:.8f} BTC по цене ${btc_price:,.2f} = ${usd_amount:,.2f}")
+        
+        # 4. Выполняем продажу
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET bitcoin = bitcoin - ?, balance = balance + ? WHERE id = ?", 
-                           (amount, int(usd_amount), uid))
-            
+            await db.execute(
+                "UPDATE users SET bitcoin = bitcoin - ?, balance = balance + ? WHERE id = ?", 
+                (btc_to_sell, int(usd_amount), uid)
+            )
             await db.commit()
-            return True, amount, int(usd_amount)
+            
+            # 5. Очищаем кэш
+            cache_key = f"user_{uid}"
+            if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+                del get_user.cache[cache_key]
+            
+            logger.info(f"✅ Успешная продажа BTC для {uid}: {btc_to_sell:.8f} BTC → ${usd_amount:,.2f}")
+            
+            return True, btc_to_sell, int(usd_amount)
+            
     except Exception as e:
-        logger.error(f"Ошибка sell_bitcoin: {e}")
-        return False, 0, 0
+        logger.error(f"❌ Ошибка sell_bitcoin для {uid}: {e}", exc_info=True)
+        return False, f"❌ Ошибка при продаже: {str(e)}", 0
 
 # ========== ИНВЕСТИЦИИ СИСТЕМА ==========
 async def get_user_investments(uid: int):
@@ -2103,7 +2698,7 @@ async def check_bonus_cooldown(uid: int):
 async def give_bonus(uid: int):
     """Выдать бонус от 5 до 20 миллионов"""
     try:
-        amount = random.randint(5_000_000, 20_000_000)
+        amount = random.randint(15_000_000, 50_000_000)
         current_time = int(time.time())
         
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2188,7 +2783,7 @@ async def update_game_cooldown(uid: int, game_type: str):
 async def give_work_reward(uid: int):
     """Выдать награду за работу (1-5 миллионов)"""
     try:
-        amount = random.randint(1_000_000, 5_000_000)
+        amount = random.randint(1_000_000, 10_000_000)
         current_time = int(time.time())
         
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2341,6 +2936,18 @@ async def handle_all_commands(msg: Message):
     
     parts = text.split()
     cmd = text.lower()
+
+    if cmd == 'проверка':
+        await simple_check_cmd(msg)
+        return
+    
+    if cmd == 'форсфикс':
+        await force_fix_cmd(msg)
+        return
+    
+    if cmd == 'гарантия':
+        await guarantee_cmd(msg)
+        return
     
 @router.message(Command("start"))
 async def cmd_start(msg: Message, command: CommandObject = None):
@@ -2521,51 +3128,26 @@ async def cmd_start(msg: Message, command: CommandObject = None):
     
     elif cmd == 'продать биткоин' and args:
         try:
-            amount = float(args[0]) if args[0] != 'все' else None
+            if args[0].lower() == 'все':
+                amount = None  # Продать все
+            else:
+                amount = float(args[0])
+        
             success, btc_sold, usd_received = await sell_bitcoin(uid, amount)
             if success:
-                await msg.reply(f"✅ Продано {btc_sold:.8f} BTC за {format_money(usd_received)}$", parse_mode="HTML")
+                user = await get_user(uid)  # Получаем обновленные данные
+                await msg.reply(
+                f"✅ <b>БИТКОИНЫ ПРОДАНЫ!</b>\n\n"
+                f"💰 <b>Продано:</b> {btc_sold:.8f} BTC\n"
+                f"💵 <b>Получено:</b> {format_money(usd_received)}$\n"
+                f"📊 <b>Осталось BTC:</b> {user['bitcoin']:.8f}\n"
+                f"💳 <b>Новый баланс:</b> {format_money(user['balance'])}",
+                parse_mode="HTML"
+            )
             else:
                 await msg.reply(f"❌ {usd_received}", parse_mode="HTML")
         except:
             await msg.reply("❌ Неверный формат команды. Используйте: продать биткоин [количество] или продать биткоин все")
-    
-    elif cmd == 'купить видеокарту':
-        success, message = await buy_gpu(uid)
-        await msg.reply(message, parse_mode="HTML")
-    
-    elif cmd == 'улучшить видеокарты':
-        success, message = await upgrade_gpu(uid)
-        await msg.reply(message, parse_mode="HTML")
-    
-    elif cmd == 'собрать биткоины':
-        success, btc_mined, usd_value = await claim_mining_profit(uid)
-        if success:
-            await msg.reply(f"✅ Получено {btc_mined:.8f} BTC ({format_money(int(usd_value))}$)", parse_mode="HTML")
-        else:
-            await msg.reply(f"❌ {usd_value}", parse_mode="HTML")
-    
-    elif cmd == 'продать плазму' and args:
-        try:
-            amount = int(args[0]) if args[0] != 'все' else None
-            success, plasma_sold, money_received, price_per_unit = await sell_plasma(uid, amount)
-            if success:
-                updated_user = await get_user(uid)
-                await msg.reply(
-                    f"✅ <b>Плазма продана!</b>\n\n"
-                    f"💎 Продано: {plasma_sold} единиц плазмы\n"
-                    f"💰 Цена за единицу: {format_money(price_per_unit)}\n"
-                    f"💵 Получено: {format_money(money_received)}\n\n"
-                    f"⚡ Осталось плазмы: {updated_user['plasma']}",
-                    parse_mode="HTML"
-                )
-            else:
-                await msg.reply(f"❌ {money_received}", parse_mode="HTML")
-        except:
-            await msg.reply("❌ Неверный формат. Используйте: продать плазму [количество] или продать плазму все")
-    
-    else:
-        await msg.reply("❌ Неизвестная команда или неверный формат", parse_mode="HTML")
 
 # ========== ОСНОВНЫЕ ФУНКЦИИ ==========
 async def send_welcome_message(msg: Message):
@@ -2661,13 +3243,13 @@ async def process_bonus(msg: Message):
 
     # Проверяем, можно ли получить бонус (1 час кулдаун)
     time_passed = now - last_bonus
-    remaining = 3600 - time_passed  # 1 час = 3600 секунд
+    remaining = 1800 - time_passed  # 1 час = 3600 секунд
     
     # Если время еще не прошло - показываем ко-даун
     if remaining > 0 and last_bonus != 0:
         minutes = remaining // 60
         seconds = remaining % 60
-        progress_percent = int(time_passed / 3600 * 100)
+        progress_percent = int(time_passed / 1800 * 100)
         progress_bar = create_progress_bar(progress_percent)
         
         next_time = now + remaining
@@ -2714,7 +3296,7 @@ async def process_bonus(msg: Message):
         f"⭐️ <b>БОЛЬШОЙ БОНУС!</b>\n\n"
         f"💰 <b>Сумма:</b> {bonus_amount:,}\n"
         f"📊 <b>Новый баланс:</b> {new_balance:,}\n\n"
-        f"⏰ <b>Следующий бонус через 1 час:</b>\n"
+        f"⏰ <b>Следующий бонус через 30 минут:</b>\n"
         f"🕐 {next_str}\n\n"
         f"{progress_bar} 0%\n\n"
         f"🏦 <b>Всего получено:</b> {total_bonus:,}",
@@ -3405,19 +3987,19 @@ async def process_slots(msg: Message, parts: list):
     symbols = ["🍒", "🔔", "💎", "7️⃣", "🍋", "⭐"]
     loading_msg = await msg.reply("🎰 <b>Крутим слоты...</b>\n┃ 🎰 ┃ 🎰 ┃ 🎰 ┃", parse_mode="HTML")
     
-    for i in range(12):
+    for i in range(3):
         slot1 = random.choice(symbols)
         slot2 = random.choice(symbols)
         slot3 = random.choice(symbols)
         await loading_msg.edit_text(f"🎰 <b>Крутим слоты...</b>\n┃ {slot1} ┃ {slot2} ┃ {slot3} ┃", parse_mode="HTML")
         await asyncio.sleep(0.1)
     
-    for i in range(6):
+    for i in range(4):
         slot1 = random.choice(symbols)
         slot2 = random.choice(symbols)
         slot3 = random.choice(symbols)
         await loading_msg.edit_text(f"🎰 <b>Крутим слоты...</b>\n┃ {slot1} ┃ {slot2} ┃ {slot3} ┃", parse_mode="HTML")
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
     
     result = [random.choice(symbols) for _ in range(3)]
     
@@ -3817,24 +4399,20 @@ async def process_bj(msg: Message, parts: list):
 """
     await msg.reply(text, parse_mode="HTML", reply_markup=kb)
 
+# Добавь глобальную переменную для хранения игр
+active_crash_games = {}  # {message_id: {"bet": int, "multiplier": float, "user_id": int, "crashed": bool}}
+
 async def process_crash(msg: Message, parts: list):
+    """Обработка команды краш - ФИКСИРОВАННАЯ ВЕРСИЯ"""
+    # Проверяем КД
+    can_play, remaining = await check_game_cooldown(msg.from_user.id, "crash")
+    if not can_play:
+        seconds = int(remaining)
+        await msg.reply(f"⏳ Подождите {seconds} секунд перед следующей игрой!")
+        return
+    
     if len(parts) < 2:
-        await msg.reply(
-            "🚀 <b>Игра: Краш</b>\n\n"
-            "🎯 <b>Правила:</b>\n"
-            "1. Ставка умножается на растущий множитель\n"
-            "2. Заберите деньги ДО краха\n"
-            "3. Если забрали вовремя - получаете ставку × множитель\n"
-            "4. Если не успели - теряете ставку\n\n"
-            "💰 <b>Использование:</b> <code>краш [ставка]</code>\n"
-            "📊 <b>Примеры:</b>\n"
-            "• <code>краш 1000</code>\n"
-            "• <code>краш 1к</code>\n"
-            "• <code>краш 1кк</code>\n\n"
-            "🎮 <b>Лучшая стратегия:</b> Забирайте на 2x-3x\n\n"
-            "⚠️ <b>Внимание:</b> Игра в реальном времени!",
-            parse_mode="HTML"
-        )
+        await msg.reply("🎮 Используйте: <code>краш [ставка]</code>\nПример: краш 1000 или краш 1к")
         return
     
     bet_str = parts[1]
@@ -3850,11 +4428,13 @@ async def process_crash(msg: Message, parts: list):
         await msg.reply(f"❌ Не хватает денег. Баланс: {format_money(user['balance'])}")
         return
     
-    # Списываем ставку
     success = await change_balance(msg.from_user.id, -bet)
     if not success:
         await msg.reply("❌ Ошибка при списании средств")
         return
+    
+    # Обновляем КД
+    await update_game_cooldown(msg.from_user.id, "crash")
     
     # Генерируем точку краха
     crash_point = CrashGame.get_crash_point()
@@ -3862,7 +4442,7 @@ async def process_crash(msg: Message, parts: list):
     
     # Создаем клавиатуру для игры
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Забрать сейчас", callback_data=f"crash_cashout_{bet}_{msg.from_user.id}")]
+        [InlineKeyboardButton(text="💰 Забрать сейчас", callback_data=f"crash_cashout_{msg.from_user.id}")]
     ])
     
     # Начинаем игру
@@ -3877,71 +4457,18 @@ async def process_crash(msg: Message, parts: list):
         reply_markup=keyboard
     )
     
-    # Симуляция роста множителя
-    current_multiplier = 1.0
-    game_active = True
+    # Сохраняем игру в память
+    active_crash_games[message.message_id] = {
+        "bet": bet,
+        "multiplier": 1.0,
+        "user_id": msg.from_user.id,
+        "crashed": False,
+        "cashed_out": False,
+        "cash_point": crash_point_rounded
+    }
     
-    for i in range(1, 101):  # Максимум 100 обновлений
-        if not game_active:
-            break
-            
-        # Увеличиваем множитель
-        increment = random.uniform(0.05, 0.15)
-        current_multiplier += increment
-        current_multiplier = round(current_multiplier, 2)
-        
-        # Проверяем крах
-        if current_multiplier >= crash_point_rounded:
-            # КРАХ!
-            game_active = False
-            win_amount = 0
-            result_text = f"💥 <b>КРАХ на {crash_point_rounded}x!</b>\n\nВы проиграли {format_money(bet)}"
-            await update_stats(msg.from_user.id, False)
-            
-            await message.edit_text(
-                f"💥 <b>КРАХ!</b>\n\n"
-                f"💰 Ставка: {format_money(bet)}\n"
-                f"🎯 Точка краха: <b>{crash_point_rounded}x</b>\n"
-                f"📈 Достигнуто: <b>{current_multiplier}x</b>\n\n"
-                f"{result_text}\n\n"
-                f"😢 Не успели забрать деньги",
-                parse_mode="HTML"
-            )
-            break
-        
-        # Обновляем сообщение
-        potential_win = int(bet * current_multiplier)
-        
-        await message.edit_text(
-            f"🚀 <b>КРАШ ИГРА</b>\n\n"
-            f"💰 Ставка: {format_money(bet)}\n"
-            f"🎯 Точка краха: <b>???</b>\n\n"
-            f"📈 Текущий множитель: <b>{current_multiplier}x</b>\n"
-            f"💰 Потенциальный выигрыш: <b>{format_money(potential_win)}</b>\n"
-            f"🎯 Прибыль: <b>+{format_money(potential_win - bet)}</b>\n\n"
-            f"<i>Нажми 'Забрать сейчас' чтобы получить {current_multiplier}x!</i>",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-        
-        await asyncio.sleep(0.5)  # Пауза между обновлениями
-    
-    # Если игрок не забрал и не было краха (маловероятно)
-    if game_active:
-        # Автоматический кэшаут на последнем множителе
-        win_amount = int(bet * current_multiplier)
-        await change_balance(msg.from_user.id, win_amount)
-        await update_stats(msg.from_user.id, True)
-        
-        await message.edit_text(
-            f"🔄 <b>АВТОМАТИЧЕСКИЙ ВЫВОД</b>\n\n"
-            f"💰 Ставка: {format_money(bet)}\n"
-            f"🎯 Множитель: <b>{current_multiplier}x</b>\n"
-            f"💰 Выигрыш: <b>{format_money(win_amount)}</b>\n\n"
-            f"✅ <b>+{format_money(win_amount - bet)}</b>\n\n"
-            f"🎉 Вы выиграли!",
-            parse_mode="HTML"
-        )
+    # Запускаем игру в фоне
+    asyncio.create_task(run_simple_crash_game(message.message_id, bet, crash_point_rounded, message))
 
 async def process_transfer(msg: Message, parts: list):
     """Обработка команды передачи денег"""
@@ -4031,11 +4558,105 @@ async def process_transfer(msg: Message, parts: list):
 # =======================================
 #        ФУНКЦИИ АДМИН-КОМАНД
 # =======================================
+@router.message(F.text.lower() == "админ майнинг")
+async def admin_mining_panel(msg: Message):
+    """Админ-панель управления майнингом"""
+    # Проверяем права администратора
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Форс-фикс для себя", callback_data="admin_force_fix_self"),
+         InlineKeyboardButton(text="🔧 Форс-фикс по ID", callback_data="admin_force_fix_id")],
+        [InlineKeyboardButton(text="📊 Статистика майнинга", callback_data="admin_mining_stats"),
+         InlineKeyboardButton(text="🎮 Выдать видеокарты", callback_data="admin_give_gpu")],
+        [InlineKeyboardButton(text="💰 Выдать BTC", callback_data="admin_give_btc"),
+         InlineKeyboardButton(text="🔄 Сбросить время всем", callback_data="admin_reset_all_time")]
+    ])
+    
+    await msg.reply(
+        "⚙️ <b>АДМИН-ПАНЕЛЬ МАЙНИНГА</b>\n\n"
+        "Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@router.message(F.text.lower() == "розыгрыш лотереи")
+async def draw_lottery_cmd(msg: Message):
+    """Принудительный розыгрыш лотереи (админ)"""
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    winners = await draw_lottery()
+    
+    if not winners:
+        await msg.reply("🎰 Нет участников для розыгрыша")
+        return
+    
+    text = "🎉 <b>РОЗЫГРЫШ ЛОТЕРЕИ ЗАВЕРШЕН!</b>\n\n"
+    
+    for lottery in winners:
+        ticket_name = LOTTERY_TICKETS[lottery['ticket_type']]['name']
+        text += f"<b>{ticket_name}</b>\n"
+        text += f"💰 Призовой фонд: {format_money(lottery['prize_pool'])}\n\n"
+        
+        for winner in lottery['winners']:
+            user = await get_user(winner['user_id'])
+            username = user.get('username', f"ID {winner['user_id']}")
+            
+            if winner['position'] == 1:
+                emoji = "🥇"
+            elif winner['position'] == 2:
+                emoji = "🥈"
+            else:
+                emoji = "🥉"
+            
+            text += f"{emoji} {username} - {format_money(winner['prize'])}\n"
+        
+        text += "\n"
+    
+    await msg.reply(text, parse_mode="HTML")
+    
+    # Уведомляем победителей
+    for lottery in winners:
+        for winner in lottery['winners']:
+            try:
+                await msg.bot.send_message(
+                    winner['user_id'],
+                    f"🎉 <b>ВЫ ВЫИГРАЛИ В ЛОТЕРЕЕ!</b>\n\n"
+                    f"🎫 Тип билета: {LOTTERY_TICKETS[lottery['ticket_type']]['name']}\n"
+                    f"🏆 Место: {winner['position']}\n"
+                    f"💰 Выигрыш: {format_money(winner['prize'])}\n\n"
+                    f"🎰 Поздравляем!",
+                    parse_mode="HTML"
+                )
+            except:
+                pass  # Если пользователь заблокировал бота
+
+@router.message(F.text.lower() == "сбросить лотерею")
+async def reset_lottery_cmd(msg: Message):
+    """Сбросить лотерею (админ)"""
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    await reset_lottery()
+    await msg.reply("✅ Лотерея сброшена! Новый день начался.")
+
 async def process_admin_give_reply(msg: Message, parts: list):
     """Админ: выдать деньги по ответу"""
+    # Проверяем, что сообщение является ответом
+    if not msg.reply_to_message:
+        await msg.reply("❌ Используйте команду <code>выдать [сумма]</code> в ответ на сообщение пользователя")
+        return
+    
     if len(parts) < 2:
         await msg.reply("❌ Используйте: <code>выдать [сумма]</code> в ответ на сообщение")
         return
+
+
     
     amount_str = parts[1]
     amount = parse_amount(amount_str)
@@ -4129,9 +4750,9 @@ async def process_admin_take_reply(msg: Message, parts: list):
     )
 
 async def process_admin_take(msg: Message, parts: list):
-    """Админ: забрать деньги по ID/юзернейму"""
+    """Админ: забрать деньги по ID/юзернейму - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
     if len(parts) < 3:
-        await msg.reply("❌ Используйте: <code>забрать @юзернейм [сумма]</code> или <code>забрать ID [сумма]</code>")
+        await msg.reply("❌ Используйте: <code>забрать @юзернейм [сумма]</code> или <code>забрать ID [сумма]</code>", parse_mode="HTML")
         return
     
     target_arg = parts[1]
@@ -4139,16 +4760,20 @@ async def process_admin_take(msg: Message, parts: list):
     amount = parse_amount(amount_str)
     
     target_id = None
+    target_username = ""
+    
     if target_arg.isdigit():
         target_id = int(target_arg)
+        target_username = f"ID {target_id}"
     elif target_arg.startswith('@'):
         username = target_arg[1:]
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT id FROM users WHERE username = ?", (username,))
+            cursor = await db.execute("SELECT id, username FROM users WHERE username = ?", (username,))
             row = await cursor.fetchone()
             if row:
                 target_id = row['id']
+                target_username = f"@{row['username']}"
             else:
                 await msg.reply(f"❌ Пользователь @{username} не найден")
                 return
@@ -4156,21 +4781,119 @@ async def process_admin_take(msg: Message, parts: list):
         await msg.reply("❌ Укажите ID или @юзернейм")
         return
     
-    target_user = await get_user(target_id)
-    if target_user['balance'] < amount:
-        await msg.reply(f"❌ У пользователя только {target_user['balance']:,}")
+    if amount <= 0:
+        await msg.reply("❌ Сумма должна быть больше 0")
         return
     
-    await change_balance(target_id, -amount)
-    new_balance = await get_user(target_id)
+    # Получаем текущий баланс пользователя
+    target_user = await get_user(target_id)
+    if not target_user:
+        await msg.reply(f"❌ Пользователь {target_username} не найден в базе данных")
+        return
     
-    await msg.reply(
-        f"✅ <b>Деньги забраны!</b>\n\n"
-        f"💸 Сумма: <code>{amount:,}</code>\n"
-        f"👤 Пользователь: ID {target_id}\n"
-        f"💰 Новый баланс: <code>{new_balance['balance']:,}</code>",
-        parse_mode="HTML"
-    )
+    if target_user['balance'] < amount:
+        await msg.reply(f"❌ У пользователя только {format_money(target_user['balance'])}")
+        return
+    
+    # **ИСПРАВЛЕНИЕ: Используем транзакцию для гарантированного списания**
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Начинаем транзакцию
+            await db.execute("BEGIN")
+            
+            # Списываем деньги
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE id = ?", 
+                (amount, target_id)
+            )
+            
+            # Получаем новый баланс для проверки
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (target_id,))
+            new_balance_row = await cursor.fetchone()
+            new_balance = new_balance_row[0] if new_balance_row else 0
+            
+            # Подтверждаем транзакцию
+            await db.commit()
+            
+            logger.info(f"✅ Админ {msg.from_user.id} забрал {amount:,} у пользователя {target_id}")
+            
+            # **ВАЖНО: Очищаем кэш пользователя, чтобы изменения отобразились**
+            cache_key = f"user_{target_id}"
+            if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+                del get_user.cache[cache_key]
+            
+            await msg.reply(
+                f"✅ <b>Деньги успешно забраны!</b>\n\n"
+                f"💸 <b>Сумма:</b> {format_money(amount)}\n"
+                f"👤 <b>Пользователь:</b> {target_username} (ID: {target_id})\n"
+                f"💰 <b>Новый баланс пользователя:</b> {format_money(new_balance)}",
+                parse_mode="HTML"
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при списании денег: {e}")
+        await msg.reply(f"❌ Ошибка при списании: {e}")
+
+# Также нужно исправить функцию process_admin_take_reply:
+async def process_admin_take_reply(msg: Message, parts: list):
+    """Админ: забрать деньги по ответу - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    if len(parts) < 2:
+        await msg.reply("❌ Используйте: <code>забрать [сумма]</code> в ответ на сообщение", parse_mode="HTML")
+        return
+    
+    amount_str = parts[1]
+    amount = parse_amount(amount_str)
+    
+    if amount <= 0:
+        await msg.reply("❌ Сумма должна быть больше 0")
+        return
+    
+    target_id = msg.reply_to_message.from_user.id
+    target_username = msg.reply_to_message.from_user.username or f"ID {target_id}"
+    
+    # Получаем текущий баланс
+    target_user = await get_user(target_id)
+    
+    if target_user['balance'] < amount:
+        await msg.reply(f"❌ У пользователя только {format_money(target_user['balance'])}")
+        return
+    
+    # **ИСПРАВЛЕНИЕ: Используем транзакцию**
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN")
+            
+            # Списываем деньги
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE id = ?", 
+                (amount, target_id)
+            )
+            
+            # Получаем новый баланс
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (target_id,))
+            new_balance_row = await cursor.fetchone()
+            new_balance = new_balance_row[0] if new_balance_row else 0
+            
+            await db.commit()
+            
+            logger.info(f"✅ Админ {msg.from_user.id} забрал {amount:,} у пользователя {target_id}")
+            
+            # Очищаем кэш
+            cache_key = f"user_{target_id}"
+            if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+                del get_user.cache[cache_key]
+            
+            await msg.reply(
+                f"✅ <b>Деньги успешно забраны!</b>\n\n"
+                f"💸 <b>Сумма:</b> {format_money(amount)}\n"
+                f"👤 <b>Пользователь:</b> {target_username} (ID: {target_id})\n"
+                f"💰 <b>Новый баланс пользователя:</b> {format_money(new_balance)}",
+                parse_mode="HTML"
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при списании денег: {e}")
+        await msg.reply(f"❌ Ошибка при списании: {e}")
 
 # =======================================
 #        ХЭНДЛЕРЫ АДМИН-КОМАНД
@@ -4187,6 +4910,48 @@ async def cmd_give_text(msg: Message):
         await process_admin_give_reply(msg, parts)
     else:
         await process_admin_give(msg, parts)
+
+@router.message(F.text.lower().startswith("завершить игру "))
+async def force_end_game_cmd(msg: Message):
+    """Принудительно завершить игру (админ)"""
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    parts = msg.text.split()
+    
+    if len(parts) < 2:
+        await msg.reply("❌ Используйте: завершить игру [ID пользователя]")
+        return
+    
+    try:
+        target_uid = int(parts[2])
+    except:
+        await msg.reply("❌ ID должен быть числом")
+        return
+    
+    if target_uid not in crash_games:
+        await msg.reply(f"❌ У пользователя {target_uid} нет активной игры")
+        return
+    
+    # Завершаем игру
+    game_info = crash_games[target_uid]
+    bet = game_info.get("bet", 0)
+    
+    # Возвращаем ставку если игрок еще не забрал
+    if not game_info.get("cashed_out", False):
+        await change_balance(target_uid, bet)
+    
+    # Удаляем игру
+    del crash_games[target_uid]
+    
+    await msg.reply(
+        f"✅ <b>Игра принудительно завершена для пользователя {target_uid}</b>\n\n"
+        f"💰 Ставка: {format_money(bet)} (возвращена если не был кэшаут)\n"
+        f"📈 Множитель: {game_info.get('multiplier', 1.0)}x\n"
+        f"🎮 Статус: Завершена администратором",
+        parse_mode="HTML"
+    )
 
 @router.message(F.text.lower().startswith("забрать"))
 async def cmd_take_text(msg: Message):
@@ -4511,6 +5276,62 @@ async def crash_text_cmd(msg: Message):
     parts = msg.text.split()
     await process_crash(msg, parts)
 
+@router.message(F.text.lower().startswith("продать биткоин"))
+async def sell_bitcoin_cmd(msg: Message):
+    """Продать биткоины - команда из чата"""
+    uid = msg.from_user.id
+    parts = msg.text.split()
+    
+    if len(parts) < 3:
+        await msg.reply(
+            "💸 <b>ПРОДАЖА БИТКОИНОВ</b>\n\n"
+            "📝 <b>Формат:</b>\n"
+            "• <code>продать биткоин все</code> - продать все BTC\n"
+            "• <code>продать биткоин 0.01</code> - продать 0.01 BTC\n"
+            "• <code>продать биткоин 0.5</code> - продать 0.5 BTC\n\n"
+            "💰 <b>Примеры:</b>\n"
+            "<code>продать биткоин все</code>\n"
+            "<code>продать биткоин 0.1</code>\n"
+            "<code>продать биткоин 0.05</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    amount_str = parts[2].lower()
+    
+    try:
+        if amount_str == "все":
+            amount = None  # Продать все
+        else:
+            amount = float(amount_str)
+        
+        success, btc_sold, usd_received = await sell_bitcoin(uid, amount)
+        
+        if success:
+            user = await get_user(uid)
+            await msg.reply(
+                f"✅ <b>БИТКОИНЫ ПРОДАНЫ!</b>\n\n"
+                f"💰 <b>Продано:</b> {btc_sold:.8f} BTC\n"
+                f"💵 <b>Получено:</b> {format_money(usd_received)}$\n"
+                f"📊 <b>Осталось BTC:</b> {user['bitcoin']:.8f}\n"
+                f"💳 <b>Новый баланс:</b> {format_money(user['balance'])}",
+                parse_mode="HTML"
+            )
+        else:
+            await msg.reply(f"❌ {usd_received}", parse_mode="HTML")
+            
+    except ValueError:
+        await msg.reply(
+            "❌ <b>Неверный формат!</b>\n\n"
+            "Используйте число:\n"
+            "• <code>продать биткоин 0.1</code>\n"
+            "• <code>продать биткоин все</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка продажи BTC: {e}")
+        await msg.reply(f"❌ Ошибка при продаже: {str(e)}")
+
 @router.message(Command("краш", "crash"))
 async def crash_slash_cmd(msg: Message, command: CommandObject = None):
     """Команда /краш"""
@@ -4548,6 +5369,46 @@ async def planets_text_cmd(msg: Message):
 @router.message(F.text.lower().startswith(("инвестиции", "investments")))
 async def investments_text_cmd(msg: Message):
     await show_investments(msg)
+
+@router.message(F.text.lower() == "забрать биткоины")
+@router.message(F.text.lower().startswith("забрать биткоин"))
+@router.message(F.text.lower().startswith("собрать биткоин"))
+async def collect_btc_text_cmd(msg: Message):
+    """Текстовая команда для сбора BTC"""
+    success, btc_amount, result = await claim_mining_profit(msg.from_user.id)
+    
+    if success:
+        btc_price = BitcoinMining.get_bitcoin_price()
+        usd_value = result if isinstance(result, (int, float)) else btc_amount * btc_price
+        
+        await msg.reply(
+            f"✅ <b>БИТКОИНЫ СОБРАНЫ!</b>\n\n"
+            f"💰 <b>Количество:</b> {btc_amount:.8f} BTC\n"
+            f"💵 <b>Стоимость:</b> {format_money(int(usd_value))}$\n"
+            f"📈 <b>Курс BTC:</b> {format_money(int(btc_price))}$\n\n"
+            f"🎉 <b>Успешно добавлено к вашему балансу BTC!</b>",
+            parse_mode="HTML"
+        )
+    else:
+        error_msg = str(result)
+        
+        # Предлагаем решение
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔧 Проверка", callback_data="check_mining_now"),
+             InlineKeyboardButton(text="🔄 Форс-фикс", callback_data="force_fix_now")],
+            [InlineKeyboardButton(text="⛏️ Панель майнинга", callback_data="show_mining")]
+        ])
+        
+        await msg.reply(
+            f"❌ <b>Не удалось собрать BTC</b>\n\n"
+            f"⚠️ <b>Причина:</b> {error_msg}\n\n"
+            f"💡 <b>Что делать:</b>\n"
+            f"1. Нажмите 'Проверка' для диагностики\n"
+            f"2. Если проблема - нажмите 'Форс-фикс'\n"
+            f"3. Подождите 2-3 минуты",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
 
 # ========== CALLBACK ОБРАБОТЧИКИ ==========
 
@@ -4626,6 +5487,187 @@ async def show_my_businesses_cb(cb: CallbackQuery):
         await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
     await cb.answer()
 
+# ========== АДМИН ОБРАБОТЧИКИ МАЙНИНГА ==========
+@router.callback_query(F.data == "admin_force_fix_self")
+async def admin_force_fix_self_callback(cb: CallbackQuery):
+    """Форс-фикс для админа"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    # Просто вызываем обычный форс-фикс
+    await force_fix_now_callback(cb)
+
+@router.callback_query(F.data == "admin_force_fix_id")
+async def admin_force_fix_id_callback(cb: CallbackQuery):
+    """Форс-фикс по ID пользователя"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    await cb.answer("📝 Введите: форсфикс [ID пользователя]\nНапример: форсфикс 123456789", show_alert=True)
+
+@router.callback_query(F.data == "admin_mining_stats")
+async def admin_mining_stats_callback(cb: CallbackQuery):
+    """Статистика майнинга для админа"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            
+            # Общая статистика
+            cursor = await db.execute("""
+                SELECT 
+                    COUNT(*) as total_users,
+                    SUM(mining_gpu_count) as total_gpus,
+                    AVG(mining_gpu_count) as avg_gpus,
+                    SUM(bitcoin) as total_btc,
+                    SUM(balance) as total_balance
+                FROM users 
+                WHERE mining_gpu_count > 0
+            """)
+            stats = await cursor.fetchone()
+            
+            # Топ майнеров
+            cursor = await db.execute("""
+                SELECT id, username, mining_gpu_count, mining_gpu_level, bitcoin, balance
+                FROM users 
+                WHERE mining_gpu_count > 0
+                ORDER BY mining_gpu_count DESC 
+                LIMIT 10
+            """)
+            top_miners = await cursor.fetchall()
+        
+        if stats:
+            text = f"""
+📊 <b>СТАТИСТИКА МАЙНИНГА</b>
+
+👥 <b>Общая информация:</b>
+• Всего майнеров: {stats['total_users'] or 0}
+• Всего видеокарт: {stats['total_gpus'] or 0}
+• Среднее на игрока: {stats['avg_gpus'] or 0:.1f}
+• Всего BTC в системе: {stats['total_btc'] or 0:.8f}
+• Общая стоимость BTC: {format_money(int((stats['total_btc'] or 0) * BitcoinMining.get_bitcoin_price()))}$
+
+🏆 <b>Топ-10 майнеров:</b>
+"""
+            
+            for i, miner in enumerate(top_miners, 1):
+                username = miner['username'] or f"ID {miner['id']}"
+                text += f"{i}. {username[:15]}\n"
+                text += f"   🎮 {miner['mining_gpu_count']} карт (ур. {miner['mining_gpu_level']})\n"
+                text += f"   ₿ {miner['bitcoin']:.4f} BTC\n"
+                
+            await cb.message.edit_text(text, parse_mode="HTML")
+        else:
+            await cb.message.edit_text("📊 Нет данных о майнерах", parse_mode="HTML")
+            
+    except Exception as e:
+        logger.error(f"Ошибка admin_mining_stats_callback: {e}")
+        await cb.answer("❌ Ошибка получения статистики", show_alert=True)
+
+@router.callback_query(F.data == "admin_give_gpu")
+async def admin_give_gpu_callback(cb: CallbackQuery):
+    """Выдать видеокарты"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 10 карт себе", callback_data="admin_give_gpu_self_10"),
+         InlineKeyboardButton(text="🎮 50 карт себе", callback_data="admin_give_gpu_self_50")],
+        [InlineKeyboardButton(text="⚡ Улучшить всем", callback_data="admin_upgrade_all"),
+         InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
+    ])
+    
+    await cb.message.edit_text(
+        "🎮 <b>ВЫДАТЬ ВИДЕОКАРТЫ</b>\n\n"
+        "Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("admin_give_gpu_self_"))
+async def admin_give_gpu_self_callback(cb: CallbackQuery):
+    """Выдать видеокарты себе"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    try:
+        count = int(cb.data.split("_")[4])  # admin_give_gpu_self_10 → 10
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE users 
+                SET mining_gpu_count = mining_gpu_count + ?
+                WHERE id = ?
+            """, (count, cb.from_user.id))
+            await db.commit()
+        
+        await cb.answer(f"✅ Добавлено {count} видеокарт!")
+        await admin_mining_panel(cb.message)
+        
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}")
+
+@router.callback_query(F.data == "admin_upgrade_all")
+async def admin_upgrade_all_callback(cb: CallbackQuery):
+    """Улучшить всем видеокарты"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE users 
+                SET mining_gpu_level = 5
+                WHERE mining_gpu_count > 0
+            """)
+            await db.commit()
+        
+        await cb.answer("✅ Все видеокарты улучшены до 5 уровня!")
+        await admin_mining_panel(cb.message)
+        
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}")
+
+@router.callback_query(F.data == "admin_give_btc")
+async def admin_give_btc_callback(cb: CallbackQuery):
+    """Выдать BTC"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    await cb.answer("📝 Введите: выдать биткоин [ID] [количество]\nПример: выдать биткоин 123456789 0.1", show_alert=True)
+
+@router.callback_query(F.data == "admin_reset_all_time")
+async def admin_reset_all_time_callback(cb: CallbackQuery):
+    """Сбросить время всем"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    try:
+        new_time = int(time.time()) - 3600
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE users 
+                SET last_mining_claim = ?
+                WHERE mining_gpu_count > 0
+            """, (new_time,))
+            await db.commit()
+        
+        await cb.answer("✅ Время сброшено всем майнерам на 1 час назад!")
+        await admin_mining_panel(cb.message)
+        
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}")
 
 @router.callback_query(F.data.startswith("mybiz_"))
 async def my_business_callback(cb: CallbackQuery):
@@ -5130,68 +6172,63 @@ async def bj_stand_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("crash_cashout_"))
 async def crash_cashout_callback(cb: CallbackQuery):
-    """Обработка кэшаута в игре Краш"""
+    """Обработка кэшаута в игре Краш - РАБОЧАЯ ВЕРСИЯ"""
     try:
-        # callback_data: "crash_cashout_1000_123456789"
-        parts = cb.data.split("_")
-        bet = int(parts[2])
-        player_id = int(parts[3])
+        player_id = int(cb.data.split("_")[2])
         
         # Проверяем, что это тот же пользователь
         if cb.from_user.id != player_id:
             await cb.answer("❌ Это не ваша игра!", show_alert=True)
             return
         
-        # Получаем текущий множитель из текста сообщения
-        import re
-        message_text = cb.message.text
+        # Ищем активную игру пользователя
+        game_id = None
+        game_data = None
         
-        # Ищем множитель в тексте
-        multiplier_match = re.search(r'Текущий множитель:.*?<b>(\d+\.\d+)', message_text)
+        for msg_id, game in active_crash_games.items():
+            if game["user_id"] == player_id and not game.get("cashed_out", False) and not game.get("crashed", False):
+                game_id = msg_id
+                game_data = game
+                break
         
-        if not multiplier_match:
-            # Пробуем другой паттерн
-            multiplier_match = re.search(r'(\d+\.\d+)x</b>', message_text)
+        if not game_id or not game_data:
+            await cb.answer("❌ Нет активной игры или игра уже завершена!", show_alert=True)
+            return
         
-        if multiplier_match:
-            multiplier = float(multiplier_match.group(1))
-            win_amount = int(bet * multiplier)
-            
-            # Начисляем выигрыш
-            await change_balance(player_id, win_amount)
-            await update_stats(player_id, True)
-            
-            # Показываем результат
-            await cb.message.edit_text(
-                f"💰 <b>ВЫВОД УСПЕШЕН!</b>\n\n"
-                f"🎯 Множитель: <b>{multiplier}x</b>\n"
-                f"💰 Ставка: {format_money(bet)}\n"
-                f"💵 Выигрыш: <b>{format_money(win_amount)}</b>\n\n"
-                f"✅ <b>+{format_money(win_amount - bet)}</b>\n\n"
-                f"🎉 Поздравляем с победой!",
-                parse_mode="HTML"
-            )
-            
-            await cb.answer(f"✅ Выигрыш: {format_money(win_amount)}!")
-        else:
-            # Если не нашли множитель, используем безопасный
-            safe_multiplier = 1.5
-            win_amount = int(bet * safe_multiplier)
-            await change_balance(player_id, win_amount)
-            
-            await cb.message.edit_text(
-                f"💰 <b>ВЫВОД УСПЕШЕН!</b>\n\n"
-                f"🎯 Множитель: <b>{safe_multiplier}x</b> (безопасный)\n"
-                f"💰 Ставка: {format_money(bet)}\n"
-                f"💵 Выигрыш: <b>{format_money(win_amount)}</b>\n\n"
-                f"✅ <b>+{format_money(win_amount - bet)}</b>",
-                parse_mode="HTML"
-            )
-            
-            await cb.answer(f"✅ Получено {format_money(win_amount)} (безопасный множитель)")
-            
+        # Получаем текущий множитель
+        multiplier = game_data["multiplier"]
+        bet = game_data["bet"]
+        win_amount = int(bet * multiplier)
+        
+        # Отмечаем, что игрок забрал деньги
+        active_crash_games[game_id]["cashed_out"] = True
+        active_crash_games[game_id]["cashout_multiplier"] = multiplier
+        
+        # Начисляем выигрыш
+        await change_balance(player_id, win_amount)
+        await update_stats(player_id, True)
+        
+        # Обновляем сообщение
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Уже забрали", callback_data="no_action")]
+        ])
+        
+        await cb.message.edit_text(
+            f"💰 <b>ВЫ УСПЕЛИ ЗАБРАТЬ!</b>\n\n"
+            f"🎯 Множитель: <b>{multiplier}x</b>\n"
+            f"💰 Ставка: {format_money(bet)}\n"
+            f"💵 Выигрыш: <b>{format_money(win_amount)}</b>\n\n"
+            f"✅ <b>+{format_money(win_amount - bet)}</b>\n\n"
+            f"🎉 Поздравляем с победой!\n"
+            f"⚠️ Ждите краха для завершения игры",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        
+        await cb.answer(f"✅ Выигрыш: {format_money(win_amount)}! Ждите завершения игры.")
+        
     except Exception as e:
-        logger.error(f"Ошибка crash_cashout_callback: {e}")
+        logger.error(f"Ошибка crash_cashout_callback: {e}", exc_info=True)
         await cb.answer("❌ Ошибка вывода", show_alert=True)
 
 @router.callback_query(F.data.startswith("coin_"))
@@ -5246,95 +6283,32 @@ async def update_username_handler(msg: Message):
         await update_username(uid, username)
 
 # ========== ФУНКЦИИ ИЗ ДОПОЛНЕНИЯ ==========
+async def cleanup_old_games():
+    """Очистка старых игр"""
+    try:
+        current_time = time.time()
+        to_remove = []
+        
+        for user_id, game in crash_games.items():
+            # Если игра старше 5 минут - удаляем
+            if current_time - game.get("timestamp", 0) > 300:
+                to_remove.append(user_id)
+        
+        for user_id in to_remove:
+            del crash_games[user_id]
+            logger.info(f"🗑️ Очищена старая игра краш для пользователя {user_id}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка очистки игр: {e}")
+
+async def periodic_cleanup():
+    """Периодическая очистка"""
+    while True:
+        await asyncio.sleep(60)  # Каждую минуту
+        await cleanup_old_games()
 
 async def show_mining_panel(msg: Message = None, cb: CallbackQuery = None):
-    """Показать красивую inline-панель майнинга - С РАСЧЕТОМ ОКУПАЕМОСТИ"""
-    if msg:
-        uid = msg.from_user.id
-        message_obj = msg
-    elif cb:
-        uid = cb.from_user.id
-        message_obj = cb.message
-    accumulated = await auto_accumulate_bitcoin(uid)
-    if accumulated > 0:
-        logger.info(f"Автонакопление для {uid}: {accumulated:.6f} BTC")
-    
-    user = await get_user(uid)
-    
-    hashrate = BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level'])
-    btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
-    btc_price = BitcoinMining.get_bitcoin_price()
-    usd_per_hour = btc_per_hour * btc_price
-    
-    # Расчет окупаемости
-    total_investment = 0
-    for level in range(1, user['mining_gpu_level'] + 1):
-        cards_at_level = user['mining_gpu_count'] if level == user['mining_gpu_level'] else 0
-        if cards_at_level > 0:
-            total_investment += BitcoinMining.get_gpu_price(level) * cards_at_level
-    
-    daily_income = usd_per_hour * 24
-    roi_days = total_investment / daily_income if daily_income > 0 else 0
-    
-    # Текущие накопления
-    current_time = int(time.time())
-    last_claim = user['last_mining_claim'] or current_time
-    time_passed = current_time - last_claim
-    btc_mined = btc_per_hour * (time_passed / 3600)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🛒 Купить 1 видеокарту", callback_data="mining_buy_gpu_1"),
-            InlineKeyboardButton(text="🛒 Купить 10 видеокарт", callback_data="mining_buy_gpu_10")
-        ],
-        [
-            InlineKeyboardButton(text="⚡ Улучшить видеокарты", callback_data="mining_upgrade_gpu"),
-            InlineKeyboardButton(text="💰 Забрать BTC", callback_data="mining_claim")
-        ],
-        [
-            InlineKeyboardButton(text="💸 Продать BTC", callback_data="mining_sell"),
-            InlineKeyboardButton(text="📊 Обновить", callback_data="mining_refresh")
-        ],
-        [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
-    ])
-    
-    text = f"""
-⛏️ <b>МАЙНИНГ ФЕРМА - СУПЕР ВЫГОДНАЯ!</b>
-
-📊 <b>Ваша ферма:</b>
-• 🎮 Видеокарт: {user['mining_gpu_count']} шт.
-• ⭐ Уровень: {user['mining_gpu_level']}/5
-• ⚡ Хешрейт: {hashrate:,.0f} MH/s
-
-💰 <b>Доходность:</b>
-• ₿ BTC/час: {btc_per_hour:.4f}
-• 💰 $/час: {format_money(int(usd_per_hour))}
-• 💵 $/день: {format_money(int(daily_income))}
-• 📈 Окупаемость: {roi_days:.1f} дней
-
-💎 <b>Ваши активы:</b>
-• Накоплено BTC: {btc_mined:.6f} (~{format_money(int(btc_mined * btc_price))}$)
-• Всего BTC: {user['bitcoin']:.6f}
-
-🎯 <b>Стоимость видеокарт:</b>
-• Уровень 1: {format_money(BitcoinMining.get_gpu_price(1))}
-• Уровень 2: {format_money(BitcoinMining.get_gpu_price(2))}
-• Уровень 3: {format_money(BitcoinMining.get_gpu_price(3))}
-• Уровень 4: {format_money(BitcoinMining.get_gpu_price(4))}
-• Уровень 5: {format_money(BitcoinMining.get_gpu_price(5))}
-"""
-    
-    if cb:
-        try:
-            await message_obj.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
-        except:
-            await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
-    elif msg:
-        await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
-
-async def show_my_planets_panel(msg: Message = None, cb: CallbackQuery = None):
-    """Показать панель 'Мои планеты' с автонакоплением плазмы"""
-    # Получаем ID пользователя из сообщения или callback
+    """Показать красивую inline-панель майнинга"""
     if msg:
         uid = msg.from_user.id
         message_obj = msg
@@ -5344,12 +6318,141 @@ async def show_my_planets_panel(msg: Message = None, cb: CallbackQuery = None):
     else:
         return
     
-    # 🔥 ВАЖНО: ГАРАНТИРУЕМ автонакопление плазмы при открытии панели
-    # Просто вызываем get_user() - он автоматически начислит плазму
-    await get_user(uid)
+    # 1. Сначала ОБЯЗАТЕЛЬНО обновляем накопления
+    await calculate_and_update_mining(uid)
     
-    # Получаем обновленные данные пользователя (с автонакопленной плазмой)
+    # 2. Получаем ОБНОВЛЕННЫЕ данные
     user = await get_user(uid)
+    
+    # 3. Проверяем админ ли пользователь
+    is_admin = uid in ADMIN_IDS
+    
+    # 4. Делаем расчеты
+    hashrate = BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level'])
+    btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+    btc_price = BitcoinMining.get_bitcoin_price()
+    usd_per_hour = btc_per_hour * btc_price
+    
+    # 5. Создаем клавиатуру (разную для админов и обычных пользователей)
+    if is_admin:
+        # Клавиатура для админа
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🛒 Купить 1 карту", callback_data="mining_buy_gpu_1"),
+                InlineKeyboardButton(text="💰 Забрать BTC", callback_data="mining_claim")
+            ],
+            [
+                InlineKeyboardButton(text="⚡ Улучшить", callback_data="mining_upgrade_gpu"),
+                InlineKeyboardButton(text="🔧 Форс-фикс", callback_data="force_fix_now")
+            ],
+            [
+                InlineKeyboardButton(text="💸 Продать BTC", callback_data="mining_sell"),
+                InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="admin_mining_panel")
+            ],
+            [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
+        ])
+    else:
+        # Клавиатура для обычного пользователя
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🛒 Купить 1 карту", callback_data="mining_buy_gpu_1"),
+                InlineKeyboardButton(text="💰 Забрать BTC", callback_data="mining_claim")
+            ],
+            [
+                InlineKeyboardButton(text="⚡ Улучшить", callback_data="mining_upgrade_gpu"),
+                InlineKeyboardButton(text="🔍 Проверить", callback_data="check_mining_now")
+            ],
+            [
+                InlineKeyboardButton(text="💸 Продать BTC", callback_data="mining_sell"),
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="mining_refresh")
+            ],
+            [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
+        ])
+    
+    # 6. Формируем текст (немного разный для админа)
+    if is_admin:
+        text = f"""
+⛏️ <b>МАЙНИНГ ФЕРМА [АДМИН]</b>
+
+📊 <b>Ваша ферма:</b>
+• 🎮 Видеокарт: {user['mining_gpu_count']} шт.
+• ⭐ Уровень: {user['mining_gpu_level']}/5
+• ⚡ Хешрейт: {hashrate:,.0f} MH/s
+
+💰 <b>Доходность:</b>
+• ₿ BTC/час: {btc_per_hour:.6f}
+• 💰 $/час: {format_money(int(usd_per_hour))}
+• 📈 Курс BTC: {format_money(int(btc_price))}$
+
+💎 <b>Ваши BTC:</b> {user['bitcoin']:.8f}
+
+🛠️ <b>Админ-панель доступна!</b>
+"""
+    else:
+        # Показываем сколько уже накопилось
+        current_time = int(time.time())
+        last_claim = user.get('last_mining_claim', current_time)
+        time_passed = current_time - last_claim
+        
+        if time_passed < 60:
+            btc_mined = 0
+            time_text = "⏳ Еще не прошла минута"
+        else:
+            btc_mined = btc_per_hour * (time_passed / 3600)
+            time_text = f"✅ Накоплено: {btc_mined:.8f} BTC"
+        
+        text = f"""
+⛏️ <b>МАЙНИНГ ФЕРМА</b>
+
+📊 <b>Ваша ферма:</b>
+• 🎮 Видеокарт: {user['mining_gpu_count']} шт.
+• ⭐ Уровень: {user['mining_gpu_level']}/5
+• ⚡ Хешрейт: {hashrate:,.0f} MH/s
+
+💰 <b>Доходность:</b>
+• ₿ BTC/час: {btc_per_hour:.6f}
+• 💰 $/час: {format_money(int(usd_per_hour))}
+• 📈 Курс BTC: {format_money(int(btc_price))}$
+
+💎 <b>Накопления:</b>
+• Всего BTC: {user['bitcoin']:.8f}
+• {time_text}
+• Прошло времени: {time_passed} сек
+"""
+    
+    # 7. Отправляем/редактируем сообщение
+    if cb:
+        try:
+            await message_obj.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except:
+            await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    elif msg:
+        await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+async def show_my_planets_panel(msg: Message = None, cb: CallbackQuery = None):
+    """Показать панель 'Мои планеты' - ТОЛЬКО ЗДЕСЬ обновляем плазму"""
+    # Получаем ID пользователя
+    if msg:
+        uid = msg.from_user.id
+        message_obj = msg
+    elif cb:
+        uid = cb.from_user.id
+        message_obj = cb.message
+    else:
+        return
+    
+    # ВАЖНО: УДАЛИТЬ этот вызов:
+    # await get_user(uid)  # Он активировал автонакопление
+    
+    # ВМЕСТО ЭТОГО: Рассчитываем и обновляем плазму (только здесь!)
+    accumulated_plasma = await calculate_and_update_plasma(uid)
+    if accumulated_plasma > 0:
+        logger.info(f"🪐 Автонакопление плазмы для {uid}: {accumulated_plasma}")
+    
+    # Теперь получаем ОБНОВЛЕННЫЕ данные пользователя
+    user = await get_user(uid)
+    
+    # ... остальной код функции без изменений ...
     
     # Получаем список планет пользователя
     user_planets = await get_user_planets(uid)
@@ -5564,6 +6667,80 @@ async def show_investments_panel(msg: Message = None, cb: CallbackQuery = None):
         await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 # ========== CALLBACK ОБРАБОТЧИКИ ИЗ ДОПОЛНЕНИЯ ==========
+@router.callback_query(F.data == "admin_mining_panel")
+async def admin_mining_panel_callback(cb: CallbackQuery):
+    """Админ-панель майнинга через callback"""
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Форс-фикс для себя", callback_data="admin_force_fix_self"),
+         InlineKeyboardButton(text="🔧 Форс-фикс по ID", callback_data="admin_force_fix_id")],
+        [InlineKeyboardButton(text="📊 Статистика майнинга", callback_data="admin_mining_stats"),
+         InlineKeyboardButton(text="🎮 Выдать видеокарты", callback_data="admin_give_gpu")],
+        [InlineKeyboardButton(text="💰 Выдать BTC", callback_data="admin_give_btc"),
+         InlineKeyboardButton(text="🔄 Сбросить время всем", callback_data="admin_reset_all_time")],
+        [InlineKeyboardButton(text="⛏️ Вернуться в майнинг", callback_data="show_mining")]
+    ])
+    
+    await cb.message.edit_text(
+        "⚙️ <b>АДМИН-ПАНЕЛЬ МАЙНИНГА</b>\n\n"
+        "Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await cb.answer()
+
+@router.message(F.text.lower() == "активные игры")
+async def active_games_cmd(msg: Message):
+    """Показать активные игры (админ)"""
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    if not crash_games:
+        await msg.reply("🎮 Нет активных игр Краш")
+        return
+    
+    text = "🎮 <b>АКТИВНЫЕ ИГРЫ КРАШ</b>\n\n"
+    
+    for user_id, game in crash_games.items():
+        if game.get("active", False):
+            time_passed = int(time.time() - game.get("timestamp", time.time()))
+            text += f"👤 ID: {user_id}\n"
+            text += f"💰 Ставка: {format_money(game['bet'])}\n"
+            text += f"📈 Множитель: {game.get('multiplier', 1.0)}x\n"
+            text += f"⏳ Длится: {time_passed} сек\n"
+            text += f"🆔 Сообщение: {game.get('message_id', 'N/A')}\n"
+            text += "─" * 30 + "\n"
+    
+    await msg.reply(text, parse_mode="HTML")
+
+@router.message(F.text.lower() == "активные игры")
+async def active_games_cmd(msg: Message):
+    """Показать активные игры (админ)"""
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    if not crash_games:
+        await msg.reply("🎮 Нет активных игр Краш")
+        return
+    
+    text = "🎮 <b>АКТИВНЫЕ ИГРЫ КРАШ</b>\n\n"
+    
+    for user_id, game in crash_games.items():
+        if game.get("active", False):
+            time_passed = int(time.time() - game.get("timestamp", time.time()))
+            text += f"👤 ID: {user_id}\n"
+            text += f"💰 Ставка: {format_money(game['bet'])}\n"
+            text += f"📈 Множитель: {game.get('multiplier', 1.0)}x\n"
+            text += f"⏳ Длится: {time_passed} сек\n"
+            text += f"🆔 Сообщение: {game.get('message_id', 'N/A')}\n"
+            text += "─" * 30 + "\n"
+    
+    await msg.reply(text, parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("mining_buy_gpu_"))
 async def mining_buy_gpu_callback(cb: CallbackQuery):
@@ -5629,33 +6806,276 @@ async def mining_upgrade_gpu_callback(cb: CallbackQuery):
 
 @router.callback_query(F.data == "mining_claim")
 async def mining_claim_callback(cb: CallbackQuery):
-    success, btc_mined, usd_value_or_message = await claim_mining_profit(cb.from_user.id)
-    if success:
-        try:
+    """Обработка кнопки 'Забрать BTC' - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    try:
+        uid = cb.from_user.id
+        
+        # Показываем сообщение о начале сбора
+        await cb.answer("⛏️ Собираем BTC...")
+        
+        # Получаем данные перед сбором
+        user_before = await get_user(uid)
+        
+        # Вызываем сбор BTC
+        success, btc_amount, result = await claim_mining_profit(uid)
+        
+        if success:
+            btc_price = BitcoinMining.get_bitcoin_price()
+            usd_value = result if isinstance(result, (int, float)) else btc_amount * btc_price
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💸 Продать BTC", callback_data="mining_sell")],
+                [InlineKeyboardButton(text="⛏️ Вернуться в майнинг", callback_data="show_mining")]
+            ])
+            
             await cb.message.edit_text(
-                f"✅ <b>Получено {btc_mined:.8f} BTC ({format_money(int(usd_value_or_message))}$)</b>\n\n"
-                f"⛏️ <b>МАЙНИНГ ФЕРМА</b>\n\n"
-                f"💰 BTC успешно зачислены на ваш счет!\n\n"
-                f"🔄 <i>Обновляю панель...</i>",
-                parse_mode="HTML"
+                f"✅ <b>БИТКОИНЫ СОБРАНЫ!</b>\n\n"
+                f"💰 <b>Количество:</b> {btc_amount:.8f} BTC\n"
+                f"💵 <b>Стоимость:</b> {format_money(int(usd_value))}$\n"
+                f"📈 <b>Курс BTC:</b> {format_money(int(btc_price))}$\n\n"
+                f"🎉 <b>Поздравляем с успешным майнингом!</b>\n\n"
+                f"⚡ Ферма продолжает работать автоматически",
+                parse_mode="HTML",
+                reply_markup=keyboard
             )
-        except:
-            await cb.message.answer(
-                f"✅ <b>Получено {btc_mined:.8f} BTC ({format_money(int(usd_value_or_message))}$)</b>\n\n"
-                f"⛏️ <b>МАЙНИНГ ФЕРМА</b>\n\n"
-                f"💰 BTC успешно зачислены на ваш счет!\n\n"
-                f"🔄 <i>Обновляю панель...</i>",
-                parse_mode="HTML"
+        else:
+            # Если не удалось собрать
+            error_msg = str(result)
+            
+            # Проверяем почему не удалось
+            user_after = await get_user(uid)
+            
+            debug_text = f"""
+🔍 <b>ДИАГНОСТИКА ПРОБЛЕМЫ:</b>
+
+📊 <b>До:</b>
+• BTC: {user_before.get('bitcoin', 0):.8f}
+• Видеокарт: {user_before.get('mining_gpu_count', 0)}
+
+📊 <b>После:</b>
+• BTC: {user_after.get('bitcoin', 0):.8f}
+• Видеокарт: {user_after.get('mining_gpu_count', 0)}
+
+⚠️ <b>Проблема:</b> {error_msg}
+"""
+            
+            # Создаем кнопки для решения проблемы
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Форс-фикс", callback_data="force_fix_now"),
+                 InlineKeyboardButton(text="🎮 Купить видеокарты", callback_data="mining_buy_gpu_1")],
+                [InlineKeyboardButton(text="🔧 Проверка", callback_data="check_mining_now")]
+            ])
+            
+            await cb.message.edit_text(
+                f"❌ <b>НЕ УДАЛОСЬ СОБРАТЬ BTC</b>\n\n"
+                f"{debug_text}\n\n"
+                f"💡 <b>Попробуйте:</b>\n"
+                f"1. Подождать 2-3 минуты\n"
+                f"2. Нажать 'Форс-фикс'\n"
+                f"3. Купить видеокарты",
+                parse_mode="HTML",
+                reply_markup=keyboard
             )
-        await asyncio.sleep(2)
-        await show_mining_panel(cb=cb)
-        await cb.answer()
+            
+    except Exception as e:
+        logger.error(f"Ошибка mining_claim_callback: {e}", exc_info=True)
+        await cb.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+@router.callback_query(F.data == "force_fix_now")
+async def force_fix_now_callback(cb: CallbackQuery):
+    """Форс-фикс через callback - ТОЛЬКО ДЛЯ АДМИНОВ"""
+    # Проверяем права администратора
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("❌ Эта команда доступна только администраторам!", show_alert=True)
+        return
+    
+    uid = cb.from_user.id
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Устанавливаем время на 1 час назад
+            new_time = int(time.time()) - 3600
+            
+            await db.execute("""
+                UPDATE users 
+                SET last_mining_claim = ?, 
+                    bitcoin = bitcoin + 0.001
+                WHERE id = ?
+            """, (new_time, uid))
+            
+            await db.commit()
+            
+        await cb.answer("✅ АДМИН-ФИКС ПРИМЕНЕН! Теперь попробуйте снова 'Забрать BTC'")
+        
+        # Обновляем сообщение
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Забрать BTC", callback_data="mining_claim")]
+        ])
+        
+        await cb.message.edit_text(
+            "✅ <b>Админ-фикс применен!</b>\n\n"
+            "• Время сброшено на 1 час назад\n"
+            "• Добавлено 0.001 BTC\n\n"
+            "🔄 <b>Теперь попробуйте снова:</b>",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}")
+
+@router.callback_query(F.data == "check_mining_now")
+async def check_mining_now_callback(cb: CallbackQuery):
+    """Проверка майнинга через callback"""
+    uid = cb.from_user.id
+    user = await get_user(uid)
+    
+    text = f"""
+🔍 <b>ПРОВЕРКА МАЙНИНГА</b>
+
+🎮 <b>Видеокарты:</b> {user.get('mining_gpu_count', 0)} шт.
+⭐ <b>Уровень:</b> {user.get('mining_gpu_level', 1)}/5
+₿ <b>BTC:</b> {user.get('bitcoin', 0):.8f}
+
+⏰ <b>Последний сбор:</b> {user.get('last_mining_claim', 0)}
+⏳ <b>Прошло времени:</b> {int(time.time()) - user.get('last_mining_claim', time.time())} сек
+
+💡 <b>Рекомендации:</b>
+"""
+    
+    if user.get('mining_gpu_count', 0) == 0:
+        text += "1. Купите видеокарты\n2. Подождите 2-3 минуты"
+    elif user.get('bitcoin', 0) <= 0:
+        text += "1. Подождите 2-3 минуты\n2. Если не поможет - нажмите 'Форс-фикс'"
     else:
-        await cb.answer(f"❌ {usd_value_or_message}")
+        text += "✅ Всё отлично! Можете собирать BTC"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Забрать BTC", callback_data="mining_claim"),
+         InlineKeyboardButton(text="🔄 Форс-фикс", callback_data="force_fix_now")],
+        [InlineKeyboardButton(text="🛒 Купить видеокарту", callback_data="mining_buy_gpu_1")]
+    ])
+    
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await cb.answer("✅ Проверка завершена")
 
 @router.callback_query(F.data == "mining_sell")
 async def mining_sell_callback(cb: CallbackQuery):
-    await cb.answer("💸 Введите: продать биткоин [количество] или продать биткоин все")
+    """Обработка кнопки 'Продать BTC'"""
+    try:
+        uid = cb.from_user.id
+        user = await get_user(uid)
+        
+        if user['bitcoin'] <= 0:
+            await cb.answer("❌ У вас нет биткоинов для продажи", show_alert=True)
+            return
+        
+        # Создаем клавиатуру с вариантами продажи
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💰 25% BTC", callback_data="sell_btc_25"),
+                InlineKeyboardButton(text="💰 50% BTC", callback_data="sell_btc_50"),
+                InlineKeyboardButton(text="💰 100% BTC", callback_data="sell_btc_100")
+            ],
+            [
+                InlineKeyboardButton(text="💎 0.01 BTC", callback_data="sell_btc_0.01"),
+                InlineKeyboardButton(text="💎 0.1 BTC", callback_data="sell_btc_0.1")
+            ],
+            [
+                InlineKeyboardButton(text="📝 Своя сумма", callback_data="sell_btc_custom"),
+                InlineKeyboardButton(text="🔙 Назад", callback_data="show_mining")
+            ]
+        ])
+        
+        btc_price = BitcoinMining.get_bitcoin_price()
+        total_value = user['bitcoin'] * btc_price
+        
+        await cb.message.edit_text(
+            f"💸 <b>ПРОДАЖА БИТКОИНОВ</b>\n\n"
+            f"💰 <b>Ваши BTC:</b> {user['bitcoin']:.8f}\n"
+            f"💵 <b>Стоимость:</b> {format_money(int(total_value))}$\n"
+            f"📈 <b>Курс:</b> 1 BTC = {format_money(int(btc_price))}$\n\n"
+            f"🎯 <b>Выберите сколько продать:</b>",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        await cb.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка mining_sell_callback: {e}")
+        await cb.answer("❌ Ошибка", show_alert=True)
+
+@router.callback_query(F.data.startswith("sell_btc_"))
+async def sell_btc_percent_callback(cb: CallbackQuery):
+    """Продажа определенного процента BTC"""
+    try:
+        uid = cb.from_user.id
+        data = cb.data
+        
+        # Получаем данные пользователя
+        user = await get_user(uid)
+        current_btc = user['bitcoin']
+        
+        if current_btc <= 0:
+            await cb.answer("❌ У вас нет биткоинов", show_alert=True)
+            return
+        
+        # Определяем сколько продавать
+        if data == "sell_btc_25":
+            btc_to_sell = current_btc * 0.25
+            text_percent = "25%"
+        elif data == "sell_btc_50":
+            btc_to_sell = current_btc * 0.50
+            text_percent = "50%"
+        elif data == "sell_btc_100":
+            btc_to_sell = current_btc
+            text_percent = "100%"
+        elif data == "sell_btc_0.01":
+            btc_to_sell = 0.01
+            text_percent = "0.01 BTC"
+        elif data == "sell_btc_0.1":
+            btc_to_sell = 0.1
+            text_percent = "0.1 BTC"
+        elif data == "sell_btc_custom":
+            await cb.answer("📝 Введите: продать биткоин [количество]\nНапример: продать биткоин 0.05", show_alert=True)
+            return
+        else:
+            await cb.answer("❌ Неизвестная команда", show_alert=True)
+            return
+        
+        # Проверяем, что не продаем больше чем есть
+        if btc_to_sell > current_btc:
+            btc_to_sell = current_btc
+            text_percent = "все"
+        
+        # Продаем
+        success, btc_sold, usd_received = await sell_bitcoin(uid, btc_to_sell)
+        
+        if success:
+            updated_user = await get_user(uid)
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💸 Продать еще", callback_data="mining_sell")],
+                [InlineKeyboardButton(text="⛏️ Вернуться в майнинг", callback_data="show_mining")]
+            ])
+            
+            await cb.message.edit_text(
+                f"✅ <b>БИТКОИНЫ ПРОДАНЫ!</b>\n\n"
+                f"📊 <b>Продано:</b> {text_percent}\n"
+                f"💰 <b>Количество BTC:</b> {btc_sold:.8f}\n"
+                f"💵 <b>Получено:</b> {format_money(usd_received)}$\n\n"
+                f"📈 <b>Осталось BTC:</b> {updated_user['bitcoin']:.8f}\n"
+                f"💳 <b>Новый баланс:</b> {format_money(updated_user['balance'])}",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            await cb.answer(f"✅ Получено {format_money(usd_received)}$!")
+        else:
+            await cb.answer(f"❌ {usd_received}", show_alert=True)
+            
+    except Exception as e:
+        logger.error(f"Ошибка sell_btc_percent_callback: {e}")
+        await cb.answer("❌ Ошибка при продаже", show_alert=True)
 
 @router.callback_query(F.data == "mining_refresh")
 async def mining_refresh_callback(cb: CallbackQuery):
@@ -6050,6 +7470,88 @@ async def fix_profile_slash(msg: Message):
 async def fix_profile_cmd(msg: Message):
     await process_profile(msg)
 
+@router.message(F.text.lower().startswith("форсфикс "))
+async def force_fix_for_user_cmd(msg: Message):
+    """Форс-фикс для другого пользователя - ТОЛЬКО АДМИН"""
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    parts = msg.text.split()
+    
+    if len(parts) < 2:
+        await msg.reply("❌ Используйте: форсфикс [ID пользователя]")
+        return
+    
+    try:
+        target_uid = int(parts[1])
+    except ValueError:
+        await msg.reply("❌ ID должен быть числом")
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Устанавливаем время на 1 час назад
+            new_time = int(time.time()) - 3600
+            
+            await db.execute("""
+                UPDATE users 
+                SET last_mining_claim = ?, 
+                    bitcoin = bitcoin + 0.001,
+                    mining_gpu_count = CASE WHEN mining_gpu_count = 0 THEN 5 ELSE mining_gpu_count END
+                WHERE id = ?
+            """, (new_time, target_uid))
+            
+            await db.commit()
+            
+        await msg.reply(
+            f"✅ <b>Форс-фикс применен для пользователя ID {target_uid}!</b>\n\n"
+            "• Время сброшено на 1 час назад\n"
+            "• Добавлено 0.001 BTC\n"
+            "• Если не было видеокарт - добавлено 5 шт",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
+
+@router.message(F.text.lower().startswith("выдать биткоин "))
+async def give_bitcoin_cmd(msg: Message):
+    """Выдать биткоины пользователю - ТОЛЬКО АДМИН"""
+    if msg.from_user.id not in ADMIN_IDS:
+        await msg.reply("❌ Эта команда доступна только администраторам!")
+        return
+    
+    parts = msg.text.split()
+    
+    if len(parts) < 3:
+        await msg.reply("❌ Используйте: выдать биткоин [ID] [количество]\nПример: выдать биткоин 123456789 0.1")
+        return
+    
+    try:
+        target_uid = int(parts[2])
+        amount = float(parts[3])
+        
+        if amount <= 0:
+            await msg.reply("❌ Количество должно быть больше 0")
+            return
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET bitcoin = bitcoin + ? WHERE id = ?", 
+                           (amount, target_uid))
+            await db.commit()
+        
+        await msg.reply(
+            f"✅ <b>Выдано {amount:.8f} BTC пользователю ID {target_uid}!</b>\n\n"
+            f"Теперь он может собрать их командой: <code>забрать биткоины</code>",
+            parse_mode="HTML"
+        )
+        
+    except ValueError:
+        await msg.reply("❌ Неверный формат. Используйте: выдать биткоин [ID] [число]")
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
+
 @router.callback_query(F.data == "sell_plasma_menu")
 async def sell_plasma_menu_callback(cb: CallbackQuery):
     """Меню продажи плазмы"""
@@ -6148,6 +7650,136 @@ async def buy_business_cmd(msg: Message):
     else:
         await msg.reply(f"❌ {result}")
 
+        # Команды для продажи BTC
+@router.message(F.text.lower() == "продать биткоины")
+@router.message(F.text.lower() == "продать все биткоины")
+@router.message(F.text.lower() == "продать весь биткоин")
+async def sell_all_btc_cmd(msg: Message):
+    """Продать все биткоины"""
+    success, btc_sold, usd_received = await sell_bitcoin(msg.from_user.id, None)
+    
+    if success:
+        user = await get_user(msg.from_user.id)
+        await msg.reply(
+            f"✅ <b>ВСЕ БИТКОИНЫ ПРОДАНЫ!</b>\n\n"
+            f"💰 <b>Продано:</b> {btc_sold:.8f} BTC\n"
+            f"💵 <b>Получено:</b> {format_money(usd_received)}$\n"
+            f"💳 <b>Новый баланс:</b> {format_money(user['balance'])}",
+            parse_mode="HTML"
+        )
+    else:
+        await msg.reply(f"❌ {usd_received}", parse_mode="HTML")
+
+@router.message(F.text.lower() == "сбросить время")
+async def reset_time_cmd(msg: Message):
+    """Сбросить время майнинга (для теста)"""
+    uid = msg.from_user.id
+    current_time = int(time.time())
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Ставим время на 1 час назад
+        await db.execute("UPDATE users SET last_mining_claim = ? WHERE id = ?", 
+                       (current_time - 3600, uid))
+        await db.commit()
+    
+    await msg.reply(
+        "🕐 <b>Время сброшено на 1 час назад!</b>\n\n"
+        "Теперь майнинг должен работать.\n"
+        "Проверьте через 2 минуты командой:\n"
+        "<code>забрать биткоины</code>",
+        parse_mode="HTML"
+    )
+
+@router.message(F.text.lower() == "статус майнинга")
+async def mining_status_cmd(msg: Message):
+    """Детальный статус майнинга"""
+    uid = msg.from_user.id
+    user = await get_user(uid)
+    
+    current_time = int(time.time())
+    last_claim = user.get('last_mining_claim', current_time)
+    time_passed = current_time - last_claim
+    
+    hashrate = BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level'])
+    btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+    btc_per_minute = btc_per_hour / 60
+    btc_per_second = btc_per_minute / 60
+    
+    # Сколько уже должно было накопиться
+    btc_accumulated = btc_per_hour * (time_passed / 3600)
+    
+    # Когда будет 0.001 BTC (минимальная сумма для сбора)
+    if btc_per_hour > 0:
+        time_to_001 = (0.001 / btc_per_hour) * 3600
+        minutes_to_001 = int(time_to_001 // 60)
+        seconds_to_001 = int(time_to_001 % 60)
+    else:
+        time_to_001 = 0
+        minutes_to_001 = 0
+        seconds_to_001 = 0
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сбросить время", callback_data="force_fix_now"),
+         InlineKeyboardButton(text="💰 Забрать BTC", callback_data="mining_claim")],
+        [InlineKeyboardButton(text="⛏️ Панель майнинга", callback_data="show_mining")]
+    ])
+    
+    text = f"""
+🔍 <b>СТАТУС МАЙНИНГА</b>
+
+📊 <b>Ферма:</b>
+• Видеокарт: {user['mining_gpu_count']} шт.
+• Уровень: {user['mining_gpu_level']}/5
+• Хешрейт: {hashrate:,.0f} MH/s
+
+💰 <b>Доходность:</b>
+• В секунду: {btc_per_second:.10f} BTC
+• В минуту: {btc_per_minute:.8f} BTC
+• В час: {btc_per_hour:.6f} BTC
+• В день: {btc_per_hour * 24:.4f} BTC
+
+⏳ <b>Время:</b>
+• Последний сброс: {time.ctime(last_claim)}
+• Прошло: {time_passed} секунд ({time_passed/60:.1f} минут)
+• Накоплено (расчетно): {btc_accumulated:.8f} BTC
+
+📈 <b>Прогноз:</b>
+• 0.001 BTC будет через: {minutes_to_001} мин {seconds_to_001} сек
+• 0.01 BTC будет через: {int((0.01 / btc_per_hour) * 3600 // 60)} минут
+
+💎 <b>Текущий баланс BTC:</b> {user['bitcoin']:.8f}
+"""
+    
+    await msg.reply(text, parse_mode="HTML", reply_markup=keyboard)
+
+# Команда для просмотра баланса BTC
+@router.message(F.text.lower() == "мои биткоины")
+@router.message(F.text.lower() == "биткоины")
+@router.message(F.text.lower() == "btc")
+async def my_btc_cmd(msg: Message):
+    """Показать мои биткоины"""
+    user = await get_user(msg.from_user.id)
+    btc_price = BitcoinMining.get_bitcoin_price()
+    total_value = user['bitcoin'] * btc_price
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Продать BTC", callback_data="mining_sell")],
+        [InlineKeyboardButton(text="⛏️ Майнинг ферма", callback_data="show_mining")]
+    ])
+    
+    await msg.reply(
+        f"₿ <b>ВАШИ БИТКОИНЫ</b>\n\n"
+        f"💰 <b>Количество:</b> {user['bitcoin']:.8f} BTC\n"
+        f"💵 <b>Стоимость:</b> {format_money(int(total_value))}$\n"
+        f"📈 <b>Курс BTC:</b> {format_money(int(btc_price))}$ за 1 BTC\n\n"
+        f"💡 <b>Команды для продажи:</b>\n"
+        f"• <code>продать биткоин все</code>\n"
+        f"• <code>продать биткоин 0.1</code>\n"
+        f"• <code>продать биткоины</code>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
 @router.callback_query(F.data == "no_action")
 async def no_action_callback(cb: CallbackQuery):
     """Обработчик для заблокированных кнопок (когда нельзя собирать прибыль)"""
@@ -6184,36 +7816,313 @@ async def main():
     logger.info(f"✅ Бот запущен!")
     # ... остальной код
 
+@router.message(F.text.lower() == "проверитьбаланс")
+async def check_balance_test(msg: Message):
+    """Тестовая команда для проверки баланса"""
+    uid = msg.from_user.id
+    
+    # Проверяем 3 раза подряд (как было раньше)
+    for i in range(1, 4):
+        user = await get_user(uid)
+        await msg.reply(
+            f"🔍 Проверка #{i}:\n"
+            f"💰 Баланс: {user['balance']:,}\n"
+            f"₿ BTC: {user['bitcoin']:.6f}\n"
+            f"⚡ Плазма: {user['plasma']}\n"
+            f"⏰ Время: {time.time()}"
+        )
+        await asyncio.sleep(1)  # Пауза 1 секунда
+    
+    await msg.reply("✅ Проверка завершена. Баланс не должен меняться сам по себе!")
+
+async def check_mining_debug(uid: int):
+    """Детальная диагностика майнинга"""
+    user = await get_user(uid)
+    
+    text = f"""
+🔍 <b>ДИАГНОСТИКА МАЙНИНГА</b>
+
+👤 <b>Пользователь:</b> {uid}
+
+📊 <b>Данные из БД:</b>
+• Видеокарт: {user['mining_gpu_count']}
+• Уровень: {user['mining_gpu_level']}
+• BTC баланс: {user['bitcoin']:.8f}
+• Последний сбор: {user.get('last_mining_claim', 0)}
+• Время последнего сбора: {time.ctime(user.get('last_mining_claim', 0))}
+
+⚡ <b>Расчеты:</b>
+• Хешрейт: {BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level']):,.0f} MH/s
+• BTC/час: {BitcoinMining.calculate_btc_per_hour(BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level'])):.8f}
+
+🕐 <b>Время:</b>
+• Текущее: {time.time()} ({time.ctime()})
+• Прошло с последнего сбора: {time.time() - user.get('last_mining_claim', time.time()):.0f} сек
+• Часов: {(time.time() - user.get('last_mining_claim', time.time())) / 3600:.2f}
+
+💡 <b>Потенциальные BTC:</b>
+• За прошедшее время: {BitcoinMining.calculate_btc_per_hour(BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level'])) * ((time.time() - user.get('last_mining_claim', time.time())) / 3600):.8f}
+"""
+    
+    return text
+
+# ========== ФИКС-КОМАНДЫ ==========
+
+@router.message(F.text.lower() == "фиксмайнинг")
+async def fix_mining_cmd(msg: Message):
+    """Экстренный фикс майнинга"""
+    uid = msg.from_user.id
+    current_time = int(time.time())
+    
+    # Устанавливаем время на 2 часа назад
+    two_hours_ago = current_time - (2 * 3600)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET last_mining_claim = ? WHERE id = ?", 
+                       (two_hours_ago, uid))
+        await db.commit()
+        
+        # Очищаем кэш
+        cache_key = f"user_{uid}"
+        if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+            del get_user.cache[cache_key]
+    
+    await msg.reply(
+        f"✅ <b>Майнинг пофикшен!</b>\n\n"
+        f"🕐 Время установлено на 2 часа назад\n"
+        f"⏳ Теперь у вас должно быть BTC\n\n"
+        f"Попробуйте: <code>собрать биткоины</code>",
+        parse_mode="HTML"
+    )
+
+@router.message(F.text.lower() == "дебагмайнинг")
+async def debug_mining_cmd(msg: Message):
+    """Дебаг майнинга"""
+    uid = msg.from_user.id
+    user = await get_user(uid)
+    
+    current_time = int(time.time())
+    last_claim = user.get('last_mining_claim', 0)
+    time_passed = current_time - last_claim
+    
+    hashrate = BitcoinMining.calculate_hashrate(user['mining_gpu_count'], user['mining_gpu_level'])
+    btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+    potential_btc = btc_per_hour * (time_passed / 3600)
+    
+    text = f"""
+🔧 <b>ДЕБАГ МАЙНИНГА</b>
+
+📊 <b>Данные:</b>
+• Видеокарт: {user['mining_gpu_count']}
+• Уровень: {user['mining_gpu_level']}
+• Текущий BTC: {user['bitcoin']:.8f}
+• last_mining_claim: {last_claim}
+• Текущее время: {current_time}
+• Разница: {time_passed} сек ({time_passed/60:.1f} мин)
+
+⚡ <b>Расчеты:</b>
+• Хешрейт: {hashrate:,.0f} MH/s
+• BTC/час: {btc_per_hour:.8f}
+• Потенциально: {potential_btc:.8f} BTC
+
+💡 <b>Решение:</b>
+"""
+    
+    if time_passed < 60:
+        text += f"❌ Слишком мало времени: {time_passed} сек < 60 сек\n"
+        text += f"Нужно подождать: {60 - time_passed} секунд"
+    else:
+        text += f"✅ Время прошло достаточно: {time_passed} сек\n"
+        text += f"Должно накопиться: {potential_btc:.8f} BTC"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сбросить время", callback_data="reset_mining_time")]
+    ])
+    
+    await msg.reply(text, parse_mode="HTML", reply_markup=keyboard)
+
+@router.callback_query(F.data == "reset_mining_time")
+async def reset_mining_time_callback(cb: CallbackQuery):
+    """Сбросить время майнинга через callback"""
+    uid = cb.from_user.id
+    current_time = int(time.time())
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET last_mining_claim = ? WHERE id = ?", 
+                       (current_time - 7200, uid))  # 2 часа назад
+        await db.commit()
+        
+        cache_key = f"user_{uid}"
+        if hasattr(get_user, 'cache') and cache_key in get_user.cache:
+            del get_user.cache[cache_key]
+    
+    await cb.answer("✅ Время сброшено на 2 часа назад!")
+    await debug_mining_cmd(cb.message)
+
+    # ========== ЭКСТРЕННЫЕ КОМАНДЫ ==========
+
+@router.message(F.text.lower() == "тест123")
+async def test123_cmd(msg: Message):
+    """Тестовая команда 123"""
+    await msg.reply("✅ Бот жив!")
+
+@router.message(F.text.lower() == "сброс")
+async def reset_all_cmd(msg: Message):
+    """Сброс всего майнинга"""
+    uid = msg.from_user.id
+    
+    # Простой SQL запрос
+    try:
+        import sqlite3
+        conn = sqlite3.connect('murasaki.db')
+        cursor = conn.cursor()
+        
+        # Время на 5 часов назад
+        new_time = int(time.time()) - 18000
+        
+        cursor.execute("UPDATE users SET last_mining_claim = ?, bitcoin = 0.1, mining_gpu_count = 5 WHERE id = ?", 
+                      (new_time, uid))
+        conn.commit()
+        conn.close()
+        
+        await msg.reply("✅ ВСЁ СБРОШЕНО!\nТеперь введите: майнинг")
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
+
+@router.message(F.text.lower() == "майнинг2")
+async def mining2_cmd(msg: Message):
+    """Альтернативная панель майнинга"""
+    uid = msg.from_user.id
+    
+    try:
+        import sqlite3
+        conn = sqlite3.connect('murasaki.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT mining_gpu_count, bitcoin FROM users WHERE id = ?", (uid,))
+        data = cursor.fetchone()
+        conn.close()
+        
+        if data:
+            await msg.reply(
+                f"⛏️ <b>МАЙНИНГ 2.0</b>\n\n"
+                f"🎮 Видеокарт: {data[0] or 0}\n"
+                f"₿ BTC: {data[1] or 0:.8f}\n\n"
+                f"💡 Команды:\n"
+                f"• <code>сброс</code> - сбросить всё\n"
+                f"• <code>забрать2</code> - забрать BTC\n"
+                f"• <code>купитьгпу</code> - купить 10 карт",
+                parse_mode="HTML"
+            )
+        else:
+            await msg.reply("❌ Нет данных")
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
+
+@router.message(F.text.lower() == "забрать2")
+async def collect2_cmd(msg: Message):
+    """Забрать BTC v2"""
+    uid = msg.from_user.id
+    
+    try:
+        import sqlite3
+        conn = sqlite3.connect('murasaki.db')
+        cursor = conn.cursor()
+        
+        # Получаем BTC
+        cursor.execute("SELECT bitcoin FROM users WHERE id = ?", (uid,))
+        btc = cursor.fetchone()[0] or 0
+        
+        if btc <= 0:
+            cursor.execute("UPDATE users SET bitcoin = 0.05 WHERE id = ?", (uid,))
+            btc = 0.05
+        
+        # Выдаем деньги (1 BTC = 100,000,000$)
+        reward = int(btc * 100000000)
+        cursor.execute("UPDATE users SET balance = balance + ?, bitcoin = 0, last_mining_claim = ? WHERE id = ?", 
+                      (reward, int(time.time()), uid))
+        
+        conn.commit()
+        conn.close()
+        
+        await msg.reply(f"✅ ЗАБРАНО {btc:.8f} BTC!\n💵 +{reward:,}$")
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
+
+@router.message(F.text.lower() == "купитьгпу")
+async def buy_gpu_simple(msg: Message):
+    """Купить видеокарты"""
+    uid = msg.from_user.id
+    
+    try:
+        import sqlite3
+        conn = sqlite3.connect('murasaki.db')
+        cursor = conn.cursor()
+        
+        # Добавляем 10 видеокарт уровня 1
+        cursor.execute("UPDATE users SET mining_gpu_count = mining_gpu_count + 10 WHERE id = ?", (uid,))
+        cursor.execute("UPDATE users SET mining_gpu_level = 1 WHERE mining_gpu_level = 0 AND id = ?", (uid,))
+        
+        conn.commit()
+        conn.close()
+        
+        await msg.reply("✅ Куплено 10 видеокарт!")
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
+
+# ВСТАВИТЬ ПЕРЕД async def main():
+# ========== ЗАПУСК ЛОТЕРЕЙНОЙ СИСТЕМЫ ==========
+async def lottery_scheduler():
+    """Планировщик для автоматического розыгрыша лотереи"""
+    while True:
+        try:
+            # Проверяем каждую минуту
+            await asyncio.sleep(60)
+            
+            # Проверяем, прошло ли 24 часа
+            if await reset_lottery():
+                # Если лотерея сбросилась (прошел день), проводим розыгрыш
+                winners = await draw_lottery()
+                
+                if winners:
+                    # Отправляем уведомление в чат
+                    logger.info("🎰 Проведен автоматический розыгрыш лотереи")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка в планировщике лотереи: {e}")
+
 # ========== ЗАПУСК ==========
 async def main():
-    await init_db()
+        await init_db()
 
-    bot = Bot(token=TOKEN)
-    dp = Dispatcher()
+        bot = Bot(token=TOKEN)
+        dp = Dispatcher()
 
-    dp.include_router(router)  # ← ВАЖНЕЕ ВСЕГО
+        dp.include_router(router)  # ← ВАЖНЕЕ ВСЕГО
 
-    await bot.delete_webhook(drop_pending_updates=True)
+        asyncio.create_task(periodic_cleanup())
 
-    logger.info(f"✅ Бот запущен!")
-    logger.info("🎯 Теперь команды работают И С / И БЕЗ / !")
-    logger.info("🏢 ДОБАВЛЕНЫ БИЗНЕСЫ: 13 бизнесов с системой продуктов!")
-    logger.info("🪐 ДОБАВЛЕНЫ ПЛАНЕТЫ: 5 планет с генерацией плазмы!")
-    logger.info("⛏️ ДОБАВЛЕН МАЙНИНГ: Майнинг ферма с видеокартами и BTC!")
-    logger.info("💼 ДОБАВЛЕНЫ ИНВЕСТИЦИИ: 5 видов инвестиций с риском!")
-    logger.info("🎰 ДОБАВЛЕНЫ АЗАРТНЫЕ ИГРЫ: Монетка, Кости, Слоты, Рулетка, Блэкджек!")
-    logger.info("💰 Бонус: 5-20М каждый час с прогресс-баром!")
-    logger.info("💼 Работа: 1-5М каждые 30 секунд!")
-    logger.info("🎁 СТАРТОВЫЙ БОНУС: 10.000.000!")
-    logger.info("👥 РЕФЕРАЛЬНАЯ СИСТЕМА: 30-100М за каждого друга!")
-    logger.info("📱 Полная поддержка сокращений: 1к, 10кк, 100кк, 1.5к и т.д.")
-    logger.info("🎯 ДОБАВЛЕНА КОМАНДА 'МОЙ БИЗНЕС' с inline-кнопками!")
-    logger.info("💼 ИНВЕСТИЦИИ: Теперь 'начать инвестицию [id]' показывает панель с выбором суммы!")
-    logger.info("⛏️ ДОБАВЛЕНА ПАНЕЛЬ МАЙНИНГА!")
-    logger.info("🪐 ДОБАВЛЕНА ПАНЕЛЬ 'МОИ ПЛАНЕТЫ'!")
-    logger.info("💼 ДОБАВЛЕНА ПАНЕЛЬ ИНВЕСТИЦИЙ!")
+        await bot.delete_webhook(drop_pending_updates=True)
+
+        logger.info(f"✅ Бот запущен!")
+        logger.info("🎯 Теперь команды работают И С / И БЕЗ / !")
+        logger.info("🏢 ДОБАВЛЕНЫ БИЗНЕСЫ: 13 бизнесов с системой продуктов!")
+        logger.info("🪐 ДОБАВЛЕНЫ ПЛАНЕТЫ: 5 планет с генерацией плазмы!")
+        logger.info("⛏️ ДОБАВЛЕН МАЙНИНГ: Майнинг ферма с видеокартами и BTC!")
+        logger.info("💼 ДОБАВЛЕНЫ ИНВЕСТИЦИИ: 5 видов инвестиций с риском!")
+        logger.info("🎰 ДОБАВЛЕНЫ АЗАРТНЫЕ ИГРЫ: Монетка, Кости, Слоты, Рулетка, Блэкджек!")
+        logger.info("💰 Бонус: 5-20М каждый час с прогресс-баром!")
+        logger.info("💼 Работа: 1-5М каждые 30 секунд!")
+        logger.info("🎁 СТАРТОВЫЙ БОНУС: 10.000.000!")
+        logger.info("👥 РЕФЕРАЛЬНАЯ СИСТЕМА: 30-100М за каждого друга!")
+        logger.info("📱 Полная поддержка сокращений: 1к, 10кк, 100кк, 1.5к и т.д.")
+        logger.info("🎯 ДОБАВЛЕНА КОМАНДА 'МОЙ БИЗНЕС' с inline-кнопками!")
+        logger.info("💼 ИНВЕСТИЦИИ: Теперь 'начать инвестицию [id]' показывает панель с выбором суммы!")
+        logger.info("⛏️ ДОБАВЛЕНА ПАНЕЛЬ МАЙНИНГА!")
+        logger.info("🪐 ДОБАВЛЕНА ПАНЕЛЬ 'МОИ ПЛАНЕТЫ'!")
+        logger.info("💼 ДОБАВЛЕНА ПАНЕЛЬ ИНВЕСТИЦИЙ!")
     
-    await dp.start_polling(bot)
+        await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
