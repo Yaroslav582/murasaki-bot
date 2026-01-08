@@ -6,18 +6,668 @@ import logging
 import hashlib
 import math
 import re
+import secrets
+import shutil
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Dice
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.enums import ChatType
+import sys
+import os
+import db
+import warnings
+
+# Suppress aiohttp warnings
+warnings.filterwarnings("ignore", message="Unclosed client session")
+warnings.filterwarnings("ignore", message="Unclosed connector")
+
+# Suppress asyncio unclosed resource warnings
+logging.getLogger('asyncio').setLevel(logging.CRITICAL)
+
+LOCK_FILE = "murasaki_bot.lock"
+
+def check_single_instance():
+    """Проверяет, что бот запущен только один раз"""
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            
+            if os.name == 'nt':
+                import psutil
+                if psutil.pid_exists(pid):
+                    print(f"❌ Бот уже запущен (PID: {pid})!")
+                    print("Закройте предыдущий экземпляр и удалите файл murasaki_bot.lock")
+                    sys.exit(1)
+            else:  
+                import signal
+                try:
+                    os.kill(pid, 0)  
+                    print(f"❌ Бот уже запущен (PID: {pid})!")
+                    print("Закройте предыдущий экземпляр и удалите файл murasaki_bot.lock")
+                    sys.exit(1)
+                except OSError:
+                    pass
+        except:
+            pass
+        finally:
+            # Создаем lock-файл с PID текущего процесса
+            with open(LOCK_FILE, 'w') as f:
+                f.write(str(os.getpid()))
+    
+    # Удаляем lock-файл при выходе
+    import atexit
+    atexit.register(cleanup_lock_file)
+
+def cleanup_lock_file():
+    """Удаляет lock-файл при завершении"""
+    if os.path.exists(LOCK_FILE):
+        try:
+            os.remove(LOCK_FILE)
+        except:
+            pass
+
+# Вызываем проверку в самом начале
+check_single_instance()
 print("🔥 THIS FILE IS RUNNING")
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA"
-ADMIN_IDS = {1162907446}  # Твой ID
-DB_PATH = "murasaki.db"
+ADMIN_IDS = {1162907446}
+CREATOR_ID = 1162907446
+
+# ========== НАСТРОЙКА ПУТИ К БД (RAILWAY VOLUMES) ==========
+def get_db_path():
+    """Определяет путь к БД в зависимости от окружения"""
+    
+    # Если запущено на Railway (проверяем переменную окружения)
+    if os.getenv('RAILWAY_ENVIRONMENT'):
+        # Путь к volume на Railway
+        data_dir = '/data'
+        
+        # Создаем директорию если её нет
+        if not os.path.exists(data_dir):
+            try:
+                os.makedirs(data_dir, exist_ok=True)
+                print(f"✅ Создана директория: {data_dir}")
+            except Exception as e:
+                print(f"⚠️ Не удалось создать {data_dir}: {e}")
+                # Используем текущую директорию как fallback
+                return "murasaki_NEW.db"
+        
+        db_path = os.path.join(data_dir, 'murasaki_NEW.db')
+        print(f"🗄️ Railway БД: {db_path}")
+        return db_path
+    else:
+        # Локальная разработка
+        print("💻 Локальная БД: murasaki_NEW.db")
+        return "murasaki_NEW.db"
+
+DB_PATH = get_db_path()
+
+HELP_COMMANDS = {
+    "Профиль и старт": [
+        ("профиль", "ваш профиль"),
+        ("страна", "информация о стране"),
+        ("выбор страны", "выбрать стартовую страну"),
+    ],
+    "Заработок": [
+        ("бонус", "ежедневный бонус (серия 30 дней)"),
+        ("работа", "активный заработок"),
+        ("собрать доход", "доход со страны"),
+    ],
+    "Экономика": [
+        ("улучшения", "улучшения страны"),
+        ("бизнесы", "бизнесы внутри страны"),
+        ("налоги", "управление налогами"),
+        ("экономика", "статус экономики"),
+    ],
+    "Армия и войны": [
+        ("армия", "управление армией"),
+        ("оружие", "магазин оружия"),
+        ("техника", "магазин техники"),
+        ("войны", "список войн"),
+        ("война", "текущая война"),
+    ],
+    "Кланы": [
+        ("клан", "информация о клане"),
+        ("создать клан", ""),
+        ("клан склад", ""),
+        ("клан выйти", ""),
+    ],
+    "Боссы": [
+        ("боссы", "список боссов"),
+        ("босс", "текущий босс"),
+        ("атака босса", ""),
+    ],
+    "Космос": [
+        ("космос", "меню космоса"),
+        ("экспедиции", ""),
+        ("колонии", ""),
+        ("технологии", ""),
+    ],
+    "Кредиты": [
+        ("кредиты", ""),
+        ("кредит запросить", ""),
+        ("кредит платить", ""),
+        ("кредит сигма", ""),
+    ],
+    "Развлечения": [
+        ("казино", ""),
+        ("рулетка", ""),
+    ],
+    "Прочее": [
+        ("хелп", "список команд"),
+    ],
+}
+
+
+def build_help_text(is_admin: bool) -> str:
+    lines = []
+    for section, items in HELP_COMMANDS.items():
+        lines.append(f"📌 {section}:")
+        for command, description in items:
+            if description:
+                lines.append(f"- {command} — {description}")
+            else:
+                lines.append(f"- {command}")
+        lines.append("")
+    if is_admin:
+        lines.append("Для админ-команд используйте: админ")
+    return "\n".join(lines).strip()
+
+# ========== КОНФИГ СТАРТОВЫХ СТРАН ==========
+START_COUNTRIES = [
+    {'code': 'arcadia', 'name': 'Аркадия', 'description': '+5% налоги', 'bonus_type': 'tax_rate', 'bonus_value': 0.05},
+    {'code': 'aurelion', 'name': 'Аурелион', 'description': '+5% доход бизнесов', 'bonus_type': 'business_income', 'bonus_value': 0.05},
+    {'code': 'zlatoria', 'name': 'Златория', 'description': '+10% стартовая казна', 'bonus_type': 'start_treasury', 'bonus_value': 0.10},
+    {'code': 'valoria', 'name': 'Валория', 'description': '-5% стоимость апгрейдов', 'bonus_type': 'upgrade_cost', 'bonus_value': -0.05},
+    {'code': 'merkatia', 'name': 'Меркатия', 'description': '+5% торговля', 'bonus_type': 'trade_bonus', 'bonus_value': 0.05},
+    {'code': 'lumenсия', 'name': 'Люменсия', 'description': '+10% прирост населения', 'bonus_type': 'population_growth', 'bonus_value': 0.10},
+    {'code': 'sancteria', 'name': 'Санктерия', 'description': '+10 счастье', 'bonus_type': 'happiness', 'bonus_value': 10},
+    {'code': 'eventia', 'name': 'Эвентия', 'description': '-10% негативные ивенты', 'bonus_type': 'event_resistance', 'bonus_value': -0.10},
+    {'code': 'novalis', 'name': 'Новалис', 'description': '+10 грамотность', 'bonus_type': 'literacy', 'bonus_value': 10},
+    {'code': 'harmonia', 'name': 'Гармония', 'description': '-10% преступность', 'bonus_type': 'crime', 'bonus_value': -10},
+    {'code': 'noxara', 'name': 'Ноксара', 'description': '+5% боевая сила', 'bonus_type': 'military_power', 'bonus_value': 0.05},
+    {'code': 'kratosia', 'name': 'Кратосия', 'description': '+10% лимит людей', 'bonus_type': 'population_cap', 'bonus_value': 0.10},
+    {'code': 'fortex', 'name': 'Фортекс', 'description': '-10% потери армии', 'bonus_type': 'army_losses', 'bonus_value': -0.10},
+    {'code': 'bastion', 'name': 'Бастион', 'description': '+5% защита', 'bonus_type': 'defense', 'bonus_value': 0.05},
+    {'code': 'dominia', 'name': 'Доминия', 'description': '+5% урон по боссам', 'bonus_type': 'boss_damage', 'bonus_value': 0.05},
+    {'code': 'technolis', 'name': 'Технолис', 'description': '+10% эффективность зданий', 'bonus_type': 'building_efficiency', 'bonus_value': 0.10},
+    {'code': 'industria', 'name': 'Индустрия', 'description': '+5% рабочие места', 'bonus_type': 'jobs', 'bonus_value': 0.05},
+    {'code': 'logistar', 'name': 'Логистар', 'description': '-10% upkeep армии', 'bonus_type': 'army_upkeep', 'bonus_value': -0.10},
+    {'code': 'energolia', 'name': 'Энерголия', 'description': '+10% энергетические бонусы', 'bonus_type': 'energy_bonus', 'bonus_value': 0.10},
+    {'code': 'megapolis', 'name': 'Мегаполис', 'description': '+10% population_cap', 'bonus_type': 'population_cap', 'bonus_value': 0.10},
+    {'code': 'astrea', 'name': 'Астрея', 'description': '+10% плазма', 'bonus_type': 'plasma_bonus', 'bonus_value': 0.10},
+    {'code': 'orbiton', 'name': 'Орбитон', 'description': '+5% урон по боссам', 'bonus_type': 'boss_damage', 'bonus_value': 0.05},
+    {'code': 'singula', 'name': 'Сингуля', 'description': '+5% шанс уникалок', 'bonus_type': 'unique_chance', 'bonus_value': 0.05},
+    {'code': 'kosmarium', 'name': 'Космариум', 'description': '-10% космо-апгрейды', 'bonus_type': 'cosmo_upgrades', 'bonus_value': -0.10},
+    {'code': 'nova-prime', 'name': 'Нова-Прайм', 'description': '+5% космо-бонусы', 'bonus_type': 'cosmo_bonus', 'bonus_value': 0.05},
+    {'code': 'equilibrium', 'name': 'Эквилибриум', 'description': '+3% ко всем доходам', 'bonus_type': 'all_income', 'bonus_value': 0.03},
+    {'code': 'valdheim', 'name': 'Вальдхейм', 'description': '+5 стабильность', 'bonus_type': 'stability', 'bonus_value': 5},
+    {'code': 'civilis', 'name': 'Цивилис', 'description': '+5 счастье и грамотность', 'bonus_type': 'happiness_literacy', 'bonus_value': 5},
+    {'code': 'progressa', 'name': 'Прогресса', 'description': '+5% апгрейды и доход', 'bonus_type': 'upgrades_income', 'bonus_value': 0.05},
+    {'code': 'alliance', 'name': 'Альянсия', 'description': '+3% доход и сила', 'bonus_type': 'income_power', 'bonus_value': 0.03},
+]
+
+# Особая страна для создателя
+CREATOR_COUNTRY = {
+    'code': 'sigma_empire',
+    'name': 'Империя Великого Сигмы Ярика',
+    'description': '+15% доход, +15% боевая сила, +20% урон по боссам, +20 стабильность, +20 счастье',
+    'bonus_type': 'creator_bonuses',
+    'bonus_value': {'income': 0.15, 'military_power': 0.15, 'boss_damage': 0.20, 'stability': 20, 'happiness': 20}
+}
+
+# ========== КОНФИГ ТИТУЛОВ ==========
+TITLES_CONFIG = [
+    {'code': 'iron_ruler', 'name': 'Железный Правитель', 'description': '30 дней без бунтов', 'bonus_type': 'income', 'bonus_value': 0.02, 'permanent': 1},
+    {'code': 'military_maniac', 'name': 'Военный Маньяк', 'description': '50 побед в войнах', 'bonus_type': 'combat', 'bonus_value': 0.02, 'permanent': 1},
+    {'code': 'casino_magnate', 'name': 'Казино-Магнат', 'description': 'оборот ставок > 10B', 'bonus_type': 'casino', 'bonus_value': 0.01, 'permanent': 1},
+    {'code': 'sigma_killer', 'name': 'Убийца Сигмы', 'description': 'победа над Жирным Сигмой Яриком', 'bonus_type': 'boss', 'bonus_value': 0.03, 'permanent': 1},
+    {'code': 'wealthy_trader', 'name': 'Богатый Торговец', 'description': 'баланс > 100B', 'bonus_type': 'income', 'bonus_value': 0.01, 'permanent': 0},
+    {'code': 'plasma_master', 'name': 'Мастер Плазмы', 'description': 'плазма > 1M', 'bonus_type': 'income', 'bonus_value': 0.015, 'permanent': 1},
+    {'code': 'space_pioneer', 'name': '\u041f\u0435\u0440\u0432\u043e\u043e\u0442\u043a\u0440\u044b\u0432\u0430\u0442\u0435\u043b\u044c', 'description': '\u043f\u0435\u0440\u0432\u043e\u0435 \u043a\u043e\u0441\u043c\u0438\u0447\u0435\u0441\u043a\u043e\u0435 \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u0435', 'bonus_type': 'prestige', 'bonus_value': 1, 'permanent': 1},
+    {'code': 'void_conqueror', 'name': '\u041f\u043e\u043a\u043e\u0440\u0438\u0442\u0435\u043b\u044c \u0411\u0435\u0437\u0434\u043d\u044b', 'description': '\u043c\u043d\u043e\u0433\u043e \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u0439 \u0432 \u043a\u043e\u0441\u043c\u043e\u0441\u0435', 'bonus_type': 'prestige', 'bonus_value': 2, 'permanent': 1},
+    {'code': 'sigma_witness', 'name': '\u0412\u0438\u0434\u0435\u0432\u0448\u0438\u0439 \u0421\u0438\u0433\u043c\u0443', 'description': '\u043e\u0442\u043a\u0440\u044b\u0442\u0438\u0435 \u0441\u0438\u0433\u043c\u0430-\u0430\u043d\u043e\u043c\u0430\u043b\u0438\u0438', 'bonus_type': 'prestige', 'bonus_value': 3, 'permanent': 1},
+    {'code': 'referral_guru', 'name': 'Реферальный Гуру', 'description': '100+ рефералов', 'bonus_type': 'income', 'bonus_value': 0.02, 'permanent': 1},
+    {'code': 'mining_tycoon', 'name': 'Майнинг-Магнат', 'description': '100+ видеокарт', 'bonus_type': 'income', 'bonus_value': 0.01, 'permanent': 1},
+    {'code': 'business_empire', 'name': 'Империя Бизнеса', 'description': 'Все бизнесы страны макс уровня', 'bonus_type': 'income', 'bonus_value': 0.025, 'permanent': 1},
+    {'code': 'war_hero', 'name': 'Герой Войны', 'description': '100+ побед в войнах', 'bonus_type': 'combat', 'bonus_value': 0.03, 'permanent': 1},
+    {'code': 'debtor', 'name': '\u0414\u043e\u043b\u0436\u043d\u0438\u043a', 'description': '\u0434\u0435\u0444\u043e\u043b\u0442 \u043f\u043e \u043a\u0440\u0435\u0434\u0438\u0442\u0443', 'bonus_type': 'income', 'bonus_value': -0.03, 'permanent': 1},
+]
+
+# ========== КОНФИГ МИРОВЫХ СОБЫТИЙ ==========
+WORLD_EVENTS_CONFIG = [
+    {'code': 'economic_crisis', 'name': 'Экономический кризис', 'description': 'Все доходы снижены на 20%', 'effect_type': 'income', 'effect_value': -0.20, 'duration_hours': 48},
+    {'code': 'war_era', 'name': 'Эра войн', 'description': 'Урон в войнах увеличен на 10%', 'effect_type': 'war_damage', 'effect_value': 0.10, 'duration_hours': 72},
+    {'code': 'scientific_breakthrough', 'name': 'Научный прорыв', 'description': 'Производство плазмы увеличено на 20%', 'effect_type': 'plasma', 'effect_value': 0.20, 'duration_hours': 96},
+    {'code': 'sigma_week', 'name': 'Неделя Сигмы', 'description': 'Боссы сильнее, но дают больше лута', 'effect_type': 'boss_buff', 'effect_value': 0.15, 'duration_hours': 168},
+    {'code': 'golden_age', 'name': 'Золотой век', 'description': 'Все доходы увеличены на 15%', 'effect_type': 'income', 'effect_value': 0.15, 'duration_hours': 120},
+    {'code': 'dark_times', 'name': 'Темные времена', 'description': 'Шанс негативных событий увеличен', 'effect_type': 'event_chance', 'effect_value': 0.20, 'duration_hours': 60},
+    {'code': 'peace_era', 'name': 'Эра мира', 'description': 'Стабильность стран выше', 'effect_type': 'stability', 'effect_value': 0.10, 'duration_hours': 84},
+    {'code': 'mining_boom', 'name': 'Бум майнинга', 'description': 'Эффективность майнинга +25%', 'effect_type': 'mining', 'effect_value': 0.25, 'duration_hours': 72},
+]
+
+# ========== БИЗНЕСЫ СТРАНЫ ==========
+BUSINESS_DEFS = {
+    "trade_hub": {
+        "name": "Торговый хаб",
+        "base_cost": 5_000_000,
+        "max_level": 10,
+        "income_bonus": 0.01,
+        "jobs": 150,
+        "upkeep_day": 50_000
+    },
+    "logistics": {
+        "name": "Логистический центр",
+        "base_cost": 12_000_000,
+        "max_level": 10,
+        "income_bonus": 0.012,
+        "jobs": 220,
+        "upkeep_day": 90_000
+    },
+    "industrial_park": {
+        "name": "Промышленный парк",
+        "base_cost": 40_000_000,
+        "max_level": 10,
+        "income_bonus": 0.02,
+        "jobs": 450,
+        "upkeep_day": 250_000
+    },
+    "finance_district": {
+        "name": "Финансовый квартал",
+        "base_cost": 25_000_000,
+        "max_level": 10,
+        "income_bonus": 0.015,
+        "jobs": 260,
+        "upkeep_day": 160_000
+    },
+    "media_group": {
+        "name": "Медиа-холдинг",
+        "base_cost": 8_000_000,
+        "max_level": 10,
+        "income_bonus": 0.008,
+        "jobs": 120,
+        "upkeep_day": 60_000
+    }
+}
+
+# Для безопасной компенсации при миграции старой системы бизнесов.
+LEGACY_BUSINESS_DEFS = {
+    1: {"price": 100_000, "upgrade_multiplier": 1.5},
+    2: {"price": 1_000_000, "upgrade_multiplier": 1.5},
+    3: {"price": 5_000_000, "upgrade_multiplier": 1.5},
+    4: {"price": 25_000_000, "upgrade_multiplier": 1.5},
+    5: {"price": 100_000_000, "upgrade_multiplier": 1.5},
+    6: {"price": 500_000_000, "upgrade_multiplier": 1.5},
+    7: {"price": 2_000_000_000, "upgrade_multiplier": 1.5},
+    8: {"price": 10_000_000_000, "upgrade_multiplier": 1.5},
+    9: {"price": 50_000_000_000, "upgrade_multiplier": 1.5},
+    10: {"price": 200_000_000_000, "upgrade_multiplier": 1.5},
+    11: {"price": 1_000_000_000_000, "upgrade_multiplier": 1.5},
+    12: {"price": 50_000_000, "upgrade_multiplier": 1.5},
+    13: {"price": 30_000_000, "upgrade_multiplier": 1.5}
+}
+
+# ========== КОНФИГ СПЕЦИАЛИЗАЦИЙ СТРАНЫ ==========
+COUNTRY_SPECIALIZATIONS = {
+    'military': {
+        'name': 'Военная',
+        'description': 'Фокус на военной мощи',
+        'bonuses': [
+            {'type': 'combat_power', 'value': 0.10, 'description': '+10% боевой силы'},
+        ],
+        'penalties': [
+            {'type': 'income', 'value': -0.05, 'description': '-5% дохода'},
+        ]
+    },
+    'economic': {
+        'name': 'Экономическая', 
+        'description': 'Фокус на экономическом развитии',
+        'bonuses': [
+            {'type': 'income', 'value': 0.10, 'description': '+10% дохода'},
+            {'type': 'jobs', 'value': 0.05, 'description': '+5% рабочих мест'},
+        ],
+        'penalties': [
+            {'type': 'happiness', 'value': -5, 'description': '-5 счастья'},
+        ]
+    },
+    'science': {
+        'name': 'Научная',
+        'description': 'Фокус на исследованиях и технологиях',
+        'bonuses': [
+            {'type': 'literacy', 'value': 10, 'description': '+10 грамотности'},
+            {'type': 'research_speed', 'value': 0.15, 'description': '+15% скорость исследований'},
+        ],
+        'penalties': [
+            {'type': 'stability', 'value': -5, 'description': '-5 стабильности'},
+        ]
+    },
+    'social': {
+        'name': 'Социальная',
+        'description': 'Фокус на благополучии населения',
+        'bonuses': [
+            {'type': 'happiness', 'value': 10, 'description': '+10 счастья'},
+            {'type': 'population_growth', 'value': 0.10, 'description': '+10% прирост населения'},
+        ],
+        'penalties': [
+            {'type': 'crime', 'value': 5, 'description': '+5 преступности'},
+        ]
+    }
+}
+
+SPECIALIZATION_CHANGE_COOLDOWN = 7 * 24 * 3600  # 7 дней в секундах
 
 crash_games = {}  # {user_id: {"active": bool, "message_id": int, "bet": int, "multiplier": float, "crashed": bool}}
+# in-memory throttle for auto-plasma accrual: {user_id: last_tick_timestamp}
+last_plasma_tick = {}
+
+# ========== ВОЙНЫ ==========
+WAR_MIN_PEOPLE_START = 1000
+WAR_MIN_PEOPLE_ACTIVE = 300
+WAR_ROUND_INTERVAL = 5 * 60
+WAR_MAX_ROUNDS = 10
+WAR_COOLDOWN = 6 * 60 * 60
+WAR_MAX_LAZY_ROUNDS = 3
+WAR_TRIBUTE_CAP = 30_000_000
+WAR_TRIBUTE_PCT_RANGE = (0.05, 0.10)
+CREDIT_MIN_AMOUNT = 100_000
+CREDIT_MAX_AMOUNT = 1_000_000_000
+CREDIT_MIN_INTEREST_PCT = 1
+CREDIT_MAX_INTEREST_PCT = 30
+CREDIT_MIN_DAYS = 1
+CREDIT_MAX_DAYS = 14
+CREDIT_MIN_STABILITY = 40
+CREDIT_SIGMA_MAX_AMOUNT = 250_000_000
+
+
+# ========== SPACE CONFIG ==========
+SPACE_MAX_ACTIVE_EXPEDITIONS_BASE = 1
+SPACE_MAX_COLONIES = 3
+
+SPACE_EXPEDITION_TYPES = {
+    'cheap': {
+        'name': 'дешёвая',
+        'min_hours': 2,
+        'max_hours': 2,
+        'base_fail': 0.15,
+        'discovery_chance': 0.15,
+        'loot': {'plasma': (1, 3), 'plutonium': (0, 1), 'artifacts': (0, 1), 'tech_data': (0, 1)}
+    },
+    'medium': {
+        'name': 'средняя',
+        'min_hours': 6,
+        'max_hours': 6,
+        'base_fail': 0.30,
+        'discovery_chance': 0.30,
+        'loot': {'plasma': (3, 7), 'plutonium': (1, 3), 'artifacts': (0, 2), 'tech_data': (1, 2)}
+    },
+    'elite': {
+        'name': 'элитная',
+        'min_hours': 12,
+        'max_hours': 24,
+        'base_fail': 0.45,
+        'discovery_chance': 0.50,
+        'loot': {'plasma': (8, 15), 'plutonium': (3, 6), 'artifacts': (1, 4), 'tech_data': (2, 4)}
+    }
+}
+
+SPACE_DISCOVERY_TYPES = [
+    {'type': 'planet', 'rarity': 'rare', 'weight': 35, 'description': 'Обнаружена новая планета с потенциалом колонизации.'},
+    {'type': 'anomaly', 'rarity': 'rare', 'weight': 25, 'description': 'Зафиксирована аномалия с неизученным полем.'},
+    {'type': 'derelict_station', 'rarity': 'epic', 'weight': 18, 'description': 'Найдена заброшенная станция с фрагментами данных.'},
+    {'type': 'ancient_ruins', 'rarity': 'epic', 'weight': 15, 'description': 'Следы древней цивилизации. Опасно, но очень интересно.'},
+    {'type': 'sigma_anomaly', 'rarity': 'legendary', 'weight': 7, 'description': 'Сигма-аномалия. Что-то непонятное наблюдает вас.'}
+]
+
+SPACE_COLONY_TYPES = {
+    'ice': {'name': 'ледяная', 'bonus_type': 'plasma', 'yield_plasma': 4, 'yield_plutonium': 0, 'yield_artifacts': 0, 'yield_tech': 0},
+    'volcanic': {'name': 'вулканическая', 'bonus_type': 'plutonium', 'yield_plasma': 0, 'yield_plutonium': 3, 'yield_artifacts': 0, 'yield_tech': 0},
+    'anomalous': {'name': 'аномальная', 'bonus_type': 'boss_damage', 'yield_plasma': 1, 'yield_plutonium': 1, 'yield_artifacts': 1, 'yield_tech': 0},
+    'ancient': {'name': 'древняя', 'bonus_type': 'unique_chance', 'yield_plasma': 0, 'yield_plutonium': 1, 'yield_artifacts': 2, 'yield_tech': 1}
+}
+
+SPACE_TECH_CONFIG = [
+    {'tech_code': 'nav_array', 'name': 'Навигационный маяк', 'description': 'Снижает риск экспедиций', 'cost_plasma': 60, 'cost_plutonium': 5},
+    {'tech_code': 'defense_matrix', 'name': 'Защитный матричный блок', 'description': 'Снижает потери в экспедициях', 'cost_plasma': 90, 'cost_plutonium': 10},
+    {'tech_code': 'ai_core', 'name': 'Ядро ИИ', 'description': 'Улучшает лут', 'cost_plasma': 120, 'cost_plutonium': 15},
+    {'tech_code': 'anomaly_scanner', 'name': 'Сканер аномалий', 'description': 'Больше открытий', 'cost_plasma': 140, 'cost_plutonium': 20}
+]
+CREDIT_SIGMA_INTEREST_PCT = 15
+CREDIT_SIGMA_DAYS = 7
+CREDIT_DEFAULT_STABILITY_PENALTY = 10
+CREDIT_DEFAULT_TAX_PENALTY = 0.02
+CREDIT_DEFAULT_TREASURY_PENALTY_PCT = 0.05
+SIGMA_DEFAULT_STABILITY_PENALTY = 20
+SIGMA_DEFAULT_TAX_PENALTY = 0.04
+SIGMA_DEFAULT_TREASURY_PENALTY_PCT = 0.10
+
+WAR_LOSS_RANGES = {
+    "winner": {"people": (0.04, 0.08), "weapons": (0.02, 0.05), "tech": (0.01, 0.02)},
+    "loser": {"people": (0.08, 0.14), "weapons": (0.05, 0.09), "tech": (0.02, 0.04)},
+    "draw": {"people": (0.06, 0.11), "weapons": (0.035, 0.07), "tech": (0.015, 0.03)},
+}
+
+# pending war confirmations: {user_id: {"token": str, "attacker_country_id": int, "defender_country_id": int, "expires_at": int}}
+war_challenges = {}
+
+# ========== КОНФИГ ЗДАНИЙ СТРАНЫ ==========
+BUILDING_CONFIG = {
+    'parks': {
+        'name': 'Парки',
+        'max_level': 10,
+        'base_cost': 1000000,
+        'jobs_provided': 200,
+        'effects': {'income_bonus': 5, 'stability_bonus': 2, 'happiness_bonus': 5, 'literacy_bonus': 1}
+    },
+    'police': {
+        'name': 'Полиция',
+        'max_level': 10,
+        'base_cost': 1500000,
+        'jobs_provided': 300,
+        'effects': {'stability_bonus': 3, 'raid_protection': 10, 'crime_reduction': 10}
+    },
+    'court': {
+        'name': 'Суд',
+        'max_level': 10,
+        'base_cost': 2000000,
+        'jobs_provided': 100,
+        'effects': {'stability_bonus': 4, 'income_bonus': 3, 'crime_reduction': 5}
+    },
+    'education': {
+        'name': 'Образование',
+        'max_level': 10,
+        'base_cost': 2500000,
+        'jobs_provided': 400,
+        'effects': {'income_bonus': 8, 'people_limit_add': 50, 'literacy_bonus': 10}
+    },
+    'hospital': {
+        'name': 'Больница',
+        'max_level': 10,
+        'base_cost': 3000000,
+        'jobs_provided': 250,
+        'effects': {'stability_bonus': 5, 'people_limit_add': 30, 'happiness_bonus': 3, 'hospital_bonus': 0.1}
+    },
+    'school': {
+        'name': 'Школа',
+        'max_level': 10,
+        'base_cost': 2200000,
+        'jobs_provided': 350,
+        'effects': {'literacy_bonus': 8, 'happiness_bonus': 2, 'people_limit_add': 40}
+    },
+    'fire_department': {
+        'name': 'Пожарная',
+        'max_level': 10,
+        'base_cost': 1800000,
+        'jobs_provided': 150,
+        'effects': {'stability_bonus': 2, 'fire_damage_reduction': 20, 'happiness_bonus': 1}
+    },
+    'tax_office': {
+        'name': 'Налоговая',
+        'max_level': 10,
+        'base_cost': 1800000,
+        'jobs_provided': 120,
+        'effects': {'income_bonus': 12}
+    },
+    'logistics_hub': {
+        'name': 'Логистический хаб',
+        'max_level': 10,
+        'base_cost': 4000000,
+        'jobs_provided': 500,
+        'effects': {'income_bonus': 10, 'upkeep_reduction': 5}
+    },
+    'industrial_complex': {
+        'name': 'Промышленный комплекс',
+        'max_level': 10,
+        'base_cost': 5000000,
+        'jobs_provided': 800,
+        'effects': {'income_bonus': 15, 'tech_limit_add': 5}
+    },
+    'development_bank': {
+        'name': 'Банк развития',
+        'max_level': 10,
+        'base_cost': 3500000,
+        'jobs_provided': 200,
+        'effects': {'income_bonus': 7, 'stability_bonus': 3}
+    },
+    'trade_port': {
+        'name': 'Торговый порт',
+        'max_level': 10,
+        'base_cost': 4500000,
+        'jobs_provided': 600,
+        'effects': {'income_bonus': 13}
+    },
+    'power_grid': {
+        'name': 'Энергосеть',
+        'max_level': 10,
+        'base_cost': 2800000,
+        'jobs_provided': 180,
+        'effects': {'income_bonus': 6, 'stability_bonus': 2}
+    },
+    'nuclear_plant': {
+        'name': 'АЭС',
+        'max_level': 10,
+        'base_cost': 6000000,
+        'jobs_provided': 150,
+        'effects': {'income_bonus': 20, 'stability_bonus': -5}
+    },
+    'roads': {
+        'name': 'Дороги',
+        'max_level': 10,
+        'base_cost': 3200000,
+        'jobs_provided': 100,
+        'effects': {'income_bonus': 4, 'stability_bonus': 3, 'vehicle_limit_add': 10}
+    },
+    'airport': {
+        'name': 'Аэропорт',
+        'max_level': 10,
+        'base_cost': 5500000,
+        'jobs_provided': 400,
+        'effects': {'income_bonus': 9, 'vehicle_limit_add': 5}
+    },
+    'internet': {
+        'name': 'Интернет',
+        'max_level': 10,
+        'base_cost': 3800000,
+        'jobs_provided': 80,
+        'effects': {'income_bonus': 11, 'literacy_bonus': 3, 'happiness_bonus': 2}
+    },
+    'barracks': {
+        'name': 'Казармы',
+        'max_level': 10,
+        'base_cost': 2200000,
+        'jobs_provided': 250,
+        'effects': {'combat_bonus': 5, 'people_limit_add': 20}
+    },
+    'miltech_center': {
+        'name': 'Воентех центр',
+        'max_level': 10,
+        'base_cost': 5500000,
+        'jobs_provided': 300,
+        'effects': {'combat_bonus': 8, 'tech_limit_add': 3}
+    },
+    'weapons_factory': {
+        'name': 'Оружейный завод',
+        'max_level': 10,
+        'base_cost': 7000000,
+        'jobs_provided': 450,
+        'effects': {'combat_bonus': 10}
+    },
+    'tank_factory': {
+        'name': 'Танковый завод',
+        'max_level': 10,
+        'base_cost': 8000000,
+        'jobs_provided': 350,
+        'effects': {'combat_bonus': 12}
+    },
+    'air_defense': {
+        'name': 'ПВО',
+        'max_level': 10,
+        'base_cost': 6500000,
+        'jobs_provided': 200,
+        'effects': {'raid_protection': 15, 'combat_bonus': 6}
+    },
+    'intelligence': {
+        'name': 'Разведка',
+        'max_level': 10,
+        'base_cost': 5000000,
+        'jobs_provided': 180,
+        'effects': {'raid_protection': 20, 'combat_bonus': 4}
+    },
+    'military_academy': {
+        'name': 'Военная академия',
+        'max_level': 10,
+        'base_cost': 4200000,
+        'jobs_provided': 220,
+        'effects': {'combat_bonus': 7, 'literacy_bonus': 5}
+    },
+    'space_station': {
+        'name': 'Космостанция',
+        'max_level': 10,
+        'base_cost': 10000000,
+        'jobs_provided': 100,
+        'effects': {'income_bonus': 25, 'stability_bonus': 10}
+    },
+    'research_institute': {
+        'name': 'НИИ',
+        'max_level': 10,
+        'base_cost': 7500000,
+        'jobs_provided': 280,
+        'effects': {'income_bonus': 18, 'tech_limit_add': 8, 'literacy_bonus': 6}
+    }
+}
+
+# ========== КОНФИГ ПРЕДМЕТОВ ==========
+ITEM_CONFIG = {
+    # Оружие
+    'pistol': {'category': 'weapon', 'name': 'Пистолет', 'tier': 1, 'power': 10, 'upkeep_day': 100, 'price_money': 50000},
+    'smg': {'category': 'weapon', 'name': 'ПП', 'tier': 2, 'power': 25, 'upkeep_day': 300, 'price_money': 150000},
+    'rifle': {'category': 'weapon', 'name': 'Винтовка', 'tier': 2, 'power': 40, 'upkeep_day': 500, 'price_money': 250000},
+    'mg': {'category': 'weapon', 'name': 'Пулемёт', 'tier': 3, 'power': 80, 'upkeep_day': 1000, 'price_money': 500000},
+    'sniper': {'category': 'weapon', 'name': 'Снайперка', 'tier': 3, 'power': 120, 'upkeep_day': 1500, 'price_money': 750000},
+    'grenade_launcher': {'category': 'weapon', 'name': 'Гранатомёт', 'tier': 4, 'power': 200, 'upkeep_day': 2500, 'price_money': 1500000},
+    'armor_kit': {'category': 'armor', 'name': 'Бронекомплект', 'tier': 2, 'power': 30, 'upkeep_day': 400, 'price_money': 200000},
+    'assault_kit': {'category': 'armor', 'name': 'Штурмовой комплект', 'tier': 3, 'power': 60, 'upkeep_day': 800, 'price_money': 400000},
+    'atgm_kit': {'category': 'weapon', 'name': 'ПТРК', 'tier': 4, 'power': 150, 'upkeep_day': 2000, 'price_money': 1200000},
+    'aa_kit': {'category': 'weapon', 'name': 'ПЗРК', 'tier': 4, 'power': 100, 'upkeep_day': 1800, 'price_money': 1000000},
+    
+    # Техника
+    'apc_s': {'category': 'vehicle', 'name': 'БТР-С', 'tier': 2, 'power': 100, 'upkeep_day': 2000, 'price_money': 2000000},
+    'ifv_lynx': {'category': 'vehicle', 'name': 'БМП Lynx', 'tier': 3, 'power': 250, 'upkeep_day': 4000, 'price_money': 5000000},
+    'spg_thunder': {'category': 'vehicle', 'name': 'САУ Thunder', 'tier': 4, 'power': 500, 'upkeep_day': 8000, 'price_money': 10000000},
+    'tank_t34': {'category': 'vehicle', 'name': 'Т-34', 'tier': 2, 'power': 150, 'upkeep_day': 3000, 'price_money': 3000000},
+    'tank_bulat': {'category': 'vehicle', 'name': 'Танк Булат', 'tier': 3, 'power': 350, 'upkeep_day': 6000, 'price_money': 7000000},
+    'tank_armada': {'category': 'vehicle', 'name': 'Танк Armada', 'tier': 4, 'power': 700, 'upkeep_day': 12000, 'price_money': 15000000, 'req_building': 'tank_factory', 'req_building_level': 3},
+    'heavy_colossus': {'category': 'vehicle', 'name': 'Тяжёлый Colossus', 'tier': 5, 'power': 1000, 'upkeep_day': 20000, 'price_money': 25000000, 'price_plutonium': 10},
+    'mlrs_storm': {'category': 'vehicle', 'name': 'РСЗО Storm', 'tier': 4, 'power': 600, 'upkeep_day': 10000, 'price_money': 12000000},
+    'spg_volcano': {'category': 'vehicle', 'name': 'САУ Volcano', 'tier': 5, 'power': 1200, 'upkeep_day': 25000, 'price_money': 30000000, 'price_plutonium': 15},
+    'armored_train': {'category': 'vehicle', 'name': 'Бронепоезд', 'tier': 4, 'power': 800, 'upkeep_day': 15000, 'price_money': 20000000},
+    'orbital_drone': {'category': 'vehicle', 'name': 'Орбитальный дрон', 'tier': 5, 'power': 1500, 'upkeep_day': 30000, 'price_money': 50000000, 'price_plasma': 5},
+    'titan_mech': {'category': 'vehicle', 'name': 'Титан-мех', 'tier': 5, 'power': 2000, 'upkeep_day': 50000, 'price_money': 100000000, 'price_plutonium': 50, 'price_plasma': 20}
+}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -25,29 +675,6 @@ logger = logging.getLogger(__name__)
 logging.getLogger('aiogram').setLevel(logging.DEBUG)
 
 router = Router()
-
-@router.message(F.text.lower().startswith("купить бизнес"))
-async def buy_business_cmd(msg: Message):
-
-    try:
-        parts = msg.text.split()
-
-        if len(parts) < 3:
-            await msg.reply("❌ Использование:\n<code>купить бизнес [id]</code>", parse_mode="HTML")
-            return
-
-        business_id = int(parts[2])
-
-        success, result = await buy_business(msg.from_user.id, business_id)
-
-        await msg.reply(result if success else f"❌ {result}")
-
-    except Exception as e:
-        await msg.reply(
-            f"❌ <b>КРИТИЧЕСКАЯ ОШИБКА</b>\n<code>{e}</code>",
-            parse_mode="HTML"
-        )
-        raise  # ← ЭТО ВАЖНО
 
 @router.message(F.text.lower().startswith("купить планету"))
 async def buy_planet_cmd(msg: Message):
@@ -114,10 +741,10 @@ async def buy_lottery_cmd(msg: Message):
         await msg.reply(
             "🎫 <b>Покупка лотерейных билетов</b>\n\n"
             "📝 <b>Использование:</b>\n"
-            "• <code>купить лотерейный 1</code> - 1 бронзовый билет (50М)\n"
-            "• <code>купить лотерейный 2</code> - 1 золотой билет (100М)\n"
-            "• <code>купить лотерейный 1 5</code> - 5 бронзовых билетов (250М)\n"
-            "• <code>купить лотерейный 2 3</code> - 3 золотых билета (300М)",
+            "- <code>купить лотерейный 1</code> - 1 бронзовый билет (50М)\n"
+            "- <code>купить лотерейный 2</code> - 1 золотой билет (100М)\n"
+            "- <code>купить лотерейный 1 5</code> - 5 бронзовых билетов (250М)\n"
+            "- <code>купить лотерейный 2 3</code> - 3 золотых билета (300М)",
             parse_mode="HTML"
         )
         return
@@ -134,21 +761,51 @@ async def buy_lottery_cmd(msg: Message):
     except Exception as e:
         await msg.reply(f"❌ Ошибка: {e}")
 
-@router.message(F.text.lower() == "профиль")
 async def profile_cmd(msg: Message):
     uid = msg.from_user.id
     user = await get_user(uid)
+    country_name = "нет"
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT name FROM countries WHERE owner_user_id = ? LIMIT 1", (uid,))
+            row = await cursor.fetchone()
+            if row:
+                country_name = row[0]
+    except Exception as e:
+        logger.error(f"Ошибка загрузки страны в профиле: {e}")
+    
+    # Получить титулы пользователя
+    titles = await get_user_titles(uid)
+    titles_text = ""
+    if titles:
+        titles_list = [f"🏅 {t['name']}" for t in titles[:3]]  # Показать первые 3
+        titles_text = f"\n\n🎖️ <b>Титулы:</b>\n" + "\n".join(titles_list)
+        if len(titles) > 3:
+            titles_text += f"\n... и ещё {len(titles) - 3} титулов"
+    else:
+        titles_text = "\n\n🎖️ <b>Титулы:</b> Нет титулов"
+    
+    # Получить текущее мировое событие
+    current_event = await get_current_world_event()
+    event_text = ""
+    if current_event:
+        event_text = f"\n\n🌍 <b>Мировое событие:</b> {current_event['name']}\n{current_event['description']}"
+    else:
+        event_text = "\n\n🌍 <b>Мировое событие:</b> Спокойные времена"
 
     text = (
         "👤 <b>ПРОФИЛЬ</b>\n\n"
         f"🆔 ID: <code>{uid}</code>\n"
         f"💰 Баланс: {format_money(user['balance'])}\n"
+        f"🏳️ Страна: {country_name}\n"
         f"💎 Плазма: {user.get('plasma', 0)}\n"
         f"₿ Биткоины: {user.get('bitcoin', 0):.6f}\n\n"
         f"👥 Рефералы: {user.get('referral_count', 0)}\n"
         f"💸 Заработано на рефералах: {format_money(user.get('total_referral_earned', 0))}\n\n"
         f"🏆 Победы: {user.get('wins', 0)}\n"
         f"💀 Поражения: {user.get('losses', 0)}"
+        f"{titles_text}"
+        f"{event_text}"
     )
 
     await msg.reply(text, parse_mode="HTML")
@@ -163,36 +820,18 @@ async def test_ref_cmd(msg: Message):
     referral_code = user['referral_code']
     referral_link = f"https://t.me/{bot_username}?start={referral_code}"
     
-    text = f"""
-🔍 <b>ТЕСТ РЕФЕРАЛЬНОЙ СИСТЕМЫ</b>
-
-👤 <b>Ваш ID:</b> {uid}
-🔗 <b>Ваш код:</b> {user['referral_code']}
-📊 <b>Пригласил вас:</b> {user.get('referred_by', 'Никто')}
-💰 <b>Рефералов у вас:</b> {user.get('referral_count', 0)}
-💵 <b>Заработано на рефералах:</b> {format_money(user.get('total_referral_earned', 0))}
-
-🔗 <b>Ваша ссылка:</b>
-<code>{referral_link}</code>
-
-📝 <b>Как проверить:</b>
-1. Отправьте ссылку другу
-2. Попросите друга нажать на нее
-3. Друг должен написать /start в боте
-4. Вы должны получить 30-100М
-
-⚠️ <b>Примечание:</b> Работает только первый /start
-"""
+    text = (
+        f"\U0001F3F0 ????? ????????? ??????\n\n"
+        f"??????, {username}!\n\n"
+        f"\U0001F30D ?????? ?????? ????? ?????????? ??????, ??????? ???????? ?? ???? ????????!\n\n"
+        "???????? ??????, ??????? ?????? ????? ????? ? ?????????? ????:\n"
+    )
     await msg.reply(text, parse_mode="HTML")
 
 @router.message(F.text.lower() == "меню")
 async def menu_cmd(msg: Message):
     await send_welcome_message(msg)
 
-
-@router.message(F.text.lower() == "мой бизнес")
-async def my_business_cmd(msg: Message):
-    await show_my_businesses(msg)
 
 
 @router.message(F.text.lower() == "майнинг")
@@ -211,11 +850,196 @@ async def planets_cmd(msg: Message):
 
 
 # ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
-WORK_COOLDOWN = 30  # 30 секунд вместо 60
-BONUS_COOLDOWN = 1800  # ⬅ ДОБАВИТЬ: 30 минут в секундах (было 3600)
+WORK_COOLDOWN = 1800  # 30 ?????
+BONUS_COOLDOWN = 86400  # 24 ????
+REFERRAL_ACTIONS_REQUIRED = 20
 # ⬇ ДОБАВИТЬ НОВЫЕ КОНСТАНТЫ:
 GAMES_COOLDOWN = 5  # 5 секунд для всех азартных игр
-BOSS_COOLDOWN = 5   # 5 секунд для атаки босса
+BOSS_COOLDOWN = 300  # 5 минут для атаки босса
+BOSS_LIFETIME = 24 * 60 * 60  # 24 часа жизни босса
+
+BOSS_TEMPLATES = [
+    {"name": "Капитан Лутер", "tier": 1, "max_hp": 1_200_000, "attack_power": 8_000},
+    {"name": "Техномонстр Грейд", "tier": 2, "max_hp": 3_500_000, "attack_power": 15_000},
+    {"name": "Барон Пустоты", "tier": 3, "max_hp": 8_000_000, "attack_power": 30_000},
+    {"name": "Генерал Армагеддон", "tier": 4, "max_hp": 18_000_000, "attack_power": 70_000},
+    {"name": "Император Облом", "tier": 5, "max_hp": 40_000_000, "attack_power": 140_000},
+    {"name": "ЖИРНЫЙ СИГМА ЯРИК", "tier": 6, "max_hp": 180_000_000, "attack_power": 250_000},
+]
+
+BOSS_REWARD_CONFIG = {
+    1: {"money": 50_000, "plasma": 1, "unique_chance": 0.01},
+    2: {"money": 100_000, "plasma": 2, "unique_chance": 0.02},
+    3: {"money": 200_000, "plasma": 3, "unique_chance": 0.03},
+    4: {"money": 350_000, "plasma": 5, "unique_chance": 0.04},
+    5: {"money": 500_000, "plasma": 7, "unique_chance": 0.05},
+    6: {"money": 800_000, "plasma": 10, "unique_chance": 0.06},
+}
+
+UNIQUE_ITEMS = [
+    {
+        "item_id": "U1_LUTER_BADGE",
+        "boss_tier": 1,
+        "name": "Жетон Лутера",
+        "item_type": "artifact",
+        "slot": "support",
+        "power_flat": 500,
+        "boss_damage_mult": 0.05,
+        "rarity": "rare",
+        "description": "Полевой символ капитана Лутера.",
+    },
+    {
+        "item_id": "U1_LUTER_MANUAL",
+        "boss_tier": 1,
+        "name": "Полевой Устав Лутера",
+        "item_type": "relic",
+        "slot": "relic",
+        "people_loss_reduction": 0.08,
+        "rarity": "rare",
+        "description": "Снижает потери людей в бою.",
+    },
+    {
+        "item_id": "U2_GRADE_AI",
+        "boss_tier": 2,
+        "name": "ИИ-Модуль Грейда",
+        "item_type": "module",
+        "slot": "core",
+        "power_mult": 0.08,
+        "boss_damage_mult": 0.10,
+        "upkeep_mult": 0.05,
+        "rarity": "epic",
+        "description": "Усиливает тактику и расходы на содержание.",
+    },
+    {
+        "item_id": "U2_GRADE_PLATES",
+        "boss_tier": 2,
+        "name": "Пластины Грейда",
+        "item_type": "module",
+        "slot": "support",
+        "vehicle_loss_reduction": 0.10,
+        "rarity": "epic",
+        "description": "Снижает потери техники.",
+    },
+    {
+        "item_id": "U3_VOID_SPHERE",
+        "boss_tier": 3,
+        "name": "Сфера Пустоты",
+        "item_type": "relic",
+        "slot": "core",
+        "power_mult": 0.10,
+        "people_loss_reduction": 0.12,
+        "rarity": "epic",
+        "description": "Усиливает армию и снижает потери людей.",
+    },
+    {
+        "item_id": "U3_VOID_SEAL",
+        "boss_tier": 3,
+        "name": "Печать Пустоты",
+        "item_type": "artifact",
+        "slot": "support",
+        "boss_damage_mult": 0.12,
+        "rarity": "epic",
+        "description": "Увеличивает урон по боссам.",
+    },
+    {
+        "item_id": "U4_ARMAGEDDON_CORE",
+        "boss_tier": 4,
+        "name": "Ядро Армагеддона",
+        "item_type": "module",
+        "slot": "core",
+        "power_mult": 0.14,
+        "vehicle_loss_reduction": 0.12,
+        "upkeep_mult": 0.10,
+        "rarity": "legendary",
+        "description": "Сильный модуль с повышенным содержанием.",
+    },
+    {
+        "item_id": "U4_ARMAGEDDON_MAP",
+        "boss_tier": 4,
+        "name": "Карта Операций Армагеддона",
+        "item_type": "relic",
+        "slot": "relic",
+        "power_flat": 2500,
+        "boss_damage_mult": 0.08,
+        "rarity": "legendary",
+        "description": "Тактическая карта боевых действий.",
+    },
+    {
+        "item_id": "U5_OBLOM_RELICT_T34",
+        "boss_tier": 5,
+        "name": "Т-34: Реликт Облома",
+        "item_type": "vehicle",
+        "slot": "core",
+        "power_flat": 6000,
+        "vehicle_loss_reduction": 0.18,
+        "rarity": "legendary",
+        "description": "Уникальная техника с бонусом к силе.",
+    },
+    {
+        "item_id": "U5_OBLOM_CROWN",
+        "boss_tier": 5,
+        "name": "Корона Облома",
+        "item_type": "relic",
+        "slot": "support",
+        "power_mult": 0.18,
+        "upkeep_mult": 0.12,
+        "rarity": "legendary",
+        "description": "Сильный буст силы ценой содержания.",
+    },
+    {
+        "item_id": "U6_YARIK_SIGMA_DILDO",
+        "boss_tier": 6,
+        "name": "Дилдо Сигмы Ярика",
+        "item_type": "relic",
+        "slot": "core",
+        "power_mult": 0.22,
+        "boss_damage_mult": 0.18,
+        "ignore_defense": 0.10,
+        "upkeep_mult": 0.15,
+        "rarity": "mythic",
+        "description": "Мем-артефакт с сильными эффектами.",
+    },
+    {
+        "item_id": "U6_YARIK_MAGIC_PANTIES",
+        "boss_tier": 6,
+        "name": "Волшебные Труселя Сигмы Ярика",
+        "item_type": "artifact",
+        "slot": "support",
+        "people_loss_reduction": 0.20,
+        "vehicle_loss_reduction": 0.15,
+        "power_flat": 4000,
+        "rarity": "mythic",
+        "description": "Снижает потери и усиливает армию.",
+    },
+    {
+        "item_id": "U6_YARIK_SIGMA_BADGE",
+        "boss_tier": 6,
+        "name": "Титул: Сигма-Ярик",
+        "item_type": "cosmetic",
+        "slot": None,
+        "rarity": "mythic",
+        "description": "Косметический титул без боевых бонусов.",
+    },
+]
+
+UNIQUE_LOOT_CHANCES = {
+    1: 0.08,
+    2: 0.06,
+    3: 0.05,
+    4: 0.04,
+    5: 0.03,
+    6: 0.02,
+}
+
+UNIQUE_TOP_BONUS = {
+    1: 0.03,
+    2: 0.02,
+    3: 0.01,
+}
+
+UNIQUE_POWER_MULT_CAP = 0.40
+UNIQUE_BOSS_DMG_CAP = 0.30
+UNIQUE_LOSS_REDUCTION_CAP = 0.25
 
 # ========== МАЙНИНГ БИТКОИНОВ ==========
 class BitcoinMining:
@@ -301,10 +1125,24 @@ class CrashGameManager:
         """Игрок забирает деньги"""
         if user_id in crash_games and crash_games[user_id]["active"]:
             game = crash_games[user_id]
+            # Применяем house edge (комиссию) к выплате
+            HOUSE_EDGE = 0.97  # 3% комиссия
+
+            original_mul = float(game.get("multiplier", 1.0))
+            effective_mul = round(original_mul * HOUSE_EDGE, 2)
+
             game["cashed_out"] = True
-            game["cashout_multiplier"] = game["multiplier"]
+            # храним оригинальный и эффективный множитель
+            game["cashout_multiplier_raw"] = original_mul
+            game["cashout_multiplier"] = effective_mul
+            # сохраняем рассчитанную выплату (целое число монет)
+            try:
+                bet = int(game.get("bet", 0))
+            except:
+                bet = 0
+            game["payout"] = int(math.floor(bet * effective_mul)) if bet > 0 else 0
             game["active"] = False
-            return True, game["multiplier"]
+            return True, effective_mul
         return False, 0
     
     @staticmethod
@@ -351,6 +1189,11 @@ async def calculate_and_update_mining(uid: int):
             )
             btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
             
+            # Применить эффекты мирового события
+            world_effects = await get_world_event_effects()
+            mining_effect = world_effects.get('mining', 0.0)
+            btc_per_hour *= (1 + mining_effect)
+            
             time_passed = current_time - last_claim
             
             # Минимум 10 секунд для предотвращения спама
@@ -374,10 +1217,6 @@ async def calculate_and_update_mining(uid: int):
                 )
                 await db.commit()
                 
-                # Очищаем кэш для этого пользователя
-                cache_key = f"user_{uid}"
-                if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-                    del get_user.cache[cache_key]
                 
                 logger.info(f"✅ Начислено BTC для {uid}: {btc_mined:.6f} за {time_passed/3600:.1f} часов")
                 return btc_mined
@@ -434,17 +1273,33 @@ async def calculate_and_update_plasma(uid: int):
                 )
                 await db.commit()
                 
-                # Очищаем кэш для этого пользователя
-                cache_key = f"user_{uid}"
-                if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-                    del get_user.cache[cache_key]
-                
                 logger.info(f"✅ Начислено плазмы для {uid}: {total_plasma_mined}")
                 return total_plasma_mined
             
             return 0
     except Exception as e:
         logger.error(f"❌ Ошибка calculate_and_update_plasma для {uid}: {e}")
+        return 0
+
+
+async def lazy_update_plasma(uid: int, min_interval: int = 120):
+    """Ленивое автоначисление плазмы с in-memory троттлингом.
+
+    Вызывать при любом действии пользователя (middleware или начало handler).
+    Не должно быть сайд-эффектов в get_user().
+    """
+    try:
+        now = time.time()
+        last = last_plasma_tick.get(uid, 0)
+        if now - last < min_interval:
+            return 0
+        # Обновляем метку сразу, чтобы избегать параллельных вызовов
+        last_plasma_tick[uid] = now
+        # Вызов функции начисления (она сама обновляет БД и возвращает начисленную плазму)
+        added = await calculate_and_update_plasma(uid)
+        return added
+    except Exception as e:
+        logger.error(f"Ошибка lazy_update_plasma для {uid}: {e}")
         return 0
     
     # ========== КРАШ ИГРА ==========
@@ -474,150 +1329,26 @@ class CrashGame:
     @staticmethod
     def get_crash_point():
         """Генерирует точку краха (когда игра остановится)"""
-        # Сделаем так, чтобы чаще были множители 1.5x-3x
-        rand = random.random()
-        if rand < 0.4:  # 40% шанс на маленький множитель
-            return round(random.uniform(1.1, 2.0), 2)
-        elif rand < 0.7:  # 30% шанс на средний
-            return round(random.uniform(2.0, 4.0), 2)
-        elif rand < 0.9:  # 20% шанс на большой
-            return round(random.uniform(4.0, 8.0), 2)
-        else:  # 10% шанс на огромный
-            return round(random.uniform(8.0, 15.0), 2)
+        # Новое распределение для краша:
+        # - Небольшой шанс instant crash (1.00) ~8-12%
+        # - Большая часть выпадов даёт маленькие множители (1.02-1.3), чтобы снизить RTP
+        # - Редкие большие множители дают джекпоты
+        p_instant = 0.10  # целевой ~10% (между 8 и 12%)
+        if random.random() < p_instant:
+            return 1.00
 
-# ========== БИЗНЕСЫ ==========
-BUSINESSES = {
-    1: {
-        'name': 'Продажа паленого шмота',
-        'price': 100_000,  # 100к
-        'profit_per_hour': 20_000,  # 20к в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Товары',
-        'product_capacity': 100,
-        'product_refill_cost': 10_000
-    },
-    2: {
-        'name': 'Забегаловка у метро',
-        'price': 1_000_000,  # 1 млн
-        'profit_per_hour': 150_000,  # 150к в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Еда',
-        'product_capacity': 200,
-        'product_refill_cost': 75_000
-    },
-    3: {
-        'name': 'Сервер Minecraft',
-        'price': 5_000_000,  # 5 млн
-        'profit_per_hour': 600_000,  # 600к в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Слоты',
-        'product_capacity': 50,
-        'product_refill_cost': 300_000
-    },
-    4: {
-        'name': 'Производство презервативов',
-        'price': 25_000_000,  # 25 млн
-        'profit_per_hour': 2_500_000,  # 2.5М в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Сырье',
-        'product_capacity': 500,
-        'product_refill_cost': 1_250_000
-    },
-    5: {
-        'name': 'Samsung',
-        'price': 100_000_000,  # 100 млн
-        'profit_per_hour': 8_000_000,  # 8М в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Комплектующие',
-        'product_capacity': 1000,
-        'product_refill_cost': 4_000_000
-    },
-    6: {
-        'name': 'Аптека',
-        'price': 500_000_000,  # 500 млн
-        'profit_per_hour': 30_000_000,  # 30М в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Лекарства',
-        'product_capacity': 800,
-        'product_refill_cost': 15_000_000
-    },
-    7: {
-        'name': 'Фабрика мороженого',
-        'price': 2_000_000_000,  # 2 млрд
-        'profit_per_hour': 100_000_000,  # 100М в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Ингредиенты',
-        'product_capacity': 1500,
-        'product_refill_cost': 50_000_000
-    },
-    8: {
-        'name': 'Парк аттракционов',
-        'price': 10_000_000_000,  # 10 млрд
-        'profit_per_hour': 400_000_000,  # 400М в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Билеты',
-        'product_capacity': 5000,
-        'product_refill_cost': 200_000_000
-    },
-    9: {
-        'name': 'NASA',
-        'price': 50_000_000_000,  # 50 млрд
-        'profit_per_hour': 1_500_000_000,  # 1.5Б в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Топливо',
-        'product_capacity': 2000,
-        'product_refill_cost': 750_000_000
-    },
-    10: {
-        'name': 'ВКонтакте',
-        'price': 200_000_000_000,  # 200 млрд
-        'profit_per_hour': 6_000_000_000,  # 6Б в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Сервера',
-        'product_capacity': 10000,
-        'product_refill_cost': 3_000_000_000
-    },
-    11: {
-        'name': 'Владелец бота',
-        'price': 1_000_000_000_000,  # 1 трлн
-        'profit_per_hour': 30_000_000_000,  # 30Б в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Пользователи',
-        'product_capacity': 50000,
-        'product_refill_cost': 15_000_000_000
-    },
-    12: {
-        'name': 'Заправка',
-        'price': 50_000_000,  # 50 млн
-        'profit_per_hour': 2_500_000,  # 2.5М в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Топливо',
-        'product_capacity': 10000,
-        'product_refill_cost': 1_250_000
-    },
-    13: {
-        'name': 'Майнинг ферма',
-        'price': 30_000_000,  # 30 млн
-        'profit_per_hour': 1_500_000,  # 1.5М в час
-        'max_level': 10,
-        'upgrade_multiplier': 1.5,
-        'product_name': 'Электричество',
-        'product_capacity': 5000,
-        'product_refill_cost': 750_000
-    }
-}
+        r = random.random()
+        # 55% — маленькие множители 1.02–1.30
+        if r < 0.55:
+            return round(random.uniform(1.02, 1.30), 2)
+        # 30% — средние 1.30–2.00
+        if r < 0.85:
+            return round(random.uniform(1.30, 2.00), 2)
+        # 10% — большие 2.00–5.00
+        if r < 0.95:
+            return round(random.uniform(2.00, 5.00), 2)
+        # 5% — редкие огромные множители 5.00–20.00
+        return round(random.uniform(5.00, 20.00), 2)
 
 # ========== ЛОТЕРЕЙНАЯ СИСТЕМА ==========
 LOTTERY_TICKETS = {
@@ -932,6 +1663,141 @@ def parse_amount(amount_str: str) -> int:
     
     return int(base_value * multiplier)
 
+def calculate_total_income_bonus(buildings, businesses) -> float:
+    total_bonus = 0.0
+    for b in buildings:
+        btype = b["building_type"] if isinstance(b, aiosqlite.Row) else b[0]
+        level = b["level"] if isinstance(b, aiosqlite.Row) else b[1]
+        effects = BUILDING_CONFIG.get(btype, {}).get("effects", {})
+        income_bonus_pct = effects.get("income_bonus", 0)
+        if level > 0 and income_bonus_pct:
+            total_bonus += (income_bonus_pct * level) / 100.0
+
+    for code, level in businesses.items():
+        bdef = BUSINESS_DEFS.get(code)
+        if not bdef or level <= 0:
+            continue
+        total_bonus += bdef.get("income_bonus", 0.0) * level
+
+    return total_bonus
+
+def calculate_country_income_hour(level: int, stability: int, income_bonus: float) -> float:
+    base_income = max(1, int(level)) * 1000
+    stability_clamped = max(0, min(100, int(stability)))
+    stability_factor = 0.5 + (stability_clamped / 100.0)
+    total_multiplier = 1.0 + income_bonus
+    if total_multiplier < 0:
+        total_multiplier = 0
+    return base_income * stability_factor * total_multiplier
+
+
+async def get_space_station_level(db: aiosqlite.Connection, country_id: int) -> int:
+    cursor = await db.execute("SELECT level FROM country_buildings WHERE country_id = ? AND building_type = 'space_station'", (country_id,))
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+async def get_user_space_access(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        country_id = await get_user_country_id(db, uid)
+        if not country_id:
+            return False, None, 0
+        station_level = await get_space_station_level(db, country_id)
+        if station_level <= 0:
+            return False, country_id, 0
+        return True, country_id, station_level
+
+async def get_user_space_techs(db: aiosqlite.Connection, uid: int) -> set:
+    cursor = await db.execute("SELECT tech_code FROM user_space_tech WHERE user_id = ? AND researched = 1", (uid,))
+    rows = await cursor.fetchall()
+    return {row[0] for row in rows}
+
+def get_max_active_expeditions(station_level: int, techs: set) -> int:
+    base = SPACE_MAX_ACTIVE_EXPEDITIONS_BASE
+    bonus = station_level // 3
+    if 'nav_array' in techs:
+        bonus += 1
+    return max(1, base + bonus)
+
+def pick_weighted(items, weight_key='weight'):
+    total = sum(item.get(weight_key, 0) for item in items)
+    if total <= 0:
+        return random.choice(items)
+    r = random.uniform(0, total)
+    upto = 0
+    for item in items:
+        upto += item.get(weight_key, 0)
+        if upto >= r:
+            return item
+    return items[-1]
+
+def resolve_expedition_outcome(expedition_type: str, station_level: int, techs: set) -> dict:
+    cfg = SPACE_EXPEDITION_TYPES[expedition_type]
+    base_fail = cfg['base_fail']
+    risk_reduction = station_level * 0.02
+    if 'nav_array' in techs:
+        risk_reduction += 0.05
+    if 'defense_matrix' in techs:
+        risk_reduction += 0.05
+    fail_chance = max(0.05, base_fail - risk_reduction)
+    roll = random.random()
+    outcome = 'success'
+    if roll < fail_chance:
+        outcome = random.choice(['ship_lost', 'crew_dead', 'threat'])
+    else:
+        if random.random() < 0.25:
+            outcome = 'partial'
+
+    loot = {'plasma': 0, 'plutonium': 0, 'artifacts': 0, 'tech_data': 0}
+    if outcome in ('success', 'partial'):
+        scale = 0.5 if outcome == 'partial' else 1.0
+        ai_bonus = 1.15 if 'ai_core' in techs else 1.0
+        for key, rng in cfg['loot'].items():
+            amount = random.randint(rng[0], rng[1])
+            loot[key] = int(amount * scale * ai_bonus)
+
+    discovery = None
+    if outcome in ('success', 'partial'):
+        chance = cfg['discovery_chance']
+        if 'anomaly_scanner' in techs:
+            chance += 0.10
+        if random.random() < chance:
+            discovery = pick_weighted(SPACE_DISCOVERY_TYPES)
+    elif outcome == 'threat':
+        discovery = {'type': 'sigma_anomaly', 'rarity': 'legendary', 'description': 'unknown'}
+
+    return {'outcome': outcome, 'loot': loot, 'discovery': discovery}
+
+async def change_plutonium(uid: int, delta: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET plutonium = plutonium + ? WHERE id = ?", (delta, uid))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"\u041e\u0448\u0438\u0431\u043a\u0430 change_plutonium: {e}")
+
+async def change_artifacts(uid: int, delta: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET artifacts = artifacts + ? WHERE id = ?", (delta, uid))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"\u041e\u0448\u0438\u0431\u043a\u0430 change_artifacts: {e}")
+
+async def change_tech_data(uid: int, delta: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET tech_data = tech_data + ? WHERE id = ?", (delta, uid))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"\u041e\u0448\u0438\u0431\u043a\u0430 change_tech_data: {e}")
+
+async def change_space_prestige(uid: int, delta: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET space_prestige = space_prestige + ? WHERE id = ?", (delta, uid))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"\u041e\u0448\u0438\u0431\u043a\u0430 change_space_prestige: {e}")
 def format_money(amount: int) -> str:
     """Форматирует число с разделителями и сокращениями"""
     if amount >= 1_000_000_000_000_000:
@@ -1013,20 +1879,15 @@ async def force_fix_cmd(msg: Message):
             
             await db.commit()
             
-        # Очищаем кэш
-        cache_key = f"user_{uid}"
-        if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-            del get_user.cache[cache_key]
-            
         await msg.reply(
             "✅ <b>АДМИН-ФИКС ПРИМЕНЕН!</b>\n\n"
             "• Время сброшено на 1 час назад\n"
             "• Добавлено 0.001 BTC\n"
             "• Если не было видеокарт - добавлено 5 шт\n\n"
             "🔄 <b>Теперь проверьте:</b>\n"
-            "• <code>проверка</code> - статус майнинга\n"
-            "• <code>забрать биткоины</code> - собрать BTC\n"
-            "• <code>майнинг</code> - панель майнинга",
+            "- <code>проверка</code> - статус майнинга\n"
+            "- <code>забрать биткоины</code> - собрать BTC\n"
+            "- <code>майнинг</code> - панель майнинга",
             parse_mode="HTML"
         )
         
@@ -1077,11 +1938,6 @@ async def reset_mining_cmd(msg: Message):
             
             await db.commit()
         
-        # Очищаем кэш
-        cache_key = f"user_{uid}"
-        if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-            del get_user.cache[cache_key]
-        
         await msg.reply(
             "🔄 <b>МАЙНИНГ ПОЛНОСТЬЮ СБРОШЕН И НАСТРОЕН!</b>\n\n"
             "✅ Установлено:\n"
@@ -1089,8 +1945,8 @@ async def reset_mining_cmd(msg: Message):
             "• 0.01 BTC для сбора\n"
             "• Время на 2 часа назад\n\n"
             "🎮 <b>Теперь попробуйте:</b>\n"
-            "• <code>забрать биткоины</code> - собрать BTC\n"
-            "• <code>майнинг</code> - открыть панель",
+            "- <code>забрать биткоины</code> - собрать BTC\n"
+            "- <code>майнинг</code> - открыть панель",
             parse_mode="HTML"
         )
         
@@ -1098,6 +1954,96 @@ async def reset_mining_cmd(msg: Message):
         await msg.reply(f"❌ Ошибка сброса: {e}")
 
 # ========== БАЗА ДАННЫХ ==========
+async def migrate_legacy_businesses(db: aiosqlite.Connection):
+    try:
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='businesses'"
+        )
+        if not await cursor.fetchone():
+            return
+
+        cursor = await db.execute("SELECT user_id, business_id, level FROM businesses")
+        rows = await cursor.fetchall()
+        refunds = {}
+
+        for row in rows:
+            user_id, business_id, level = row
+            legacy = LEGACY_BUSINESS_DEFS.get(business_id)
+            if not legacy:
+                continue
+            price = legacy["price"]
+            mult = legacy["upgrade_multiplier"]
+            total_investment = price
+            for lvl in range(1, max(1, level)):
+                total_investment += int(price * (mult ** lvl))
+            refunds[user_id] = refunds.get(user_id, 0) + int(total_investment * 0.7)
+
+        for user_id, amount in refunds.items():
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE id = ?",
+                (amount, user_id)
+            )
+
+        await db.execute("DROP TABLE IF EXISTS businesses")
+    except Exception as e:
+        logger.error(f"Ошибка миграции старых бизнесов: {e}")
+
+
+async def ensure_countries_name_not_unique(db: aiosqlite.Connection):
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='countries'"
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return
+
+        table_sql = row[0]
+        if "name TEXT UNIQUE" not in table_sql and "UNIQUE (name)" not in table_sql and "UNIQUE(name)" not in table_sql:
+            return
+
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute("ALTER TABLE countries RENAME TO countries_old")
+
+        new_sql = table_sql.replace("name TEXT UNIQUE NOT NULL", "name TEXT NOT NULL")
+        new_sql = new_sql.replace(", UNIQUE (name)", "")
+        new_sql = new_sql.replace(", UNIQUE(name)", "")
+        new_sql = new_sql.replace("UNIQUE (name)", "")
+        new_sql = new_sql.replace("UNIQUE(name)", "")
+        await db.execute(new_sql)
+
+        cursor = await db.execute("PRAGMA table_info(countries_old)")
+        old_cols = await cursor.fetchall()
+        cursor = await db.execute("PRAGMA table_info(countries)")
+        new_cols = {r[1] for r in await cursor.fetchall()}
+
+        for col in old_cols:
+            name = col[1]
+            if name in new_cols:
+                continue
+            col_type = col[2] or ""
+            notnull = bool(col[3])
+            dflt_value = col[4]
+
+            col_def = f"{name} {col_type}".strip()
+            if dflt_value is not None:
+                col_def += f" DEFAULT {dflt_value}"
+                if notnull:
+                    col_def += " NOT NULL"
+
+            await db.execute(f"ALTER TABLE countries ADD COLUMN {col_def}")
+
+        cols = [r[1] for r in old_cols]
+        cols_csv = ", ".join(cols)
+        await db.execute(
+            f"INSERT INTO countries ({cols_csv}) SELECT {cols_csv} FROM countries_old"
+        )
+        await db.execute("DROP TABLE countries_old")
+        await db.commit()
+    except Exception as e:
+        logger.error(f"Failed to drop UNIQUE from countries.name: {e}")
+
+
 async def update_db_structure():
     """Обновить структуру базы данных"""
     try:
@@ -1117,6 +2063,10 @@ async def update_db_structure():
                 'has_started_bonus': 'BOOLEAN DEFAULT 0',
                 'last_collected': 'INTEGER DEFAULT 0',
                 'plasma': 'BIGINT DEFAULT 0',
+                'plutonium': 'BIGINT DEFAULT 0',
+                'artifacts': 'BIGINT DEFAULT 0',
+                'tech_data': 'BIGINT DEFAULT 0',
+                'space_prestige': 'INTEGER DEFAULT 0',
                 'bitcoin': 'REAL DEFAULT 0',
                 'mining_gpu_count': 'INTEGER DEFAULT 0',
                 'mining_gpu_level': 'INTEGER DEFAULT 1',
@@ -1125,7 +2075,17 @@ async def update_db_structure():
                 'losses': 'INTEGER DEFAULT 0',
                 'last_daily_claim': 'INTEGER DEFAULT NULL',
                 'daily_streak': 'INTEGER DEFAULT 0',
-                'last_game_time': 'INTEGER DEFAULT 0'
+                'last_game_time': 'INTEGER DEFAULT 0',
+                'weapons_shop_unlocked': 'INTEGER DEFAULT 1',
+                'weapons_shop_unlock_until': 'INTEGER DEFAULT 0',
+                'energy': 'INTEGER DEFAULT 100',
+                'energy_max': 'INTEGER DEFAULT 100',
+                'energy_last_ts': 'INTEGER DEFAULT 0',
+                'reputation': 'INTEGER DEFAULT 0',
+                'income_boost_percent': 'REAL DEFAULT 0',
+                'income_boost_until_ts': 'INTEGER DEFAULT 0',
+                'total_wagered_today': 'BIGINT DEFAULT 0',
+                'wagered_reset_ts': 'INTEGER DEFAULT 0'
             }
             
             for column, col_type in new_columns.items():
@@ -1134,19 +2094,7 @@ async def update_db_structure():
             
             await db.commit()  # Фиксируем изменения пользовательской таблицы
             
-            # 1. Создаем таблицу для бизнесов (если еще нет)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS businesses (
-                    user_id INTEGER,
-                    business_id INTEGER,
-                    level INTEGER DEFAULT 1,
-                    product_amount INTEGER DEFAULT 0,
-                    last_collected INTEGER DEFAULT 0,
-                    PRIMARY KEY (user_id, business_id)
-                )
-            """)
-            
-            # 2. Создаем таблицу для планет (если еще нет)
+            # 1. Создаем таблицу для планет (если еще нет)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS planets (
                     user_id INTEGER,
@@ -1182,6 +2130,747 @@ async def update_db_structure():
             """)
             
             await db.commit()  # Финальный коммит для всех созданных таблиц
+            # Таблица для отмеченных обработанных callback'ов (id колбека, метка времени)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS processed_callbacks (
+                    id TEXT PRIMARY KEY,
+                    ts INTEGER
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS referral_progress (
+                    referrer_id INTEGER NOT NULL,
+                    referred_id INTEGER PRIMARY KEY,
+                    actions_count INTEGER DEFAULT 0,
+                    actions_required INTEGER DEFAULT 20,
+                    reward_remaining BIGINT DEFAULT 0,
+                    rep_remaining INTEGER DEFAULT 0,
+                    created_ts INTEGER DEFAULT 0
+                )
+            """)
+            
+            # Новые таблицы для стран и кланов
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS countries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    owner_user_id INTEGER NULL,
+                    level INTEGER NOT NULL DEFAULT 1,
+                    treasury INTEGER NOT NULL DEFAULT 0,
+                    stability INTEGER NOT NULL DEFAULT 70,
+                    tax_rate REAL NOT NULL DEFAULT 0.10,
+                    last_tick INTEGER NOT NULL DEFAULT 0,
+                    last_war_end_ts INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+
+            await ensure_countries_name_not_unique(db)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS country_buildings (
+                    country_id INTEGER NOT NULL,
+                    building_type TEXT NOT NULL,
+                    level INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(country_id, building_type)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS business_defs (
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    base_cost INTEGER NOT NULL,
+                    max_level INTEGER NOT NULL,
+                    income_bonus REAL NOT NULL,
+                    jobs INTEGER NOT NULL,
+                    upkeep_day INTEGER NOT NULL
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS country_businesses (
+                    country_id INTEGER NOT NULL,
+                    business_code TEXT NOT NULL,
+                    level INTEGER NOT NULL DEFAULT 0,
+                    last_upkeep_ts INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(country_id, business_code)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS country_limits (
+                    country_id INTEGER PRIMARY KEY,
+                    people_limit INTEGER DEFAULT 100,
+                    tech_limit INTEGER DEFAULT 20
+                )
+            """)
+            
+            # Клановые боссы
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS clan_bosses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    tier INTEGER NOT NULL,
+                    max_hp INTEGER NOT NULL,
+                    hp INTEGER NOT NULL,
+                    attack_power INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    phase INTEGER NOT NULL DEFAULT 1,
+                    spawned_at INTEGER NOT NULL,
+                    ends_at INTEGER NOT NULL
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS clan_boss_hits (
+                    boss_id INTEGER NOT NULL,
+                    clan_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    country_id INTEGER NOT NULL,
+                    damage INTEGER NOT NULL,
+                    ts INTEGER NOT NULL,
+                    PRIMARY KEY (boss_id, user_id)
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS clan_boss_rewards_claimed (
+                    boss_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY (boss_id, user_id)
+                )
+            """)
+            
+            # Добавляем новые колонки для населения
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN population INTEGER DEFAULT 0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN army_people INTEGER DEFAULT 0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN population_cap INTEGER DEFAULT 100000")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN jobs_available INTEGER DEFAULT 0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN employment_rate REAL DEFAULT 0.0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN literacy INTEGER DEFAULT 50")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN crime INTEGER DEFAULT 20")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN happiness INTEGER DEFAULT 70")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN birth_rate REAL DEFAULT 0.003")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN death_rate REAL DEFAULT 0.001")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN last_population_tick INTEGER DEFAULT 0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN specialization TEXT DEFAULT NULL")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN last_specialization_change INTEGER DEFAULT 0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE countries ADD COLUMN last_war_end_ts INTEGER DEFAULT 0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE clans ADD COLUMN is_open INTEGER NOT NULL DEFAULT 1")
+            except:
+                pass
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS clans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    owner_user_id INTEGER NOT NULL,
+                    treasury_money INTEGER NOT NULL DEFAULT 0,
+                    treasury_plasma INTEGER NOT NULL DEFAULT 0,
+                    bonus_income REAL NOT NULL DEFAULT 0.02,
+                    is_open INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS clan_members (
+                    clan_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'member',
+                    joined_at INTEGER NOT NULL,
+                    PRIMARY KEY(clan_id, user_id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS clan_join_requests (
+                    clan_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(clan_id, user_id)
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS clan_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    clan_id INTEGER NOT NULL,
+                    actor_user_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    ts INTEGER NOT NULL
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS clan_join_requests (
+                    clan_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(clan_id, user_id)
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS armies (
+                    country_id INTEGER NOT NULL,
+                    unit_type TEXT NOT NULL,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(country_id, unit_type)
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS wars (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attacker_country_id INTEGER NOT NULL,
+                    defender_country_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    started_at INTEGER NOT NULL,
+                    last_round_at INTEGER NOT NULL DEFAULT 0,
+                    attacker_progress INTEGER NOT NULL DEFAULT 0,
+                    defender_progress INTEGER NOT NULL DEFAULT 0,
+                    rounds_played INTEGER NOT NULL DEFAULT 0,
+                    winner_country_id INTEGER DEFAULT NULL,
+                    tribute_amount INTEGER NOT NULL DEFAULT 0,
+                    ends_at INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS war_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    war_id INTEGER NOT NULL,
+                    actor_country_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    power INTEGER NOT NULL,
+                    losses_people INTEGER NOT NULL,
+                    losses_weapons INTEGER NOT NULL DEFAULT 0,
+                    losses_tech INTEGER NOT NULL,
+                    ts INTEGER NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS credits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lender_id INTEGER,
+                    borrower_id INTEGER NOT NULL,
+                    amount INTEGER NOT NULL,
+                    interest REAL NOT NULL,
+                    total_due INTEGER NOT NULL,
+                    issued_at INTEGER NOT NULL,
+                    due_at INTEGER NOT NULL,
+                    status TEXT NOT NULL
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS credit_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    credit_id INTEGER NOT NULL,
+                    amount INTEGER NOT NULL,
+                    paid_at INTEGER NOT NULL
+                )
+            """)
+
+            try:
+                await db.execute("ALTER TABLE wars ADD COLUMN rounds_played INTEGER NOT NULL DEFAULT 0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE wars ADD COLUMN winner_country_id INTEGER DEFAULT NULL")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE wars ADD COLUMN tribute_amount INTEGER NOT NULL DEFAULT 0")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE war_logs ADD COLUMN losses_weapons INTEGER NOT NULL DEFAULT 0")
+            except:
+                pass
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bosses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    tier INTEGER NOT NULL,
+                    max_hp INTEGER NOT NULL,
+                    hp INTEGER NOT NULL,
+                    attack_power INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    phase INTEGER DEFAULT 1,
+                    spawned_at INTEGER NOT NULL,
+                    ends_at INTEGER NOT NULL
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS boss_hits (
+                    boss_id INTEGER NOT NULL,
+                    clan_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    country_id INTEGER NOT NULL,
+                    damage INTEGER NOT NULL,
+                    ts INTEGER NOT NULL,
+                    PRIMARY KEY (boss_id, user_id)
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS boss_rewards_claimed (
+                    boss_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY (boss_id, user_id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS unique_items (
+                    item_id TEXT PRIMARY KEY,
+                    boss_tier INTEGER,
+                    name TEXT,
+                    item_type TEXT,
+                    slot TEXT,
+                    power_flat INTEGER DEFAULT 0,
+                    power_mult REAL DEFAULT 0.0,
+                    boss_damage_mult REAL DEFAULT 0.0,
+                    vehicle_loss_reduction REAL DEFAULT 0.0,
+                    people_loss_reduction REAL DEFAULT 0.0,
+                    ignore_defense REAL DEFAULT 0.0,
+                    upkeep_mult REAL DEFAULT 0.0,
+                    rarity TEXT,
+                    description TEXT
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_unique_items (
+                    user_id INTEGER,
+                    item_id TEXT,
+                    obtained_at INTEGER,
+                    PRIMARY KEY(user_id, item_id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS country_unique_slots (
+                    country_id INTEGER PRIMARY KEY,
+                    core_item_id TEXT NULL,
+                    support_item_id TEXT NULL,
+                    relic_item_id TEXT NULL
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS boss_loot_rolls (
+                    boss_id INTEGER,
+                    user_id INTEGER,
+                    rolled_at INTEGER,
+                    PRIMARY KEY(boss_id, user_id)
+                )
+            """)
+
+            for item in UNIQUE_ITEMS:
+                await db.execute("""
+                    INSERT OR IGNORE INTO unique_items
+                    (item_id, boss_tier, name, item_type, slot, power_flat, power_mult, boss_damage_mult,
+                     vehicle_loss_reduction, people_loss_reduction, ignore_defense, upkeep_mult, rarity, description)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    item["item_id"],
+                    item["boss_tier"],
+                    item["name"],
+                    item["item_type"],
+                    item.get("slot"),
+                    item.get("power_flat", 0),
+                    item.get("power_mult", 0.0),
+                    item.get("boss_damage_mult", 0.0),
+                    item.get("vehicle_loss_reduction", 0.0),
+                    item.get("people_loss_reduction", 0.0),
+                    item.get("ignore_defense", 0.0),
+                    item.get("upkeep_mult", 0.0),
+                    item.get("rarity"),
+                    item.get("description"),
+                ))
+
+            # Бэкап-миграции для старых таблиц
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN tier INTEGER")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN attack_power INTEGER")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN phase INTEGER DEFAULT 1")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN status TEXT")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN max_hp INTEGER")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN hp INTEGER")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN spawned_at INTEGER")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN ends_at INTEGER")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE bosses ADD COLUMN level INTEGER DEFAULT 1")
+            except:
+                pass
+            try:
+                await db.execute("ALTER TABLE boss_hits ADD COLUMN country_id INTEGER")
+            except:
+                pass
+            try:
+                await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_boss_hits_unique ON boss_hits (boss_id, user_id)")
+            except:
+                pass
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS items (
+                    item_id TEXT PRIMARY KEY,
+                    category TEXT,
+                    name TEXT,
+                    tier INTEGER,
+                    power INTEGER,
+                    upkeep_day INTEGER,
+                    price_money INTEGER,
+                    price_plutonium INTEGER DEFAULT 0,
+                    price_plasma INTEGER DEFAULT 0,
+                    req_building TEXT DEFAULT NULL,
+                    req_building_level INTEGER DEFAULT 0
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_items (
+                    user_id INTEGER,
+                    item_id TEXT,
+                    amount INTEGER,
+                    PRIMARY KEY(user_id, item_id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS unique_items (
+                    item_id TEXT PRIMARY KEY,
+                    boss_tier INTEGER,
+                    name TEXT,
+                    item_type TEXT,
+                    slot TEXT,
+                    power_flat INTEGER DEFAULT 0,
+                    power_mult REAL DEFAULT 0.0,
+                    boss_damage_mult REAL DEFAULT 0.0,
+                    vehicle_loss_reduction REAL DEFAULT 0.0,
+                    people_loss_reduction REAL DEFAULT 0.0,
+                    ignore_defense REAL DEFAULT 0.0,
+                    upkeep_mult REAL DEFAULT 0.0,
+                    rarity TEXT,
+                    description TEXT
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_unique_items (
+                    user_id INTEGER,
+                    item_id TEXT,
+                    obtained_at INTEGER,
+                    PRIMARY KEY(user_id, item_id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS country_unique_slots (
+                    country_id INTEGER PRIMARY KEY,
+                    core_item_id TEXT NULL,
+                    support_item_id TEXT NULL,
+                    relic_item_id TEXT NULL
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS boss_loot_rolls (
+                    boss_id INTEGER,
+                    user_id INTEGER,
+                    rolled_at INTEGER,
+                    PRIMARY KEY(boss_id, user_id)
+                )
+            """)
+
+            for item in UNIQUE_ITEMS:
+                await db.execute("""
+                    INSERT OR IGNORE INTO unique_items
+                    (item_id, boss_tier, name, item_type, slot, power_flat, power_mult, boss_damage_mult,
+                     vehicle_loss_reduction, people_loss_reduction, ignore_defense, upkeep_mult, rarity, description)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    item["item_id"],
+                    item["boss_tier"],
+                    item["name"],
+                    item["item_type"],
+                    item.get("slot"),
+                    item.get("power_flat", 0),
+                    item.get("power_mult", 0.0),
+                    item.get("boss_damage_mult", 0.0),
+                    item.get("vehicle_loss_reduction", 0.0),
+                    item.get("people_loss_reduction", 0.0),
+                    item.get("ignore_defense", 0.0),
+                    item.get("upkeep_mult", 0.0),
+                    item.get("rarity"),
+                    item.get("description"),
+                ))
+            
+            # Вставка предметов
+            for item_id, data in ITEM_CONFIG.items():
+                await db.execute("""
+                    INSERT OR IGNORE INTO items 
+                    (item_id, category, name, tier, power, upkeep_day, price_money, price_plutonium, price_plasma, req_building, req_building_level)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    item_id, data['category'], data['name'], data['tier'], data['power'], data['upkeep_day'],
+                    data['price_money'], data.get('price_plutonium', 0), data.get('price_plasma', 0),
+                    data.get('req_building'), data.get('req_building_level', 0)
+                ))
+            
+            # Вставка начальных стран
+            await db.execute("""
+                INSERT OR IGNORE INTO countries (name, level, treasury, stability, tax_rate, last_tick) VALUES
+                ('Аркадия', 1, 1000000, 70, 0.10, 0),
+                ('Аурелион', 1, 1000000, 70, 0.10, 0),
+                ('Златория', 1, 1000000, 70, 0.10, 0),
+                ('Валория', 1, 1000000, 70, 0.10, 0),
+                ('Меркатия', 1, 1000000, 70, 0.10, 0),
+                ('Люменсия', 1, 1000000, 70, 0.10, 0),
+                ('Санктерия', 1, 1000000, 70, 0.10, 0),
+                ('Эвентия', 1, 1000000, 70, 0.10, 0),
+                ('Новалис', 1, 1000000, 70, 0.10, 0),
+                ('Гармония', 1, 1000000, 70, 0.10, 0),
+                ('Ноксара', 1, 1000000, 70, 0.10, 0),
+                ('Кратосия', 1, 1000000, 70, 0.10, 0),
+                ('Фортекс', 1, 1000000, 70, 0.10, 0),
+                ('Бастион', 1, 1000000, 70, 0.10, 0),
+                ('Доминия', 1, 1000000, 70, 0.10, 0),
+                ('Технолис', 1, 1000000, 70, 0.10, 0),
+                ('Индустрия', 1, 1000000, 70, 0.10, 0),
+                ('Логистар', 1, 1000000, 70, 0.10, 0),
+                ('Энерголия', 1, 1000000, 70, 0.10, 0),
+                ('Мегаполис', 1, 1000000, 70, 0.10, 0),
+                ('Астрея', 1, 1000000, 70, 0.10, 0),
+                ('Орбитон', 1, 1000000, 70, 0.10, 0),
+                ('Сингуля', 1, 1000000, 70, 0.10, 0),
+                ('Космариум', 1, 1000000, 70, 0.10, 0),
+                ('Нова-Прайм', 1, 1000000, 70, 0.10, 0),
+                ('Эквилибриум', 1, 1000000, 70, 0.10, 0),
+                ('Вальдхейм', 1, 1000000, 70, 0.10, 0),
+                ('Цивилис', 1, 1000000, 70, 0.10, 0),
+                ('Прогресса', 1, 1000000, 70, 0.10, 0),
+                ('Альянсия', 1, 1000000, 70, 0.10, 0)
+            """)
+            
+            # Создаем таблицы для системы титулов
+            await db.execute("DELETE FROM countries WHERE owner_user_id IS NULL")
+            for country in START_COUNTRIES:
+                await db.execute(
+                    "INSERT OR IGNORE INTO countries (name, level, treasury, stability, tax_rate, last_tick) "
+                    "VALUES (?, 1, 1000000, 70, 0.10, 0)",
+                    (country["name"],)
+                )
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS titles (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT UNIQUE,
+                    name TEXT,
+                    description TEXT,
+                    bonus_type TEXT,
+                    bonus_value REAL,
+                    permanent INTEGER
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_titles (
+                    user_id INTEGER,
+                    title_code TEXT,
+                    obtained_at INTEGER,
+                    PRIMARY KEY(user_id, title_code)
+                )
+            """)
+            
+            # Вставка титулов
+            for title in TITLES_CONFIG:
+                await db.execute("""
+                    INSERT OR IGNORE INTO titles 
+                    (code, name, description, bonus_type, bonus_value, permanent)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    title['code'], title['name'], title['description'], 
+                    title['bonus_type'], title['bonus_value'], title['permanent']
+                ))
+            
+            # Создаем таблицу мировых событий
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS world_events (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT UNIQUE,
+                    name TEXT,
+                    description TEXT,
+                    effect_type TEXT,
+                    effect_value REAL,
+                    start_ts INTEGER,
+                    end_ts INTEGER
+                )
+            """)
+
+            for code, data in BUSINESS_DEFS.items():
+                await db.execute("""
+                    INSERT OR REPLACE INTO business_defs
+                    (code, name, base_cost, max_level, income_bonus, jobs, upkeep_day)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    code, data["name"], data["base_cost"], data["max_level"],
+                    data["income_bonus"], data["jobs"], data["upkeep_day"]
+                ))
+
+            await migrate_legacy_businesses(db)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS space_expeditions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    country_id INTEGER,
+                    expedition_type TEXT,
+                    started_at INTEGER,
+                    ends_at INTEGER,
+                    status TEXT
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS space_expedition_results (
+                    expedition_id INTEGER PRIMARY KEY,
+                    outcome TEXT,
+                    loot_plasma INTEGER DEFAULT 0,
+                    loot_plutonium INTEGER DEFAULT 0,
+                    loot_artifacts INTEGER DEFAULT 0,
+                    loot_tech INTEGER DEFAULT 0,
+                    discovery_id INTEGER DEFAULT NULL,
+                    message TEXT,
+                    created_at INTEGER
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS space_discoveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    discovery_type TEXT,
+                    rarity TEXT,
+                    description TEXT,
+                    discovered_at INTEGER,
+                    status TEXT DEFAULT 'new',
+                    resolved_at INTEGER DEFAULT 0
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS space_colonies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER,
+                    colony_type TEXT,
+                    stability INTEGER,
+                    bonus_type TEXT,
+                    created_at INTEGER,
+                    last_yield INTEGER DEFAULT 0
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS space_tech (
+                    tech_code TEXT PRIMARY KEY,
+                    name TEXT,
+                    description TEXT,
+                    cost_plasma INTEGER,
+                    cost_plutonium INTEGER
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_space_tech (
+                    user_id INTEGER,
+                    tech_code TEXT,
+                    researched INTEGER,
+                    PRIMARY KEY (user_id, tech_code)
+                )
+            """)
+
+            for tech in SPACE_TECH_CONFIG:
+                await db.execute(
+                    "INSERT OR IGNORE INTO space_tech (tech_code, name, description, cost_plasma, cost_plutonium) VALUES (?, ?, ?, ?, ?)",
+                    (tech['tech_code'], tech['name'], tech['description'], tech['cost_plasma'], tech['cost_plutonium'])
+                )
+
+            await db.commit()
             logger.info("✅ Структура БД обновлена")
             
     except Exception as e:
@@ -1208,12 +2897,82 @@ async def init_db():
                     total_referral_earned BIGINT DEFAULT 0,
                     has_started_bonus BOOLEAN DEFAULT 0,
                     plasma BIGINT DEFAULT 0,
+                    plutonium BIGINT DEFAULT 0,
+                    artifacts BIGINT DEFAULT 0,
+                    tech_data BIGINT DEFAULT 0,
+                    space_prestige INTEGER DEFAULT 0,
                     bitcoin REAL DEFAULT 0,
                     mining_gpu_count INTEGER DEFAULT 0,
                     mining_gpu_level INTEGER DEFAULT 1,
-                    last_mining_claim INTEGER DEFAULT 0
+                    last_mining_claim INTEGER DEFAULT 0,
+                    energy INTEGER DEFAULT 100,
+                    energy_max INTEGER DEFAULT 100,
+                    energy_last_ts INTEGER DEFAULT 0,
+                    reputation INTEGER DEFAULT 0,
+                    income_boost_percent REAL DEFAULT 0,
+                    income_boost_until_ts INTEGER DEFAULT 0,
+                    total_wagered_today BIGINT DEFAULT 0,
+                    wagered_reset_ts INTEGER DEFAULT 0,
+                    weapons_shop_unlocked INTEGER DEFAULT 1,
+                    weapons_shop_unlock_until INTEGER DEFAULT 0
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS processed_callbacks (
+                    id TEXT PRIMARY KEY,
+                    ts INTEGER
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS referral_progress (
+                    referrer_id INTEGER NOT NULL,
+                    referred_id INTEGER PRIMARY KEY,
+                    actions_count INTEGER DEFAULT 0,
+                    actions_required INTEGER DEFAULT 20,
+                    reward_remaining BIGINT DEFAULT 0,
+                    rep_remaining INTEGER DEFAULT 0,
+                    created_ts INTEGER DEFAULT 0
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS items (
+                    item_id TEXT PRIMARY KEY,
+                    category TEXT,
+                    name TEXT,
+                    tier INTEGER,
+                    power INTEGER,
+                    upkeep_day INTEGER,
+                    price_money INTEGER,
+                    price_plutonium INTEGER DEFAULT 0,
+                    price_plasma INTEGER DEFAULT 0,
+                    req_building TEXT DEFAULT NULL,
+                    req_building_level INTEGER DEFAULT 0
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_items (
+                    user_id INTEGER,
+                    item_id TEXT,
+                    amount INTEGER,
+                    PRIMARY KEY(user_id, item_id)
+                )
+            """)
+            
+            # Вставка предметов
+            for item_id, data in ITEM_CONFIG.items():
+                await db.execute("""
+                    INSERT OR IGNORE INTO items 
+                    (item_id, category, name, tier, power, upkeep_day, price_money, price_plutonium, price_plasma, req_building, req_building_level)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    item_id, data['category'], data['name'], data['tier'], data['power'], data['upkeep_day'],
+                    data['price_money'], data.get('price_plutonium', 0), data.get('price_plasma', 0),
+                    data.get('req_building'), data.get('req_building_level', 0)
+                ))
+            
             await db.commit()
             logger.info("✅ База данных создана")
             
@@ -1224,30 +2983,18 @@ async def init_db():
 
 
 async def get_user(uid: int):
-    """Получить пользователя из БД - БЕЗ автоматических начислений"""
+    """Получить пользователя - всегда свежие данные"""
     try:
-        # Кэширование на 5 секунд для предотвращения частых запросов
-        current_time = time.time()
-        cache_key = f"user_{uid}"
-        
-        # Проверяем кэш
-        if not hasattr(get_user, 'cache'):
-            get_user.cache = {}
-        
-        if cache_key in get_user.cache:
-            cached_data, timestamp = get_user.cache[cache_key]
-            if current_time - timestamp < 5:  # 5 секунд кэш
-                logger.debug(f"📦 Используем кэш для пользователя {uid}")
-                return cached_data.copy()  # Возвращаем копию
-        
         async with aiosqlite.connect(DB_PATH) as db:
+            # ВАЖНО: timeout для предотвращения блокировок
+            await db.execute("PRAGMA busy_timeout = 5000")
+            
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM users WHERE id = ?", (uid,))
             row = await cursor.fetchone()
             
-            # Если пользователя нет - создаем
             if not row:
-                logger.info(f"👤 Создаем нового пользователя: {uid}")
+                # Создаем пользователя если нет
                 referral_code = generate_referral_code(uid)
                 await db.execute(
                     "INSERT INTO users (id, balance, referral_code) VALUES (?, ?, ?)",
@@ -1255,65 +3002,402 @@ async def get_user(uid: int):
                 )
                 await db.commit()
                 
-                # Получаем созданного пользователя
                 cursor = await db.execute("SELECT * FROM users WHERE id = ?", (uid,))
                 row = await cursor.fetchone()
             
-            if row:
-                user_dict = dict(row)
-                
-                # ВНИМАНИЕ: УДАЛЕНЫ ВСЕ АВТОМАТИЧЕСКИЕ НАЧИСЛЕНИЯ!
-                # Теперь эта функция ТОЛЬКО читает данные, не изменяет их
-                
-                # Заполняем недостающие поля значениями по умолчанию
-                default_fields = {
-                    'work_time': 0,
-                    'total_work': 0,
-                    'total_bonus': 0,
-                    'bonus_time': 0,
-                    'referral_code': None,
-                    'referred_by': None,
-                    'referral_count': 0,
-                    'total_referral_earned': 0,
-                    'has_started_bonus': False,
-                    'plasma': 0,
-                    'bitcoin': 0.0,
-                    'mining_gpu_count': 0,
-                    'mining_gpu_level': 1,
-                    'last_mining_claim': 0,
-                    'wins': 0,
-                    'losses': 0,
-                    'last_daily_claim': None,
-                    'daily_streak': 0,
-                    'last_game_time': 0
-                }
-                
-                for field, default in default_fields.items():
-                    if field not in user_dict or user_dict[field] is None:
-                        user_dict[field] = default
-                
-                # Генерируем реферальный код если нет
-                if not user_dict.get('referral_code'):
-                    salt = "murasaki_empire_2024"
-                    hash_str = hashlib.md5(f"{uid}{salt}".encode()).hexdigest()[:8].upper()
-                    referral_code = f"REF{hash_str}"
-                    user_dict['referral_code'] = referral_code
-                    await db.execute("UPDATE users SET referral_code = ? WHERE id = ?", (referral_code, uid))
-                    await db.commit()
-                
-                # Сохраняем в кэш
-                get_user.cache[cache_key] = (user_dict.copy(), current_time)
-                
-                return user_dict
-            
-            return None
+            # Преобразуем в словарь
+            return dict(row) if row else None
             
     except Exception as e:
-        logger.error(f"❌ Ошибка get_user для {uid}: {e}")
+        logger.error(f"❌ Ошибка get_user для {uid}: {e}", exc_info=True)
         return None
 
-# Инициализация кэша при загрузке модуля
-get_user.cache = {}
+
+async def is_callback_processed(cb_id: str) -> bool:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT 1 FROM processed_callbacks WHERE id = ?", (cb_id,))
+            row = await cursor.fetchone()
+            return bool(row)
+    except Exception as e:
+        logger.error(f"Ошибка is_callback_processed: {e}")
+        return False
+
+
+async def mark_callback_processed(cb_id: str):
+    try:
+        now = int(time.time())
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO processed_callbacks (id, ts) VALUES (?, ?)", (cb_id, now))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка mark_callback_processed: {e}")
+
+
+# ========== ФУНКЦИИ СИСТЕМЫ ТИТУЛОВ ==========
+
+async def get_user_titles(uid: int):
+    """Получить все титулы пользователя"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT t.*, ut.obtained_at 
+                FROM titles t 
+                JOIN user_titles ut ON t.code = ut.title_code 
+                WHERE ut.user_id = ?
+                ORDER BY ut.obtained_at DESC
+            """, (uid,))
+            return [dict(row) for row in await cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Ошибка get_user_titles: {e}")
+        return []
+
+
+async def check_and_award_titles(uid: int):
+    """Проверить и выдать титулы пользователю"""
+    try:
+        user = await get_user(uid)
+        if not user:
+            return
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Получить уже имеющиеся титулы
+            cursor = await db.execute("SELECT title_code FROM user_titles WHERE user_id = ?", (uid,))
+            existing_titles = {row[0] for row in await cursor.fetchall()}
+            
+            new_titles = []
+            
+            # Проверка условий титулов
+            for title in TITLES_CONFIG:
+                if title['code'] in existing_titles:
+                    continue
+                
+                awarded = False
+                
+                if title['code'] == 'iron_ruler':
+                    # 30 дней без бунтов - проверка стабильности страны
+                    country_id = await get_user_country_id(db, uid)
+                    if country_id:
+                        cursor = await db.execute("SELECT stability FROM countries WHERE id = ?", (country_id,))
+                        row = await cursor.fetchone()
+                        if row and row[0] >= 80:
+                            awarded = True
+                        
+                elif title['code'] == 'military_maniac':
+                    # 50 побед в войнах
+                    if user.get('wins', 0) >= 50:
+                        awarded = True
+                        
+                elif title['code'] == 'casino_magnate':
+                    # оборот ставок > 10B - пока что просто по балансу
+                    if user.get('balance', 0) >= 10000000000:  # 10B
+                        awarded = True
+                        
+                elif title['code'] == 'sigma_killer':
+                    # победа над боссом - проверка по логам или флагу
+                    # Пока что не реализовано, можно добавить позже
+                    pass
+                    
+                elif title['code'] == 'wealthy_trader':
+                    # баланс > 100B
+                    if user.get('balance', 0) >= 100000000000:  # 100B
+                        awarded = True
+                        
+                elif title['code'] == 'plasma_master':
+                    # плазма > 1M
+                    if user.get('plasma', 0) >= 1000000:
+                        awarded = True
+                        
+                elif title['code'] == 'space_pioneer':
+                    cursor = await db.execute("SELECT COUNT(1) FROM space_discoveries WHERE user_id = ?", (uid,))
+                    row = await cursor.fetchone()
+                    if row and row[0] >= 1:
+                        awarded = True
+
+                elif title['code'] == 'void_conqueror':
+                    cursor = await db.execute("SELECT COUNT(1) FROM space_discoveries WHERE user_id = ?", (uid,))
+                    row = await cursor.fetchone()
+                    if row and row[0] >= 5:
+                        awarded = True
+
+                elif title['code'] == 'sigma_witness':
+                    cursor = await db.execute("SELECT 1 FROM space_discoveries WHERE user_id = ? AND discovery_type = 'sigma_anomaly' LIMIT 1", (uid,))
+                    if await cursor.fetchone():
+                        awarded = True
+
+                elif title['code'] == 'referral_guru':
+                    # 100+ рефералов
+                    if user.get('referral_count', 0) >= 100:
+                        awarded = True
+                        
+                elif title['code'] == 'mining_tycoon':
+                    # 100+ видеокарт
+                    if user.get('mining_gpu_count', 0) >= 100:
+                        awarded = True
+                        
+                elif title['code'] == 'business_empire':
+                    country_id = await get_user_country_id(db, uid)
+                    if country_id:
+                        businesses, _ = await get_country_businesses(db, country_id)
+                        max_level_businesses = sum(
+                            1 for code, level in businesses.items()
+                            if level >= BUSINESS_DEFS.get(code, {}).get("max_level", 0)
+                        )
+                        if max_level_businesses == len(BUSINESS_DEFS):
+                            awarded = True
+                        
+                elif title['code'] == 'war_hero':
+                    # 100+ побед в войнах
+                    if user.get('wins', 0) >= 100:
+                        awarded = True
+                
+                if awarded:
+                    now = int(time.time())
+                    await db.execute(
+                        "INSERT OR IGNORE INTO user_titles (user_id, title_code, obtained_at) VALUES (?, ?, ?)",
+                        (uid, title['code'], now)
+                    )
+                    new_titles.append(title)
+            
+            await db.commit()
+            return new_titles
+            
+    except Exception as e:
+        logger.error(f"Ошибка check_and_award_titles: {e}")
+        return []
+
+
+async def calculate_title_bonuses(uid: int):
+    """Рассчитать бонусы от титулов пользователя"""
+    try:
+        titles = await get_user_titles(uid)
+        
+        bonuses = {
+            'income': 0.0,
+            'combat': 0.0,
+            'casino': 0.0,
+            'boss': 0.0
+        }
+        
+        for title in titles:
+            bonus_type = title['bonus_type']
+            bonus_value = title['bonus_value']
+            
+            if bonus_type in bonuses:
+                bonuses[bonus_type] += bonus_value
+        
+        # Ограничение суммарного бонуса <= 5%
+        for key in bonuses:
+            bonuses[key] = min(bonuses[key], 0.05)
+        
+        return bonuses
+        
+    except Exception as e:
+        logger.error(f"Ошибка calculate_title_bonuses: {e}")
+        return {'income': 0.0, 'combat': 0.0, 'casino': 0.0, 'boss': 0.0}
+
+
+# ========== ФУНКЦИИ МИРОВЫХ СОБЫТИЙ ==========
+
+async def get_current_world_event():
+    """Получить текущее активное мировое событие"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            now = int(time.time())
+            cursor = await db.execute(
+                "SELECT * FROM world_events WHERE start_ts <= ? AND end_ts > ? ORDER BY start_ts DESC LIMIT 1",
+                (now, now)
+            )
+            event = await cursor.fetchone()
+            return dict(event) if event else None
+    except Exception as e:
+        logger.error(f"Ошибка get_current_world_event: {e}")
+        return None
+
+
+async def start_random_world_event():
+    """Запустить случайное мировое событие"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Проверить, есть ли активное событие
+            now = int(time.time())
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM world_events WHERE start_ts <= ? AND end_ts > ?",
+                (now, now)
+            )
+            active_count = (await cursor.fetchone())[0]
+            
+            if active_count > 0:
+                return None  # Уже есть активное событие
+            
+            # Выбрать случайное событие
+            event_config = random.choice(WORLD_EVENTS_CONFIG)
+            duration_seconds = event_config['duration_hours'] * 3600
+            start_ts = now
+            end_ts = now + duration_seconds
+            
+            # Вставить новое событие
+            await db.execute("""
+                INSERT INTO world_events (code, name, description, effect_type, effect_value, start_ts, end_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event_config['code'], event_config['name'], event_config['description'],
+                event_config['effect_type'], event_config['effect_value'], start_ts, end_ts
+            ))
+            
+            await db.commit()
+            
+            # Вернуть информацию о событии
+            return {
+                'code': event_config['code'],
+                'name': event_config['name'],
+                'description': event_config['description'],
+                'effect_type': event_config['effect_type'],
+                'effect_value': event_config['effect_value'],
+                'start_ts': start_ts,
+                'end_ts': end_ts
+            }
+            
+    except Exception as e:
+        logger.error(f"Ошибка start_random_world_event: {e}")
+        return None
+
+
+async def check_and_start_world_event():
+    """Проверить и запустить новое мировое событие если нужно"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            now = int(time.time())
+            
+            # Проверить время последнего события
+            cursor = await db.execute(
+                "SELECT end_ts FROM world_events ORDER BY end_ts DESC LIMIT 1"
+            )
+            last_event = await cursor.fetchone()
+            
+            if last_event:
+                last_end = last_event[0]
+                # События запускаются каждые 3-7 дней (259200 - 604800 секунд)
+                next_event_time = last_end + random.randint(259200, 604800)
+                if now < next_event_time:
+                    return None
+            else:
+                # Если нет событий, запустить первое
+                pass
+            
+            # Запустить новое событие
+            return await start_random_world_event()
+            
+    except Exception as e:
+        logger.error(f"Ошибка check_and_start_world_event: {e}")
+        return None
+
+
+async def get_world_event_effects():
+    """Получить текущие эффекты мирового события"""
+    event = await get_current_world_event()
+    if not event:
+        return {}
+
+    return {
+        event['effect_type']: event['effect_value']
+    }
+
+async def check_random_events(db: aiosqlite.Connection, country_id: int, uid: int):
+    """Заглушка для случайных событий (пока без логики)."""
+    return None
+
+
+# ========== ФУНКЦИИ СПЕЦИАЛИЗАЦИЙ СТРАНЫ ==========
+
+async def get_country_specialization(uid: int):
+    """Получить текущую специализацию страны пользователя"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT specialization, specialization_changed_ts FROM users WHERE id = ?",
+                (uid,)
+            )
+            row = await cursor.fetchone()
+            if row and row['specialization']:
+                return {
+                    'type': row['specialization'],
+                    'changed_ts': row['specialization_changed_ts'] or 0
+                }
+            return None
+    except Exception as e:
+        logger.error(f"Ошибка get_country_specialization для {uid}: {e}")
+        return None
+
+
+async def set_country_specialization(uid: int, specialization_type: str):
+    """Установить специализацию страны для пользователя"""
+    try:
+        # Проверить, существует ли такая специализация
+        if specialization_type not in COUNTRY_SPECIALIZATIONS:
+            return False, "Неверный тип специализации"
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Проверить cooldown
+            cursor = await db.execute(
+                "SELECT specialization_changed_ts FROM users WHERE id = ?",
+                (uid,)
+            )
+            row = await cursor.fetchone()
+            
+            if row and row[0]:
+                last_change = row[0]
+                now = int(time.time())
+                if now - last_change < SPECIALIZATION_CHANGE_COOLDOWN:
+                    remaining_seconds = SPECIALIZATION_CHANGE_COOLDOWN - (now - last_change)
+                    remaining_days = remaining_seconds // (24 * 3600)
+                    return False, f"Специализацию можно менять раз в 7 дней. Осталось {remaining_days} дней."
+            
+            # Установить новую специализацию
+            now = int(time.time())
+            await db.execute(
+                "UPDATE users SET specialization = ?, specialization_changed_ts = ? WHERE id = ?",
+                (specialization_type, now, uid)
+            )
+            await db.commit()
+            
+            spec_info = COUNTRY_SPECIALIZATIONS[specialization_type]
+            return True, f"✅ Специализация страны изменена на '{spec_info['name']}'"
+            
+    except Exception as e:
+        logger.error(f"Ошибка set_country_specialization для {uid}: {e}")
+        return False, "Ошибка при изменении специализации"
+
+
+async def get_country_specialization_bonuses(uid: int):
+    """Получить бонусы и штрафы от специализации страны"""
+    try:
+        spec = await get_country_specialization(uid)
+        if not spec or spec['type'] not in COUNTRY_SPECIALIZATIONS:
+            return {}, {}
+        
+        spec_config = COUNTRY_SPECIALIZATIONS[spec['type']]
+        bonuses = {}
+        penalties = {}
+        
+        # Преобразовать бонусы
+        for bonus in spec_config['bonuses']:
+            bonuses[bonus['type']] = bonus['value']
+        
+        # Преобразовать штрафы
+        for penalty in spec_config['penalties']:
+            penalties[penalty['type']] = penalty['value']
+        
+        return bonuses, penalties
+        
+    except Exception as e:
+        logger.error(f"Ошибка get_country_specialization_bonuses для {uid}: {e}")
+        return {}, {}
+
 
 async def reset_lottery():
     ...
@@ -1366,16 +3450,35 @@ async def update_username(uid: int, username: str):
     except:
         pass
 
-async def change_balance(uid: int, delta: int):
-    """Изменить баланс пользователя"""
+async def change_balance(uid: int, delta: int) -> bool:
+    """Изменить баланс пользователя - ФИКСИРОВАННАЯ ВЕРСИЯ"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
+            # ВАЖНО: Изоляция транзакции
+            await db.execute("BEGIN IMMEDIATE")
+            # 1. Убедимся что пользователь существует
             await db.execute("INSERT OR IGNORE INTO users (id, balance) VALUES (?, ?)", (uid, 0))
+            
+            # 2. Изменяем баланс
             await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (delta, uid))
+            
+            # 3. СРАЗУ получаем обновленный баланс в той же транзакции
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            new_balance = row[0] if row else 0
+            
+            # 4. Фиксируем транзакцию
             await db.commit()
+            
+            logger.info(f"💰 Баланс {uid}: {delta:+} (стало: {new_balance:,})")
             return True
+            
     except Exception as e:
-        logger.error(f"Ошибка change_balance: {e}")
+        logger.error(f"❌ Ошибка change_balance для {uid}: {e}", exc_info=True)
+        try:
+            await db.rollback()
+        except:
+            pass
         return False
 
 async def change_plasma(uid: int, delta: int):
@@ -1409,6 +3512,9 @@ async def update_stats(uid: int, win: bool):
             else:
                 await db.execute("UPDATE users SET losses = losses + 1 WHERE id = ?", (uid,))
             await db.commit()
+            
+            # Проверить и выдать титулы после обновления статистики
+            await check_and_award_titles(uid)
     except:
         pass
 
@@ -1541,7 +3647,7 @@ async def run_simple_crash_game(game_id: int, bet: int, crash_point: float, mess
                 break
             
             # Увеличиваем множитель
-            increment = random.uniform(0.05, 0.15)
+            increment = random.uniform(0.02, 0.08)
             current_multiplier += increment
             current_multiplier = round(current_multiplier, 2)
             
@@ -1650,119 +3756,120 @@ async def get_user_by_referral_code(code: str):
         return None
 
 async def process_referral(new_user_id: int, referral_code: str, bot: Bot = None):
-    """Обработка реферального приглашения - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    """Process referral with delayed payout after activity"""
     try:
-        logger.info(f"🔍 Начинаем обработку реферала: пользователь {new_user_id}, код {referral_code}")
-        
-        # Проверяем, есть ли код
         if not referral_code or referral_code == "start":
             return False, 0, None
-        
-        # Находим реферера по коду
+
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT id, username FROM users WHERE referral_code = ?", (referral_code,))
             referrer_data = await cursor.fetchone()
-            
             if not referrer_data:
-                logger.error(f"❌ Реферер с кодом {referral_code} не найден")
                 return False, 0, None
-            
-            referrer_id = referrer_data['id']
-            
-            # Проверяем, не пытается ли пользователь пригласить сам себя
+
+            referrer_id = referrer_data["id"]
             if referrer_id == new_user_id:
-                logger.error(f"❌ Пользователь пытается пригласить сам себя")
                 return False, 0, None
-            
-            # Проверяем, был ли уже приглашен этот пользователь
+
             cursor = await db.execute("SELECT referred_by FROM users WHERE id = ?", (new_user_id,))
             existing_user = await cursor.fetchone()
-            
             if existing_user and existing_user[0] is not None:
-                logger.error(f"❌ Пользователь {new_user_id} уже был приглашен ранее")
                 return False, 0, None
-            
-            logger.info(f"✅ Найден реферер: {referrer_id}")
-            
-            # Генерируем награду
-            reward_amount = random.randint(30_000_000, 100_000_000)
-            logger.info(f"💰 Награда за реферала: {reward_amount:,}")
-            
-            # Начинаем транзакцию
-            await db.execute("BEGIN")
-            
-            try:
-                # 1. Устанавливаем кто пригласил (В СТРОКУ КОТОРАЯ СОЗДАЕТ ПОЛЬЗОВАТЕЛЯ)
-                cursor = await db.execute("SELECT * FROM users WHERE id = ?", (new_user_id,))
-                user_exists = await cursor.fetchone()
-                
-                if user_exists:
-                    # Пользователь уже есть, обновляем поле
-                    await db.execute("UPDATE users SET referred_by = ? WHERE id = ?", (referrer_id, new_user_id))
-                else:
-                    # Создаем нового пользователя с реферером
-                    referral_code_new = generate_referral_code(new_user_id)
-                    await db.execute(
-                        "INSERT INTO users (id, referred_by, referral_code) VALUES (?, ?, ?)",
-                        (new_user_id, referrer_id, referral_code_new)
-                    )
-                
-                # 2. Обновляем данные реферера (прибавляем к балансу и счетчику)
-                await db.execute("""
-                    UPDATE users 
-                    SET balance = balance + ?,
-                        referral_count = referral_count + 1,
-                        total_referral_earned = total_referral_earned + ?
-                    WHERE id = ?
-                """, (reward_amount, reward_amount, referrer_id))
-                
-                await db.commit()
-                logger.info(f"✅ Транзакция успешно завершена!")
-                
-                # 3. Получаем обновленные данные для проверки
-                cursor = await db.execute(
-                    "SELECT balance, referral_count, total_referral_earned, username FROM users WHERE id = ?", 
-                    (referrer_id,)
+
+            cursor = await db.execute("SELECT 1 FROM referral_progress WHERE referred_id = ?", (new_user_id,))
+            if await cursor.fetchone():
+                return False, 0, None
+
+            reward_total = random.randint(1_000_000, 5_000_000)
+            rep_total = random.randint(10, 30)
+            immediate_reward = int(reward_total * 0.2)
+            immediate_rep = max(1, int(rep_total * 0.2)) if rep_total > 0 else 0
+            reward_remaining = reward_total - immediate_reward
+            rep_remaining = rep_total - immediate_rep
+
+            await db.execute("BEGIN IMMEDIATE")
+
+            cursor = await db.execute("SELECT 1 FROM users WHERE id = ?", (new_user_id,))
+            user_exists = await cursor.fetchone()
+            if user_exists:
+                await db.execute("UPDATE users SET referred_by = ? WHERE id = ?", (referrer_id, new_user_id))
+            else:
+                referral_code_new = generate_referral_code(new_user_id)
+                await db.execute(
+                    "INSERT INTO users (id, referred_by, referral_code) VALUES (?, ?, ?)",
+                    (new_user_id, referrer_id, referral_code_new)
                 )
-                updated_data = await cursor.fetchone()
-                
-                referrer_username = updated_data['username'] or f"ID {referrer_id}"
-                
-                logger.info(f"📊 Данные после обновления:")
-                logger.info(f"   Баланс: {updated_data['balance']:,}")
-                logger.info(f"   Рефералов: {updated_data['referral_count']}")
-                logger.info(f"   Заработано на рефералах: {updated_data['total_referral_earned']:,}")
-                
-                # 4. Отправляем уведомление рефереру
-                if bot:
-                    try:
-                        await bot.send_message(
-                            referrer_id,
-                            f"🎉 <b>НОВЫЙ РЕФЕРАЛ!</b>\n\n"
-                            f"👤 Кто-то присоединился по вашей ссылке!\n\n"
-                            f"💰 <b>Вы получили:</b> {format_money(reward_amount)}\n"
-                            f"📊 <b>Новый баланс:</b> {format_money(updated_data['balance'])}\n"
-                            f"👥 <b>Всего рефералов:</b> {updated_data['referral_count']}\n"
-                            f"🏦 <b>Всего заработано на рефералах:</b> {format_money(updated_data['total_referral_earned'])}",
-                            parse_mode="HTML"
-                        )
-                        logger.info(f"✅ Уведомление отправлено рефереру {referrer_id}")
-                    except Exception as e:
-                        logger.error(f"❌ Не удалось отправить уведомление: {e}")
-                
-                return True, reward_amount, referrer_username
-                
+
+            await db.execute("""
+                UPDATE users
+                SET balance = balance + ?,
+                    reputation = reputation + ?,
+                    referral_count = referral_count + 1,
+                    total_referral_earned = total_referral_earned + ?
+                WHERE id = ?
+            """, (immediate_reward, immediate_rep, immediate_reward, referrer_id))
+
+            await db.execute("""
+                INSERT INTO referral_progress
+                (referrer_id, referred_id, actions_count, actions_required, reward_remaining, rep_remaining, created_ts)
+                VALUES (?, ?, 0, ?, ?, ?, ?)
+            """, (referrer_id, new_user_id, REFERRAL_ACTIONS_REQUIRED, reward_remaining, rep_remaining, int(time.time())))
+
+            await db.commit()
+
+        referrer_username = referrer_data["username"] or f"ID {referrer_id}"
+
+        if bot:
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎁 <b>Новый реферал!</b>\n\n"
+                    f"💵 <b>Награда сейчас:</b> {format_money(immediate_reward)}\n"
+                    f"⭐ <b>Репутация:</b> +{immediate_rep}\n",
+                    parse_mode="HTML"
+                )
             except Exception as e:
-                await db.rollback()
-                logger.error(f"❌ Ошибка в транзакции: {e}")
-                return False, 0, None
-                
+                logger.error(f"Referral notify error: {e}")
+
+        return True, immediate_reward, referrer_username
+
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка process_referral: {e}")
+        logger.error(f"process_referral error: {e}")
         return False, 0, None
 
-# ========== ОБРАБОТКА РЕФЕРАЛЬНОГО СТАРТА ==========
+async def add_referral_action(uid: int, count: int = 1):
+    """Increment referral activity and release pending reward if ready."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT referrer_id, actions_count, actions_required, reward_remaining, rep_remaining
+                FROM referral_progress
+                WHERE referred_id = ? AND reward_remaining > 0
+            """, (uid,))
+            row = await cursor.fetchone()
+            if not row:
+                return
+
+            new_count = min(row["actions_required"], row["actions_count"] + count)
+            await db.execute("UPDATE referral_progress SET actions_count = ? WHERE referred_id = ?", (new_count, uid))
+
+            if new_count >= row["actions_required"]:
+                await db.execute("""
+                    UPDATE users
+                    SET balance = balance + ?,
+                        reputation = reputation + ?,
+                        total_referral_earned = total_referral_earned + ?
+                    WHERE id = ?
+                """, (row["reward_remaining"], row["rep_remaining"], row["reward_remaining"], row["referrer_id"]))
+                await db.execute("UPDATE referral_progress SET reward_remaining = 0, rep_remaining = 0 WHERE referred_id = ?", (uid,))
+
+            await db.commit()
+    except Exception as e:
+        logger.error(f"add_referral_action error: {e}")
+
+
 async def handle_referral_start(msg: Message, referral_code: str):
     """Обработка старта с реферальной ссылкой"""
     uid = msg.from_user.id
@@ -1784,23 +3891,22 @@ async def handle_referral_start(msg: Message, referral_code: str):
         referral_link = f"https://t.me/{bot_username}?start={user_referral_code}"
         
         text = f"""
-🎌 <b>С ВОЗВРАЩЕНИЕМ В MURASAKI EMPIRE, {username}!</b>
+🎉 <b>Добро пожаловать в MURASAKI EMPIRE, {username}!</b>
 
-👤 <b>Вы уже были приглашены:</b> {referrer_name}
-
-✨ <b>Вы уже в системе!</b>
-Продолжайте зарабатывать и приглашать друзей!
+👤 <b>Тебя пригласил:</b> {referrer_name}
+💰 <b>Бонус за приглашения:</b> 30-100М за друга
 
 🔗 <b>Ваша реферальная ссылка:</b>
 <code>{referral_link}</code>
 
 👤 <b>Ваш баланс:</b> <code>{user['balance']:,}</code>
 
-💡 <b>Начните с этих команд:</b>
-• <code>меню</code> - показать все возможности
-• <code>бонус</code> - получить бонус 5-20М
-• <code>работа</code> - заработать 1-5М
-• <code>стартбонус</code> - получить стартовый бонус 10М
+💡 <b>Главные команды:</b>
+- <code>меню</code> — показать все возможности
+- <code>профиль</code> — ваша статистика
+- <code>рефералы</code> — пригласить друзей
+
+🎯 <b>Удачи в зарабатывании миллионов!</b>
 """
         
         await msg.answer(text, parse_mode="HTML")
@@ -1833,7 +3939,7 @@ async def handle_referral_start(msg: Message, referral_code: str):
    Напишите <code>стартбонус</code> для получения 10М
 
 2. 🎁 <b>Получите ежечасный бонус!</b>
-   Напишите <code>бонус</code> для получения 5-20М
+   Напишите <code>бонус</code> для получения 200k-1.5MМ
 
 3. 💼 <b>Выполните первую работу!</b>
    Напишите <code>работа</code> для заработка 1-5М
@@ -1847,9 +3953,9 @@ async def handle_referral_start(msg: Message, referral_code: str):
 👤 <b>Ваш баланс:</b> <code>{user['balance']:,}</code>
 
 💡 <b>Главные команды:</b>
-• <code>меню</code> — показать все возможности
-• <code>профиль</code> — ваша статистика
-• <code>рефералы</code> — пригласить друзей
+- <code>меню</code> — показать все возможности
+- <code>профиль</code> — ваша статистика
+- <code>рефералы</code> — пригласить друзей
 
 🎯 <b>Удачи в зарабатывании миллионов!</b>
 """
@@ -1863,7 +3969,7 @@ async def handle_referral_start(msg: Message, referral_code: str):
 
 ✨ <b>Но это не проблема! Вы все равно можете:</b>
 
-🎁 <b>Получать бонусы каждый час:</b> 5-20 миллионов!
+🎁 <b>Получать бонусы каждый час:</b> 200k-1.5M миллионов!
 💼 <b>Работать каждую минуту:</b> 1-5 миллионов!
 👥 <b>Приглашать друзей:</b> 30-100М за каждого!
 
@@ -1877,337 +3983,6 @@ async def handle_referral_start(msg: Message, referral_code: str):
 """
     
     await msg.answer(text, parse_mode="HTML")
-
-# ========== БИЗНЕС СИСТЕМА ==========
-async def get_user_businesses(uid: int):
-    """Получить все бизнесы пользователя"""
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM businesses WHERE user_id = ?", (uid,))
-            rows = await cursor.fetchall()
-            businesses = {}
-            for row in rows:
-                row_dict = dict(row)
-                businesses[row_dict['business_id']] = row_dict
-            return businesses
-    except Exception as e:
-        logger.error(f"Ошибка get_user_businesses: {e}")
-        return {}
-
-async def buy_business(uid: int, business_id: int):
-    """Купить бизнес - УПРОЩЕННАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ"""
-    print(f"🔍 ВЫЗВАНА buy_business: user={uid}, business={business_id}")
-    
-    if business_id not in BUSINESSES:
-        print(f"❌ Бизнес {business_id} не найден")
-        return False, "Бизнес не найден"
-    
-    business = BUSINESSES[business_id]
-    user = await get_user(uid)
-    
-    print(f"💰 Баланс: {user['balance']}, Цена: {business['price']}")
-    
-    if user['balance'] < business['price']:
-        print(f"❌ Не хватает денег")
-        return False, f"Недостаточно средств. Нужно: {format_money(business['price'])}"
-    
-    user_businesses = await get_user_businesses(uid)
-    if business_id in user_businesses:
-        print(f"❌ Уже есть этот бизнес")
-        return False, "У вас уже есть этот бизнес"
-    
-    try:
-        print(f"✅ Покупаем бизнес {business_id}...")
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Снимаем деньги
-            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", 
-                           (business['price'], uid))
-            
-            # Добавляем бизнес
-            await db.execute("""
-                INSERT INTO businesses (user_id, business_id, level, product_amount, last_collected)
-                VALUES (?, ?, ?, ?, ?)
-            """, (uid, business_id, 1, business['product_capacity'], int(time.time())))
-            
-            await db.commit()
-            print(f"✅ Бизнес куплен успешно!")
-            
-            # Получаем обновленный баланс
-            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
-            row = await cursor.fetchone()
-            new_balance = row[0] if row else 0
-            
-            return True, f"✅ Бизнес '{business['name']}' успешно куплен за {format_money(business['price'])}!\n\n💰 Новый баланс: {format_money(new_balance)}"
-            
-    except Exception as e:
-        print(f"❌ Ошибка: {e}")
-        return False, f"❌ Ошибка покупки: {e}"
-
-        # === БИЗНЕС: РАСЧЁТ ДОХОДА ===
-import time
-
-def calculate_business_income(business):
-    now = int(time.time())
-    last_collect = business['last_collect']
-
-    elapsed = now - last_collect
-    if elapsed < 60:
-        return 0, 0
-
-    minutes = elapsed // 60
-    income = minutes * business['income_per_minute']
-    return income, minutes
-
-    # === БИЗНЕС: СБОР ДОХОДА ===
-async def collect_business_income(uid: int, business_id: int):
-    business = await get_business(uid, business_id)
-
-    income, minutes = calculate_business_income(business)
-
-    if income <= 0:
-        return False, "⏳ Доход пока не накопился"
-
-    now = int(time.time())
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            UPDATE businesses
-            SET last_collect = ?
-            WHERE id = ? AND user_id = ?
-        """, (now, business_id, uid))
-
-        await db.execute("""
-            UPDATE users
-            SET balance = balance + ?
-            WHERE id = ?
-        """, (income, uid))
-
-        await db.commit()
-
-    return True, f"💰 Получено {format_money(income)} за {minutes} мин."
-
-
-async def upgrade_business(uid: int, business_id: int):
-    """Улучшить бизнес"""
-    user_businesses = await get_user_businesses(uid)
-    if business_id not in user_businesses:
-        return False, "У вас нет этого бизнеса"
-    
-    business_data = BUSINESSES[business_id]
-    user_business = user_businesses[business_id]
-    
-    if user_business['level'] >= business_data['max_level']:
-        return False, "Бизнес достиг максимального уровня"
-    
-    upgrade_cost = int(business_data['price'] * (business_data['upgrade_multiplier'] ** user_business['level']))
-    
-    user = await get_user(uid)
-    if user['balance'] < upgrade_cost:
-        return False, f"Недостаточно средств. Нужно: {format_money(upgrade_cost)}"
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (upgrade_cost, uid))
-            
-            new_level = user_business['level'] + 1
-            new_capacity = int(business_data['product_capacity'] * (business_data['upgrade_multiplier'] ** (new_level - 1)))
-            
-            await db.execute("""
-                UPDATE businesses 
-                SET level = ?, product_amount = ?
-                WHERE user_id = ? AND business_id = ?
-            """, (new_level, new_capacity, uid, business_id))
-            
-            await db.commit()
-            return True, f"Бизнес '{business_data['name']}' улучшен до уровня {new_level}!"
-    except Exception as e:
-        logger.error(f"Ошибка upgrade_business: {e}")
-        return False, f"Ошибка улучшения: {e}"
-
-async def refill_products(uid: int, business_id: int):
-    """Пополнить продукты бизнеса (полностью)"""
-    user_businesses = await get_user_businesses(uid)
-    if business_id not in user_businesses:
-        return False, "У вас нет этого бизнеса"
-    
-    business_data = BUSINESSES[business_id]
-    user_business = user_businesses[business_id]
-    
-    refill_cost = business_data['product_refill_cost']
-    
-    # Если продукты уже полные
-    if user_business['product_amount'] >= business_data['product_capacity']:
-        return False, "Продукты уже заполнены"
-    
-    user = await get_user(uid)
-    if user['balance'] < refill_cost:
-        return False, f"Недостаточно средств. Нужно: {format_money(refill_cost)}"
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Снимаем деньги
-            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (refill_cost, uid))
-            
-            # ПОЛНОСТЬЮ заполняем продукты (до максимальной емкости)
-            await db.execute("""
-                UPDATE businesses 
-                SET product_amount = ?
-                WHERE user_id = ? AND business_id = ?
-            """, (business_data['product_capacity'], uid, business_id))
-            
-            await db.commit()
-            return True, f"✅ Продукты бизнеса '{business_data['name']}' полностью пополнены!\nТеперь он может работать {business_data['product_capacity']} часов."
-    except Exception as e:
-        logger.error(f"Ошибка refill_products: {e}")
-        return False, f"❌ Ошибка пополнения: {e}"
-
-async def collect_business_profit(uid: int, business_id: int):
-    """Собрать прибыль с бизнеса (продукты расходуются по времени)"""
-    user_businesses = await get_user_businesses(uid)
-    if business_id not in user_businesses:
-        return False, "У вас нет этого бизнеса"
-    
-    business_data = BUSINESSES[business_id]
-    user_business = user_businesses[business_id]
-    
-    # Проверяем наличие продуктов
-    if user_business['product_amount'] <= 0:
-        return False, "Недостаточно продуктов. Пополните бизнес."
-    
-    current_time = int(time.time())
-    last_collected = user_business.get('last_collected', 0)
-    
-    # Если никогда не собирали, начинаем с текущего времени
-    if last_collected == 0:
-        last_collected = current_time
-    
-    # Рассчитываем сколько часов прошло с последнего сбора
-    time_passed = current_time - last_collected
-    hours_passed = time_passed / 3600  # в часах
-    
-    if hours_passed <= 0:
-        return False, "⏳ Еще не прошло время для сбора прибыли"
-    
-    # Рассчитываем прибыль в час
-    profit_per_hour = business_data['profit_per_hour'] * (business_data['upgrade_multiplier'] ** (user_business['level'] - 1))
-    
-    # Сколько продуктов можно использовать (1 час работы = 1 единица продукта)
-    # products_per_hour = business_data['product_capacity'] / 24  # Если бы за день
-    # Проще: процент заполнения определяет сколько часов может работать бизнес
-    max_working_hours = user_business['product_amount']  # Каждый продукт = 1 час работы
-    
-    # Ограничиваем часы работы доступными продуктами
-    working_hours = min(hours_passed, max_working_hours)
-    
-    if working_hours <= 0:
-        return False, "Недостаточно продуктов для работы"
-    
-    # Прибыль = прибыль_в_час × отработанные_часы
-    profit = int(profit_per_hour * working_hours)
-    
-    if profit <= 0:
-        return False, "Недостаточно продуктов или время не прошло."
-    
-    # Сколько продуктов израсходовано
-    products_used = int(working_hours)  # Каждый час = 1 продукт
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Начисляем прибыль
-            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (profit, uid))
-            
-            # Расходуем продукты и обновляем время
-            new_product_amount = user_business['product_amount'] - products_used
-            if new_product_amount < 0:
-                new_product_amount = 0
-            
-            await db.execute("""
-                UPDATE businesses 
-                SET product_amount = ?, last_collected = ?
-                WHERE user_id = ? AND business_id = ?
-            """, (new_product_amount, current_time, uid, business_id))
-            
-            await db.commit()
-            return True, profit
-    except Exception as e:
-        logger.error(f"Ошибка collect_business_profit: {e}")
-        return False, 0
-
-async def sell_business(uid: int, business_id: int):
-    """Продать бизнес государству"""
-    user_businesses = await get_user_businesses(uid)
-    if business_id not in user_businesses:
-        return False, "У вас нет этого бизнеса"
-    
-    business_data = BUSINESSES[business_id]
-    user_business = user_businesses[business_id]
-    
-    total_investment = business_data['price']
-    for level in range(1, user_business['level']):
-        total_investment += int(business_data['price'] * (business_data['upgrade_multiplier'] ** level))
-    
-    sell_price = int(total_investment * 0.7)
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (sell_price, uid))
-            
-            await db.execute("DELETE FROM businesses WHERE user_id = ? AND business_id = ?", (uid, business_id))
-            
-            await db.commit()
-            return True, sell_price
-    except Exception as e:
-        logger.error(f"Ошибка sell_business: {e}")
-        return False, 0
-
-# ========== ФУНКЦИЯ ДЛЯ ПОКАЗА СОБСТВЕННЫХ БИЗНЕСОВ (НОВАЯ) ==========
-async def show_my_businesses(msg: Message):
-    """Показать бизнесы пользователя с inline-кнопками"""
-    uid = msg.from_user.id
-    user_businesses = await get_user_businesses(uid)
-    
-    if not user_businesses:
-        await msg.reply("У вас пока нет бизнесов. Купите первый бизнес: купить бизнес [id]")
-        return
-    
-    # Получаем все бизнесы пользователя
-    keyboard = []
-    for biz_id, biz_data in user_businesses.items():
-        if biz_id in BUSINESSES:
-            business_info = BUSINESSES[biz_id]
-            level = biz_data['level']
-            product_amount = biz_data['product_amount']
-            product_capacity = business_info['product_capacity']
-            
-            # Статус заполнения
-            if product_amount >= product_capacity:
-                status = "🟢"
-            elif product_amount > product_capacity * 0.5:
-                status = "🟡"
-            else:
-                status = "🔴"
-            
-            # Кнопка для управления этим бизнесом
-            keyboard.append([
-                InlineKeyboardButton(
-                    text=f"{status} {business_info['name']} (Ур. {level})",
-                    callback_data=f"mybiz_{biz_id}"
-                )
-            ])
-    
-    # Добавляем кнопку "Назад" если есть бизнесы
-    if keyboard:
-        keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
-    
-    text = "🏢 <b>Ваши бизнесы</b>\n\n"
-    text += f"📊 Всего бизнесов: {len(user_businesses)}\n"
-    text += "Выберите бизнес для управления:\n\n"
-    text += "🟢 - Продукты заполнены\n🟡 - Продукты наполовину\n🔴 - Мало продуктов"
-    
-    await msg.reply(text, parse_mode="HTML", reply_markup=kb)
 
 # ========== ПЛАНЕТЫ СИСТЕМА ==========
 async def get_user_planets(uid: int):
@@ -2289,6 +4064,11 @@ async def collect_planet_plasma(uid: int, planet_id: int):
     
     if plasma_collected <= 0:
         return False, "Плазма еще не накопилась"
+    
+    # Применить эффекты мирового события
+    world_effects = await get_world_event_effects()
+    plasma_effect = world_effects.get('plasma', 0.0)
+    plasma_collected = int(plasma_collected * (1 + plasma_effect))
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2480,6 +4260,7 @@ async def claim_mining_profit(uid: int):
             else:
                 # Если есть потенциальные BTC - начисляем их!
                 async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("BEGIN IMMEDIATE")
                     await db.execute("""
                         UPDATE users 
                         SET bitcoin = bitcoin + ?,
@@ -2506,14 +4287,18 @@ async def claim_mining_profit(uid: int):
                 """, (current_time, uid))
                 await db.commit()
             
-            # Очищаем кэш
-            cache_key = f"user_{uid}"
-            if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-                del get_user.cache[cache_key]
-            
             # Рассчитываем стоимость
             btc_price = BitcoinMining.get_bitcoin_price()
             usd_value = current_btc * btc_price
+            
+            # Применяем буф дохода если активен
+            current_ts = int(time.time())
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute("SELECT income_boost_percent, income_boost_until_ts FROM users WHERE id = ?", (uid,))
+                boost_row = await cursor.fetchone()
+                if boost_row and boost_row[0] > 0 and current_ts < boost_row[1]:
+                    usd_value *= (1 + boost_row[0])
+                    usd_value = int(usd_value)
             
             logger.info(f"🎉 Успешно собрано для {uid}: {current_btc:.8f} BTC = ${usd_value:.2f}")
             
@@ -2532,6 +4317,10 @@ async def sell_bitcoin(uid: int, amount: float = None):
         
         # 1. Получаем данные пользователя
         user = await get_user(uid)
+        now_ts = int(time.time())
+        if not user.get("weapons_shop_unlocked", 0) and user.get("weapons_shop_unlock_until", 0) < now_ts:
+            await cb.answer("❌ Военный магазин закрыт.", show_alert=True)
+            return
         current_btc = user.get('bitcoin', 0) or 0
         
         logger.info(f"📊 Текущий BTC баланс {uid}: {current_btc:.8f}")
@@ -2562,23 +4351,29 @@ async def sell_bitcoin(uid: int, amount: float = None):
         btc_price = BitcoinMining.get_bitcoin_price()
         usd_amount = btc_to_sell * btc_price
         
-        logger.info(f"💵 Продажа {btc_to_sell:.8f} BTC по цене ${btc_price:,.2f} = ${usd_amount:,.2f}")
+        # Комиссия 5%
+        usd_amount *= 0.95
+        usd_amount = int(usd_amount)
+        
+        logger.info(f"💵 Продажа {btc_to_sell:.8f} BTC по цене ${btc_price:,.2f} = ${usd_amount:,.2f} (после 5% комиссии)")
         
         # 4. Выполняем продажу
         async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT bitcoin FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            if not row or row[0] < btc_to_sell:
+                await db.rollback()
+                return False, "? ???????????? BTC ??? ???????", 0
+
             await db.execute(
-                "UPDATE users SET bitcoin = bitcoin - ?, balance = balance + ? WHERE id = ?", 
+                "UPDATE users SET bitcoin = bitcoin - ?, balance = balance + ? WHERE id = ?",
                 (btc_to_sell, int(usd_amount), uid)
             )
             await db.commit()
-            
-            # 5. Очищаем кэш
-            cache_key = f"user_{uid}"
-            if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-                del get_user.cache[cache_key]
-            
-            logger.info(f"✅ Успешная продажа BTC для {uid}: {btc_to_sell:.8f} BTC → ${usd_amount:,.2f}")
-            
+
+            logger.info(f"? ???????? ??????? BTC ??? {uid}: {btc_to_sell:.8f} BTC ? ${usd_amount:,.2f}")
+
             return True, btc_to_sell, int(usd_amount)
             
     except Exception as e:
@@ -2695,13 +4490,48 @@ async def check_bonus_cooldown(uid: int):
         logger.error(f"Ошибка check_bonus_cooldown: {e}")
         return True, 0, {'bonus_time': 0, 'total_bonus': 0}
 
+async def refresh_energy(uid: int):
+    """Восстановить энергию: +1 каждые 180 сек"""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT energy, energy_max, energy_last_ts FROM users WHERE id = ?", (uid,))
+        row = await cursor.fetchone()
+        if not row:
+            return
+        energy, energy_max, last_ts = row
+        if last_ts == 0:
+            await db.execute("UPDATE users SET energy_last_ts = ? WHERE id = ?", (now, uid))
+            await db.commit()
+            return
+        elapsed = now - last_ts
+        regen = elapsed // 180  # +1 per 3 min
+        if regen > 0:
+            new_energy = min(energy_max, energy + regen)
+            await db.execute("UPDATE users SET energy = ?, energy_last_ts = ? WHERE id = ?", (new_energy, now, uid))
+            await db.commit()
+
 async def give_bonus(uid: int):
-    """Выдать бонус от 5 до 20 миллионов"""
+    """Выдать бонус 200k-1.5M, +энергия, шанс бустера"""
     try:
-        amount = random.randint(15_000_000, 50_000_000)
+        await refresh_energy(uid)
+        amount = random.randint(200_000, 1_500_000)
+        
+        # Применить бонусы от титулов
+        title_bonuses = await calculate_title_bonuses(uid)
+        income_bonus = title_bonuses.get('income', 0.0)
+        amount = int(amount * (1 + income_bonus))
+        
+        # Применить эффекты мирового события
+        world_effects = await get_world_event_effects()
+        income_effect = world_effects.get('income', 0.0)
+        amount = int(amount * (1 + income_effect))
+        
         current_time = int(time.time())
         
         async with aiosqlite.connect(DB_PATH) as db:
+            # +энергия
+            await db.execute("UPDATE users SET energy = min(energy_max, energy + 50) WHERE id = ?", (uid,))
+            # Бонус
             await db.execute("""
                 UPDATE users 
                 SET balance = balance + ?, 
@@ -2709,7 +4539,10 @@ async def give_bonus(uid: int):
                     total_bonus = COALESCE(total_bonus, 0) + ?
                 WHERE id = ?
             """, (amount, current_time, amount, uid))
-            
+            # Шанс бустера 10%
+            if random.random() < 0.1:
+                boost_until = current_time + 7200  # 2 часа
+                await db.execute("UPDATE users SET income_boost_percent = 0.2, income_boost_until_ts = ? WHERE id = ?", (boost_until, uid))
             await db.commit()
             logger.info(f"✅ Бонус выдан пользователю {uid}: {amount}")
             return amount, True
@@ -2742,51 +4575,104 @@ async def check_work_cooldown(uid: int):
     
 async def check_game_cooldown(uid: int, game_type: str):
     """Проверка кулдауна для игр (5 секунд)"""
-    try:
-        # Создаем ключ для хранения времени последней игры
-        cooldown_key = f"last_{game_type}_time"
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT last_game_time FROM users WHERE id = ?", (uid,))
-            row = await cursor.fetchone()
-            
-            current_time = time.time()
-            
-            if not row or not row['last_game_time']:
-                return True, 0
-            
-            last_game = row['last_game_time']
-            time_passed = current_time - last_game
-            
-            if time_passed >= GAMES_COOLDOWN:  # 5 секунд
-                return True, 0
-            
-            remaining = GAMES_COOLDOWN - time_passed
-            return False, remaining
-            
-    except Exception as e:
-        logger.error(f"Ошибка check_game_cooldown: {e}")
-        return True, 0
+    # Кулдауны для игр отключены — всегда разрешаем играть.
+    # Эта функция оставлена для совместимости вызовов.
+    return True, 0
 
 async def update_game_cooldown(uid: int, game_type: str):
     """Обновить время последней игры"""
+    # Кулдауны отключены — ничего не делаем (оставлено для совместимости).
+    return
+
+def get_casino_limits(reputation: int):
+    if reputation < 20:
+        return 100_000, 2_000_000
+    if reputation < 50:
+        return 500_000, 10_000_000
+    if reputation < 100:
+        return 2_000_000, 50_000_000
+    return 10_000_000, 200_000_000
+
+
+async def check_daily_wager_limit(uid: int, bet: int):
+    """Check daily wager limits and max bet"""
     try:
-        current_time = int(time.time())
+        now = int(time.time())
+        today_start = now - (now % 86400)
+
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET last_game_time = ? WHERE id = ?", 
-                           (current_time, uid))
+            cursor = await db.execute(
+                "SELECT balance, reputation, total_wagered_today, wagered_reset_ts FROM users WHERE id = ?",
+                (uid,)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False, "User not found"
+
+            balance, reputation, total_wagered, reset_ts = row
+            max_bet_limit, daily_limit = get_casino_limits(reputation or 0)
+            max_bet = min(int(balance * 0.05), max_bet_limit)
+
+            if bet > max_bet:
+                return False, f"? ???????????? ??????: {max_bet:,}"
+
+            reset_ts = reset_ts or 0
+            if reset_ts < today_start:
+                await db.execute(
+                    "UPDATE users SET total_wagered_today = 0, wagered_reset_ts = ? WHERE id = ?",
+                    (today_start, uid)
+                )
+                total_wagered = 0
+                await db.commit()
+
+            if total_wagered + bet > daily_limit:
+                remaining = daily_limit - total_wagered
+                return False, f"? ??????? ????? ??????. ????????: {remaining:,}"
+
+            return True, None
+    except Exception as e:
+        logger.error(f"check_daily_wager_limit error: {e}")
+        return False, "?????? ???????? ??????"
+
+
+async def update_daily_wager(uid: int, bet: int):
+    """Обновить дневной счетчик ставок"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET total_wagered_today = total_wagered_today + ? WHERE id = ?", (bet, uid))
             await db.commit()
     except Exception as e:
-        logger.error(f"Ошибка update_game_cooldown: {e}")
+        logger.error(f"Ошибка обновления wager: {e}")
 
 async def give_work_reward(uid: int):
-    """Выдать награду за работу (1-5 миллионов)"""
+    """Выдать награду за работу 150k-600k, -15 энергии, бонус от репутации, шанс x2"""
     try:
-        amount = random.randint(1_000_000, 10_000_000)
-        current_time = int(time.time())
-        
+        await refresh_energy(uid)
         async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT energy, reputation FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            if not row or row[0] < 15:
+                return 0, False  # Недостаточно энергии
+            energy, reputation = row
+            amount = random.randint(150_000, 600_000)
+            amount *= (1 + reputation * 0.02)
+            
+            # Применить бонусы от титулов
+            title_bonuses = await calculate_title_bonuses(uid)
+            income_bonus = title_bonuses.get('income', 0.0)
+            amount *= (1 + income_bonus)
+            
+            # Применить эффекты мирового события
+            world_effects = await get_world_event_effects()
+            income_effect = world_effects.get('income', 0.0)
+            amount *= (1 + income_effect)
+            
+            amount = int(amount)
+            # Шанс x2
+            if random.random() < 0.05 and energy >= 30:
+                amount *= 2
+            current_time = int(time.time())
+            await db.execute("UPDATE users SET energy = energy - 15 WHERE id = ?", (uid,))
             await db.execute("""
                 UPDATE users 
                 SET balance = balance + ?, 
@@ -2899,38 +4785,17 @@ async def claim_daily_reward(uid: int):
         logger.error(f"Ошибка claim_daily_reward: {e}")
         return False, 0, 0, f"Ошибка: {e}"
 
-# ========== ОБРАБОТКА КОМАНД С / И БЕЗ ==========
-# В самое начало функции handle_all_commands (или в каждую игровую функцию):
-async def handle_all_commands(msg: Message):
-    """Обработчик всех команд с глобальным КД 5 секунд"""
-    text = msg.text.strip()
-    
-    if not text:
-        return
-    
-    # Проверяем, это игровая команда?
-    game_commands = ['монетка', 'кости', 'слоты', 'рулетка', 'дротик', 
-                     'блекджек', 'краш', 'босс', 'атака']
-    
-    cmd = text.lower().split()[0]
-    
-    if cmd in game_commands:
-        # Проверяем глобальный КД
-        can_play, remaining = await check_game_cooldown(msg.from_user.id, "global_game")
-        if not can_play:
-            seconds = int(remaining)
-            await msg.reply(f"⏳ Подождите {seconds} секунд перед следующей игрой!")
-            return
-    
-    # ... остальной код ...
-    
-    # После каждой игры:
-    if cmd in game_commands:
-        await update_game_cooldown(msg.from_user.id, "global_game")
+
 async def handle_all_commands(msg: Message):
     """Обработчик всех команд - и с / и без /"""
     text = msg.text.strip()
     
+    # Ленивое автоначисление плазмы при любом действии пользователя
+    try:
+        await lazy_update_plasma(msg.from_user.id)
+    except Exception:
+        pass
+
     if not text:
         return
     
@@ -2948,215 +4813,313 @@ async def handle_all_commands(msg: Message):
     if cmd == 'гарантия':
         await guarantee_cmd(msg)
         return
-    
-@router.message(Command("start"))
-async def cmd_start(msg: Message, command: CommandObject = None):
-    """Обработка команды /start с реферальным кодом"""
-    uid = msg.from_user.id
-    username = msg.from_user.username or msg.from_user.first_name
-    
-    # Получаем или создаем пользователя
-    user = await get_user(uid)
-    
-    # Если есть аргумент (реферальный код)
-    if command and command.args:
-        referral_code = command.args
-        
-        # Если пользователь уже существует и у него нет реферера
-        if not user.get('referred_by') and referral_code:
-            success, reward_amount, referrer_username = await process_referral(uid, referral_code, msg.bot)
-            
-            if success:
-                # Обновляем данные пользователя
-                user = await get_user(uid)
-    
-    # Показываем приветственное сообщение
-    await send_welcome_message(msg)
-    
-    # Основные команды без /
-    if cmd in ['меню', 'menu', 'старт', 'начать']:
-        await send_welcome_message(msg)
-        return
-    
-    if cmd in ['бонус', 'bonus', 'бон', 'bon']:
-        await process_bonus(msg)
-        return
-    
-    if cmd in ['работа', 'work', 'раб', 'wrk', 'труд']:
-        await process_work(msg)
-        return
-    
-    if cmd in ['баланс', 'balance', 'б', 'баланс']:
-        await process_balance(msg)
-        return
-    
-    if cmd in ['профиль', 'profile', 'пр', 'стата', 'stats', 'статистика']:
-        await process_profile(msg)
-        return
-    
-    if cmd in ['топ', 'top', 'лидеры', 'лидерборд']:
-        await process_top(msg)
-        return
-    
-    if cmd in ['кд', 'cd', 'кулдаун', 'cooldown', 'бонусвремя']:
-        await check_bonus_cd(msg)
-        return
-    
-    if cmd in ['кдработы', 'работакд', 'workcd']:
-        await check_work_cd(msg)
-        return
-    
-    if cmd in ['стартбонус', 'старт', 'начальныйбонус']:
-        await process_start_bonus(msg)
-        return
-    
-    if cmd in ['рефералы', 'рефы', 'реферальная']:
-        await process_referrals(msg)
-        return
-    
-    # НОВАЯ КОМАНДА: МОЙ БИЗНЕС
-    if cmd in ['мой бизнес', 'мои бизнесы', 'mybusiness', 'mybusinesses']:
-        await show_my_businesses(msg)
-        return
-    
-    # Игры с аргументами
-    if len(parts) >= 2:
-        # Монетка
-        if cmd in ['монетка', 'coin', 'мн', 'coinflip', 'монета']:
-            await process_coin(msg, parts)
-            return
-        
-        # Кости
-        if cmd in ['кости', 'dice', 'кст', 'дайс']:
-            await process_dice(msg, parts)
-            return
-        
-        # Слоты
-        if cmd in ['слоты', 'slots', 'сл', 'слот']:
-            await process_slots(msg, parts)
-            return
-        
-        # Рулетка
-        if cmd in ['рулетка', 'roulette', 'рул', 'rul', 'rule']:
-            await process_roulette(msg, parts)
-            return
-        
-        # Блэкджек
-        if cmd in ['блекджек', 'блэкджек', 'bj', 'бж', 'blackjack']:
-            await process_bj(msg, parts)
-            
-        # Дартс
-        if cmd in ['дротик', 'дартс', 'дрот', 'darts', 'дарт']:
-            await process_darts(msg, parts)
-            return
-    
-    # Бизнес команды
-    if cmd in ['бизнесы', 'business', 'бизнес', 'биз']:
-        await show_businesses(msg)
-        return
-    
-    if cmd in ['майнинг', 'mining', 'майн']:
-        await show_mining_info(msg)
-        return
-    
-    if cmd in ['планеты', 'planets', 'планет']:
-        await show_planets(msg)
-        return
-    
-    if cmd in ['инвестиции', 'investments', 'инвест']:
-        await show_investments(msg)
-        return
-    
-    if cmd == 'передать' and len(parts) >= 3:
-        await process_transfer(msg, parts)
-        return
-    
-    # Новые команды из дополнения
-    if cmd in ['майнинг панель', 'miningpanel', 'майн панель']:
-        await show_mining_panel(msg)
-        return
 
-    if cmd in ['мои планеты', 'myplanets', 'планеты панель']:
-        await show_my_planets_panel(msg=msg)
-        return
-
-    if cmd in ['инвестировать', 'инвест', 'investment']:
-        await show_investments_panel(msg)
-        return
-    
-    # Сложные команды с аргументами
-    if len(parts) >= 2:
-        arg_cmd = ' '.join(parts[:2]).lower()
-        if arg_cmd in ['купить бизнес', 'улучшить бизнес', 'пополнить бизнес', 
-                      'собрать бизнес', 'продать бизнес', 'купить планету',
-                      'собрать плазму', 'начать инвестицию', 'завершить инвестицию',
-                      'продать биткоин', 'купить видеокарту', 'улучшить видеокарты',
-                      'собрать биткоины']:
-            await handle_complex_command(msg, arg_cmd, parts[2:])
-            return
-
-    elif cmd == 'купить планету' and args:
-        planet_id = int(args[0]) if args[0].isdigit() else 0
-        if 1 <= planet_id <= len(PLANETS):
-            success, message = await buy_planet(uid, planet_id)
-            await msg.reply(message, parse_mode="HTML")
-        else:
-            await msg.reply("❌ Неверный ID планеты")
-    
-    elif cmd == 'собрать плазму' and args:
-        planet_id = int(args[0]) if args[0].isdigit() else 0
-        if 1 <= planet_id <= len(PLANETS):
-            success, amount = await collect_planet_plasma(uid, planet_id)
-            if success:
-                await msg.reply(f"✅ Плазма собрана: {amount} единиц", parse_mode="HTML")
-            else:
-                await msg.reply(f"❌ {amount}", parse_mode="HTML")
-        else:
-            await msg.reply("❌ Неверный ID планеты")
-    
-    elif cmd in ['инвестировать', 'начать инвестицию'] and len(args) >= 1:
-        await show_investments_panel(msg=msg)
-        return
-    
-    elif cmd == 'завершить инвестицию' and args:
-        try:
-            investment_db_id = int(args[0])
-            success, message = await complete_investment(uid, investment_db_id)
-            await msg.reply(message, parse_mode="HTML")
-        except:
-            await msg.reply("❌ Неверный формат команды. Используйте: завершить инвестицию [id]")
-    
-    elif cmd == 'продать биткоин' and args:
-        try:
-            if args[0].lower() == 'все':
-                amount = None  # Продать все
-            else:
-                amount = float(args[0])
-        
-            success, btc_sold, usd_received = await sell_bitcoin(uid, amount)
-            if success:
-                user = await get_user(uid)  # Получаем обновленные данные
-                await msg.reply(
-                f"✅ <b>БИТКОИНЫ ПРОДАНЫ!</b>\n\n"
-                f"💰 <b>Продано:</b> {btc_sold:.8f} BTC\n"
-                f"💵 <b>Получено:</b> {format_money(usd_received)}$\n"
-                f"📊 <b>Осталось BTC:</b> {user['bitcoin']:.8f}\n"
-                f"💳 <b>Новый баланс:</b> {format_money(user['balance'])}",
-                parse_mode="HTML"
-            )
-            else:
-                await msg.reply(f"❌ {usd_received}", parse_mode="HTML")
-        except:
-            await msg.reply("❌ Неверный формат команды. Используйте: продать биткоин [количество] или продать биткоин все")
 
 # ========== ОСНОВНЫЕ ФУНКЦИИ ==========
-async def send_welcome_message(msg: Message):
+async def check_user_has_country(uid: int) -> bool:
+    """Проверяет, есть ли у пользователя своя страна"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT id FROM countries WHERE owner_user_id = ?", (uid,))
+            row = await cursor.fetchone()
+            return row is not None
+    except Exception as e:
+        logger.error(f"Ошибка проверки страны пользователя {uid}: {e}")
+        return False
+
+async def get_taken_country_names() -> set:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT name FROM countries WHERE owner_user_id IS NOT NULL"
+            )
+            rows = await cursor.fetchall()
+            return {row[0] for row in rows if row and row[0]}
+    except Exception as e:
+        logger.error(f"Error loading taken country names: {e}")
+        return set()
+
+async def build_start_country_selection(uid: int, username: str):
+    line1 = "\u0412\u042b\u0411\u041e\u0420 \u0421\u0422\u0410\u0420\u0422\u041e\u0412\u041e\u0419 \u0421\u0422\u0420\u0410\u041d\u042b"
+    line3 = "\u041a\u0430\u0436\u0434\u0430\u044f \u0441\u0442\u0440\u0430\u043d\u0430 \u0438\u043c\u0435\u0435\u0442 \u0443\u043d\u0438\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u0431\u043e\u043d\u0443\u0441\u044b, \u043a\u043e\u0442\u043e\u0440\u044b\u0435 \u043f\u043e\u0432\u043b\u0438\u044f\u044e\u0442 \u043d\u0430 \u0432\u0430\u0448\u0435 \u0440\u0430\u0437\u0432\u0438\u0442\u0438\u0435!"
+    line4 = "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0441\u0442\u0440\u0430\u043d\u0443, \u043a\u043e\u0442\u043e\u0440\u0430\u044f \u0441\u0442\u0430\u043d\u0435\u0442 \u0432\u0430\u0448\u0438\u043c \u0434\u043e\u043c\u043e\u043c \u0438 \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u043e\u043c \u0441\u0438\u043b\u044b:"
+    text = (
+        f"\U0001F3F0 {line1}\n\n"
+        f"\u041f\u0440\u0438\u0432\u0435\u0442, {username}!\n\n"
+        f"\U0001F30D {line3}\n\n"
+        f"{line4}\n"
+    )
+
+    kb_buttons = []
+    countries_list = START_COUNTRIES.copy()
+
+    # Добавляем особую страну для создателя
+    if uid == CREATOR_ID:
+        countries_list.append(CREATOR_COUNTRY)
+    taken_names = await get_taken_country_names()
+    countries_list = [c for c in countries_list if c.get("name") not in taken_names]
+
+    if not countries_list:
+        return None, None
+
+    for country in countries_list:
+        kb_buttons.append([
+            InlineKeyboardButton(
+                text=f"{country['name']} - {country['description']}",
+                callback_data=f"select_country_{country['code']}"
+            )
+        ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    return text, kb
+
+async def show_country_selection(msg: Message):
+    uid = msg.from_user.id
+    username = msg.from_user.username or msg.from_user.first_name
+    text, kb = await build_start_country_selection(uid, username)
+    if not text:
+        await msg.answer("??? ????????? ?????? ??? ??????. ?????????? ?????.")
+        return
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+async def create_user_country(uid: int, country_code: str):
+    """Создает страну для пользователя на основе выбранного кода"""
+    try:
+        # Находим страну в конфиге
+        selected_country = None
+        if uid == CREATOR_ID and country_code == 'sigma_empire':
+            selected_country = CREATOR_COUNTRY
+        else:
+            for country in START_COUNTRIES:
+                if country['code'] == country_code:
+                    selected_country = country
+                    break
+        
+        if not selected_country:
+            return False
+        
+        # Генерируем начальные параметры
+        population = random.randint(80_000, 150_000)
+        stability = random.randint(55, 75)
+        literacy = random.randint(40, 60)
+        crime = random.randint(20, 35)
+        happiness = random.randint(45, 65)
+        
+        # Применяем бонусы
+        if selected_country['bonus_type'] == 'stability':
+            stability += selected_country['bonus_value']
+        elif selected_country['bonus_type'] == 'happiness':
+            happiness += selected_country['bonus_value']
+        elif selected_country['bonus_type'] == 'literacy':
+            literacy += selected_country['bonus_value']
+        elif selected_country['bonus_type'] == 'crime':
+            crime += selected_country['bonus_value']
+        elif selected_country['bonus_type'] == 'creator_bonuses':
+            stability += selected_country['bonus_value']['stability']
+            happiness += selected_country['bonus_value']['happiness']
+        
+        # Ограничиваем значения
+        stability = min(100, max(0, stability))
+        literacy = min(100, max(0, literacy))
+        crime = min(100, max(0, crime))
+        happiness = min(100, max(0, happiness))
+        
+        treasury = 1_000_000  # Базовая казна
+        if selected_country['bonus_type'] == 'start_treasury':
+            treasury = int(treasury * (1 + selected_country['bonus_value']))
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT 1 FROM countries WHERE name = ? AND owner_user_id IS NOT NULL",
+                (selected_country["name"],)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                return False
+            
+            # Создаем страну
+            cursor = await db.execute("""
+                INSERT INTO countries (name, owner_user_id, level, treasury, stability, tax_rate, last_tick, 
+                                     population, literacy, crime, happiness)
+                VALUES (?, ?, 1, ?, ?, 0.10, ?, ?, ?, ?, ?)
+            """, (selected_country['name'], uid, treasury, stability, int(time.time()), 
+                  population, literacy, crime, happiness))
+            
+            country_id = cursor.lastrowid
+            
+            # Создаем стартовые здания
+            await db.execute("""
+                INSERT INTO country_buildings (country_id, building_type, level) VALUES
+                (?, 'parks', 1),
+                (?, 'school', 1), 
+                (?, 'police', 1),
+                (?, 'barracks', 1)
+            """, (country_id, country_id, country_id, country_id))
+            
+            await db.commit()
+            
+            logger.info(f"✅ Создана страна {selected_country['name']} для пользователя {uid}")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Ошибка создания страны для {uid}: {e}")
+        return False
+
+def split_long_message(text: str, max_len: int = 3500):
+    if len(text) <= max_len:
+        return [text]
+    parts = text.split('\n\n')
+    chunks = []
+    current = ''
+    for part in parts:
+        candidate = part if not current else current + '\n\n' + part
+        if len(candidate) <= max_len:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        if len(part) <= max_len:
+            current = part
+        else:
+            # hard split if a single paragraph is too long
+            for i in range(0, len(part), max_len):
+                chunks.append(part[i:i + max_len])
+            current = ''
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def format_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "менее минуты"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours and minutes:
+        return f"{hours}ч {minutes}м"
+    if hours:
+        return f"{hours}ч"
+    if minutes:
+        return f"{minutes}м"
+    return "менее минуты"
+
+
+def format_timestamp(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+
+async def send_welcome_message(msg: Message, force_menu: bool = False, edit: bool = False):
     """Приветственное сообщение"""
     user = await get_user(msg.from_user.id)
     username = msg.from_user.username or msg.from_user.first_name
     
+    # Проверяем, выбрал ли пользователь страну
+    has_country = await check_user_has_country(msg.from_user.id)
+    
+    if not has_country and not force_menu:
+        await show_country_selection(msg)
+        return
+    
     welcome_text = f"""
-🎌 <b>ДОБРО ПОЖАЛОВАТЬ В MURASAKI EMPIRE, {username}!</b>
+
+👋 <b>Добро пожаловать в MURASAKI EMPIRE, {username}!</b>
+
+Murasaki — Lord of Empires 🗿
+
+Добро пожаловать в стратегическую RPG-игру в Telegram.
+
+Ты начинаешь с нуля и со временем становишься правителем, полководцем и архитектором собственной империи.
+
+🌍 Государства и власть
+
+— В начале ты выбираешь страну и становишься её владельцем
+— У каждой страны есть население и армия
+— Население растёт со временем, часть людей можно мобилизовать
+— Ты управляешь:
+• экономикой
+• налогами
+• стабильностью
+• преступностью
+• грамотностью
+
+— Страну можно развивать зданиями:
+школы, больницы, парки, полиция, казармы, АЭС, космическая станция и другие
+
+💼 Экономика и бизнес
+
+— Покупай и улучшай бизнесы внутри страны
+— Бизнесы дают рабочие места и усиливают доход государства
+— Экономика — основа силы, без неё война невозможна
+
+💰 Заработок
+
+— Работа — активный заработок с кулдауном
+— Ежедневный бонус — серия входа 30 дней с умеренной прибылью
+— Пассивный доход — страны и бизнесы копят прибыль
+
+🎰 Казино
+
+Казино — это риск.
+Здесь можно как выиграть, так и потерять деньги.
+Азарт влияет на баланс и судьбу империи.
+
+👥 Кланы
+
+— Создавай кланы, приглашай игроков
+— Общая казна и логи операций
+— Совместные рейды и боссы
+— Кланы — путь к доминированию
+
+🐉 Боссы и рейды
+
+— Клановые боссы атакуются военной силой стран
+— Награды:
+• деньги
+• плазма
+• плутоний
+• уникальные предметы
+
+— Финальный враг мира —
+Жирный Сигма Ярик 😈
+
+⚔️ Войны между странами
+
+— Покупай оружие и технику (танки, бронетехника и др.)
+— Войны идут раундами
+— Есть потери армии, техники и контрибуция
+— Победа требует стратегии, а не кликов
+
+🎁 Уникальные предметы
+
+— Выпадают с боссов и редких событий
+— Не покупаются
+— Дают бонусы к войнам и рейдам
+— Включают легендарные артефакты Сигмы Ярика
+
+🌌 Космос (эндгейм)
+
+— После космостанции открываются экспедиции
+— Открытия, риск, аномалии и колонии на других планетах
+— Космос даёт:
+• плазму
+• плутоний
+• технологии
+• престижь
+
+Это путь для сильнейших.
+
+💳 Кредиты
+
+— Можно брать кредиты у игроков
+— Или у Сигмы (жёсткие условия)
+— Не вернул — будут последствия
+
+📌 Напиши хелп, чтобы увидеть доступные команды
+📌 Игра развивается — мир Murasaki живёт и меняется
+
+Murasaki — Lord of Empires
+Здесь создаются империи.
+
 
 💰 <b>Ваш баланс:</b> {format_money(user['balance'])}
 ⚡ <b>Плазма:</b> {user['plasma']}
@@ -3164,47 +5127,52 @@ async def send_welcome_message(msg: Message):
 
 ✨ <b>Основные системы:</b>
 
-🏢 <b>БИЗНЕСЫ</b> - Покупайте бизнесы и получайте прибыль!
-• <code>бизнесы</code> - список бизнесов
-• <code>мой бизнес</code> - ваши бизнесы (с кнопками)
-• <code>купить бизнес [id]</code> - купить бизнес
-• <code>улучшить бизнес [id]</code> - улучшить бизнес
-• <code>пополнить бизнес [id]</code> - пополнить продукты
-• <code>собрать бизнес [id]</code> - собрать прибыль
-• <code>продать бизнес [id]</code> - продать государству
+💼 <b>БИЗНЕСЫ СТРАНЫ</b> - развивайте экономику внутри страны
+- <code>страна</code> - ваша страна
+• В стране: Экономика → Бизнесы
 
 🪐 <b>ПЛАНЕТЫ</b> - Колонизируйте планеты и собирайте плазму!
-• <code>планеты</code> - список планет
-• <code>купить планету [id]</code> - купить планету
-• <code>собрать плазму [id]</code> - собрать плазму
+- <code>планеты</code> - список планет
+- <code>купить планету [id]</code> - купить планету
+- <code>собрать плазму [id]</code> - собрать плазму
 
 ⛏️ <b>МАЙНИНГ</b> - Майните биткоины и продавайте их!
-• <code>майнинг</code> - информация о майнинге
-• <code>купить видеокарту</code> - купить видеокарту
-• <code>улучшить видеокарты</code> - улучшить все видеокарты
-• <code>забрать биткоины</code> - забрать намайненые BTC
-• <code>продать биткоин [кол-во]</code> - продать BTC
+- <code>майнинг</code> - информация о майнинге
+- <code>купить видеокарту</code> - купить видеокарту
+- <code>улучшить видеокарты</code> - улучшить все видеокарты
+- <code>забрать биткоины</code> - забрать намайненые BTC
+- <code>продать биткоин [кол-во]</code> - продать BTC
 
 💼 <b>ИНВЕСТИЦИИ</b> - Инвестируйте и получайте прибыль!
-• <code>инвестиции</code> - список инвестиций
-• <code>начать инвестицию [id]</code> - начать инвестицию (с кнопками)
-• <code>начать инвестицию [id] [сумма]</code> - начать инвестицию
-• <code>завершить инвестицию [id]</code> - завершить инвестицию
+- <code>инвестиции</code> - список инвестиций
+- <code>начать инвестицию [id]</code> - начать инвестицию (с кнопками)
+- <code>начать инвестицию [id] [сумма]</code> - начать инвестицию
+- <code>завершить инвестицию [id]</code> - завершить инвестицию
 
 🎰 <b>КАЗИНО И ИГРЫ:</b>
-• <code>монетка [ставка]</code> - игра в монетку
-• <code>кости [ставка]</code> - игра в кости
-• <code>слоты [ставка]</code> - игровые автоматы
-• <code>рулетка [ставка] [тип]</code> - рулетка
-• <code>блекджек [ставка]</code> - игра в блэкджек
+- <code>монетка [ставка]</code> - игра в монетку
+- <code>кости [ставка]</code> - игра в кости
+- <code>слоты [ставка]</code> - игровые автоматы
+- <code>рулетка [ставка] [тип]</code> - рулетка
+- <code>блекджек [ставка]</code> - игра в блэкджек
+
+🌍 <b>СТРАНЫ И КЛАНЫ:</b>
+- <code>страны</code> - список стран
+- <code>моя страна</code> - управление вашей страной
+- <code>кланы</code> - список кланов
+- <code>мой клан</code> - управление вашим кланом
+
+⚔️ <b>ВОЙНЫ И БОССЫ:</b>
+- <code>войны</code> - текущие войны
+- <code>боссы</code> - рейды на боссов
 
 🎮 <b>ОСНОВНЫЕ КОМАНДЫ:</b>
-• <code>бонус</code> - получить бонус (5-20М каждый час)
-• <code>работа</code> - выполнить работу (1-5М каждые 30 сек)
-• <code>стартбонус</code> - получить стартовый бонус 10М
-• <code>профиль</code> - ваша статистика
-• <code>рефералы</code> - пригласить друзей
-• <code>топ</code> - топ игроков
+- <code>бонус</code> - получить бонус (200k-1.5MМ каждый час)
+- <code>работа</code> - выполнить работу (1-5М каждые 30 сек)
+- <code>стартбонус</code> - получить стартовый бонус 10М
+- <code>профиль</code> - ваша статистика
+- <code>рефералы</code> - пригласить друзей
+- <code>топ</code> - топ игроков
 
 🔗 <b>Ваша реферальная ссылка:</b>
 <code>https://t.me/{(await msg.bot.get_me()).username}?start={user['referral_code']}</code>
@@ -3213,95 +5181,94 @@ async def send_welcome_message(msg: Message):
 """
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏢 Мои бизнесы", callback_data="show_my_businesses"),
-         InlineKeyboardButton(text="🪐 Планеты", callback_data="show_planets")],
+        [InlineKeyboardButton(text="🪐 Планеты", callback_data="show_planets")],
         [InlineKeyboardButton(text="⛏️ Майнинг", callback_data="show_mining"),
          InlineKeyboardButton(text="💼 Инвестиции", callback_data="show_investments")],
         [InlineKeyboardButton(text="🎁 Бонус", callback_data="get_bonus"),
          InlineKeyboardButton(text="💼 Работа", callback_data="get_work")],
         [InlineKeyboardButton(text="📊 Профиль", callback_data="show_profile"),
-         InlineKeyboardButton(text="🏆 Топ", callback_data="show_top")]
+         InlineKeyboardButton(text="🏆 Топ", callback_data="show_top")],
+        [InlineKeyboardButton(text="🌍 Страны", callback_data="show_countries"),
+         InlineKeyboardButton(text="👥 Кланы", callback_data="show_clans")],
+        [InlineKeyboardButton(text="⚔️ Войны", callback_data="show_wars"),
+         InlineKeyboardButton(text="🐉 Боссы", callback_data="show_bosses")],
+        [InlineKeyboardButton(text="🛒 Военный магазин", callback_data="show_weapons_shop")]
     ])
     
-    await msg.answer(welcome_text, parse_mode="HTML", reply_markup=kb)
+    chunks = split_long_message(welcome_text)
+
+    
+    if edit:
+
+    
+        try:
+
+    
+            await msg.edit_text(chunks[0], parse_mode="HTML", reply_markup=kb)
+
+    
+        except Exception:
+
+    
+            await msg.answer(chunks[0], parse_mode="HTML", reply_markup=kb)
+
+    
+    else:
+
+    
+        await msg.answer(chunks[0], parse_mode="HTML", reply_markup=kb)
+
+    
+    for chunk in chunks[1:]:
+
+    
+        await msg.answer(chunk, parse_mode="HTML")
 
 async def process_bonus(msg: Message):
-    """Обработка команды бонус - ВЫДАЕТ бонус"""
+    """Handle bonus command"""
     uid = msg.from_user.id
-    now = int(time.time())
 
-    # Получаем данные пользователя
-    user = await get_user(uid)
-    if not user:
-        await msg.reply("❌ Пользователь не найден в базе данных!")
-        return
-    
-    # Инициализируем поля, если их нет
-    last_bonus = user.get('bonus_time', 0) or 0
-    total_bonus = user.get('total_bonus', 0) or 0
-    current_balance = user.get('balance', 0)
+    can_get_bonus, remaining, bonus_data = await check_bonus_cooldown(uid)
 
-    # Проверяем, можно ли получить бонус (1 час кулдаун)
-    time_passed = now - last_bonus
-    remaining = 1800 - time_passed  # 1 час = 3600 секунд
-    
-    # Если время еще не прошло - показываем ко-даун
-    if remaining > 0 and last_bonus != 0:
-        minutes = remaining // 60
-        seconds = remaining % 60
-        progress_percent = int(time_passed / 1800 * 100)
+    if not can_get_bonus:
+        minutes = int(remaining // 60)
+        seconds = int(remaining % 60)
+        progress_percent = int((BONUS_COOLDOWN - remaining) / BONUS_COOLDOWN * 100)
         progress_bar = create_progress_bar(progress_percent)
-        
-        next_time = now + remaining
+
+        next_time = time.time() + remaining
         next_str = time.strftime('%H:%M:%S', time.localtime(next_time))
-        
+
         await msg.reply(
-            f"⏳ <b>Бонус уже получен!</b>\n\n"
-            f"⏰ <b>Следующий бонус через:</b>\n"
-            f"{minutes} минут {seconds} секунд\n\n"
+            f"❌ <b>Бонус еще не готов!</b>\n\n"
+            f"⏳ <b>Следующий бонус через:</b>\n"
+            f"{minutes} мин {seconds} сек\n\n"
             f"{progress_bar} {progress_percent}%\n\n"
-            f"🕐 <b>Доступен с:</b> {next_str}\n"
-            f"💰 <b>Всего получено бонусов:</b> {total_bonus:,}",
+            f"🕒 <b>Доступен в:</b> {next_str}\n"
+            f"💵 <b>Всего бонусов:</b> {bonus_data.get('total_bonus', 0):,}",
             parse_mode="HTML"
         )
         return
 
-    # ========== ВЫДАЕМ БОНУС ==========
-    bonus_amount = random.randint(5_000_000, 20_000_000)
-    
-    # 1. Начисляем баланс
-    await change_balance(uid, bonus_amount)
-    
-    # 2. Обновляем информацию о бонусе
-    total_bonus += bonus_amount
-    
-    # Обновляем время бонуса и общую сумму
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET bonus_time = ?, total_bonus = ? WHERE id = ?",
-            (now, total_bonus, uid)
-        )
-        await db.commit()
-    
-    # 3. Получаем обновленный баланс
-    updated_user = await get_user(uid)
-    new_balance = updated_user.get('balance', current_balance + bonus_amount)
+    amount, success = await give_bonus(uid)
+    if not success:
+        await msg.reply("? ?????? ????????? ??????", parse_mode="HTML")
+        return
 
-    # 4. Формируем сообщение об успешной выдаче
-    progress_bar = create_progress_bar(0)
-    next_str = time.strftime('%H:%M:%S', time.localtime(now + 3600))
+    await add_referral_action(uid)
+
+    updated_user = await get_user(uid)
+    next_time = time.time() + BONUS_COOLDOWN
+    next_str = time.strftime('%H:%M:%S', time.localtime(next_time))
 
     await msg.reply(
-        f"💎 <b>БОНУС ПОЛУЧЕН!</b> 💎\n\n"
-        f"⭐️ <b>БОЛЬШОЙ БОНУС!</b>\n\n"
-        f"💰 <b>Сумма:</b> {bonus_amount:,}\n"
-        f"📊 <b>Новый баланс:</b> {new_balance:,}\n\n"
-        f"⏰ <b>Следующий бонус через 30 минут:</b>\n"
-        f"🕐 {next_str}\n\n"
-        f"{progress_bar} 0%\n\n"
-        f"🏦 <b>Всего получено:</b> {total_bonus:,}",
+        f"🎁 <b>Бонус получен!</b>\n\n"
+        f"💵 <b>Сумма:</b> {amount:,}\n"
+        f"💳 <b>Баланс:</b> {updated_user.get('balance', 0):,}\n\n"
+        f"⏱ <b>Следующий бонус:</b> {next_str}",
         parse_mode="HTML"
     )
+
 
 async def check_bonus_cd(msg: Message):
     """Проверить оставшееся время до бонуса"""
@@ -3312,13 +5279,13 @@ async def check_bonus_cd(msg: Message):
         await msg.reply(
             "🎁 <b>Бонус доступен прямо сейчас!</b>\n\n"
             f"💰 Всего получено: <code>{bonus_data.get('total_bonus', 0):,}</code>\n"
-            f"✨ <b>Следующий бонус:</b> 5-20 миллионов",
+            f"✨ <b>Следующий бонус:</b> 200k-1.5M миллионов",
             parse_mode="HTML"
         )
     else:
         minutes = int(remaining // 60)
         seconds = int(remaining % 60)
-        progress_percent = int((3600 - remaining) / 3600 * 100)
+        progress_percent = int((BONUS_COOLDOWN - remaining) / BONUS_COOLDOWN * 100)
         progress_bar = create_progress_bar(progress_percent)
         
         next_time = time.time() + remaining
@@ -3330,7 +5297,7 @@ async def check_bonus_cd(msg: Message):
             f"{progress_bar} {progress_percent}%\n\n"
             f"🕐 <b>Будет доступен в:</b> {next_str}\n\n"
             f"💰 Всего получено: <code>{bonus_data.get('total_bonus', 0):,}</code>\n"
-            f"🎯 <b>Следующий бонус:</b> 5-20 миллионов",
+            f"🎯 <b>Следующий бонус:</b> 200k-1.5M миллионов",
             parse_mode="HTML"
         )
 
@@ -3361,6 +5328,8 @@ async def process_work(msg: Message):
         return
     
     amount, success = await give_work_reward(uid)
+    if success:
+        await add_referral_action(uid)
     
     if not success:
         user_data = await get_user(uid)
@@ -3372,6 +5341,7 @@ async def process_work(msg: Message):
         )
         return
     
+# Получаем СВЕЖИЕ данные без кэша
     updated_user = await get_user(uid)
     next_time = time.time() + WORK_COOLDOWN
     next_str = time.strftime('%H:%M:%S', time.localtime(next_time))
@@ -3407,7 +5377,7 @@ async def process_work(msg: Message):
         f"{salary_level}\n\n"
         f"💰 <b>Зарплата:</b> <code>{amount:,}</code>\n"
         f"📊 <b>Новый баланс:</b> <code>{updated_user.get('balance', 0):,}</code>\n\n"
-        f"⏰ <b>Следующая работа через 30 секунд:</b>\n"
+        f"⏰ <b>Следующая работа через 30 минут:</b>\n"
         f"🕐 {next_str}\n\n"
         f"{progress_bar} 0%\n\n"
         f"🏢 <b>Всего заработано:</b> <code>{updated_user.get('total_work', 0):,}</code>",
@@ -3427,7 +5397,7 @@ async def process_start_bonus(msg: Message):
             f"💰 <b>Сумма:</b> <code>{result:,}</code>\n"
             f"📊 <b>Новый баланс:</b> <code>{new_balance:,}</code>\n\n"
             f"✨ Теперь вы можете:\n"
-            f"• Написать <code>бонус</code> для получения 5-20М\n"
+            f"• Написать <code>бонус</code> для получения 200k-1.5MМ\n"
             f"• Написать <code>работа</code> для заработка 1-5М\n"
             f"• Написать <code>рефералы</code> для приглашения друзей\n\n"
             f"🎯 <b>Удачи в Murasaki Empire!</b>",
@@ -3447,9 +5417,9 @@ async def process_balance(msg: Message):
     await msg.reply(f"💰 Баланс: <code>{user['balance']:,}</code>", parse_mode="HTML")
 
 async def process_profile(msg: Message):
-    """Обработка команды профиль"""
-    user = await get_user(msg.from_user.id)
-    username = msg.from_user.username or msg.from_user.first_name
+    """????????? ??????? ???????"""
+    # Reuse the existing profile renderer to send a message in chat.
+    await profile_cmd(msg)
 
 async def view_user_profile(msg: Message, user_id: int, is_from_top: bool = False):
     """Показать профиль другого пользователя"""
@@ -3477,7 +5447,7 @@ async def view_user_profile(msg: Message, user_id: int, is_from_top: bool = Fals
 📊 Винрейт: {win_rate:.1f}%
 
 👥 <b>Социальные показатели:</b>
-🏢 Бизнесов: {len(await get_user_businesses(user_id))}
+🏢 Бизнесов страны: {await count_user_country_businesses(user_id)}
 🪐 Планет: {len(await get_user_planets(user_id))}
 ⛏️ Видеокарт: {user['mining_gpu_count']} (ур. {user['mining_gpu_level']})
 👥 Рефералов: {user.get('referral_count', 0)}
@@ -3516,14 +5486,14 @@ async def view_user_profile(msg: Message, user_id: int, is_from_top: bool = Fals
     else:
         minutes = int(remaining_bonus // 60)
         seconds = int(remaining_bonus % 60)
-        progress_percent = int((3600 - remaining_bonus) / 3600 * 100)
+        progress_percent = int((BONUS_COOLDOWN - remaining_bonus) / BONUS_COOLDOWN * 100)
         bonus_bar = create_progress_bar(progress_percent)
         bonus_status = f"⏳ <b>Через:</b> {minutes}м {seconds}с"
         bonus_time = f"{bonus_bar} {progress_percent}%"
     
     if can_work:
         work_status = "✅ <b>Доступна сейчас!</b>"
-        work_time = "Следующая через 30 секунд"
+        work_time = "Следующая через 30 минут"
         work_bar = ""
     else:
         seconds = int(remaining_work)
@@ -3554,7 +5524,7 @@ async def view_user_profile(msg: Message, user_id: int, is_from_top: bool = Fals
         f"💀 Поражений: {user['losses']}\n"
         f"📊 Винрейт: {win_rate:.1f}%\n"
         f"{start_bonus_info}\n\n"
-        f"🎁 <b>Ежечасный бонус (5-20М):</b>\n"
+        f"🎁 <b>Ежечасный бонус (200k-1.5MМ):</b>\n"
         f"• Статус: {bonus_status}\n"
         f"• {bonus_time}\n"
         f"• Всего получено: {user.get('total_bonus', 0):,}\n\n"
@@ -3624,10 +5594,10 @@ async def process_top(msg: Message, user_id: int = None):
                 "🏆 <b>ТОП-10 БОГАЧЕЙ MURASAKI EMPIRE</b>\n\n"
                 "📭 В топе пока никого нет!\n\n"
                 "💡 Стань первым! Зарабатывайте:\n"
-                "• <code>бонус</code> - 5-20М каждый час\n"
-                "• <code>работа</code> - 1-5М каждые 30 сек\n"
-                "• <code>бизнесы</code> - покупайте и получайте прибыль\n"
-                "• <code>инвестиции</code> - вкладывайте и получайте доход",
+                "- <code>бонус</code> - 200k-1.5MМ каждый час\n"
+                "- <code>работа</code> - 1-5М каждые 30 сек\n"
+                "- <code>страна</code> - развивайте экономику страны\n"
+                "- <code>инвестиции</code> - вкладывайте и получайте доход",
                 parse_mode="HTML"
             )
             return
@@ -3735,27 +5705,6 @@ async def check_work_cd(msg: Message):
             parse_mode="HTML"
         )
 
-async def show_businesses(msg: Message):
-    """Показать список бизнесов"""
-    businesses_list = "<b>🏢 СПИСОК БИЗНЕСОВ</b>\n\n"
-    
-    for biz_id, biz in BUSINESSES.items():
-        businesses_list += f"<b>{biz_id}. {biz['name']}</b>\n"
-        businesses_list += f"   💰 Цена: {format_money(biz['price'])}\n"
-        businesses_list += f"   💵 Прибыль/час: {format_money(biz['profit_per_hour'])}\n"
-        businesses_list += f"   ⚡ Продукты: {biz['product_name']} (емкость: {biz['product_capacity']})\n"
-        businesses_list += f"   🔄 Пополнение: {format_money(biz['product_refill_cost'])}\n"
-        businesses_list += f"   📈 Уровней: {biz['max_level']}\n\n"
-    
-    businesses_list += "<b>📋 КОМАНДЫ:</b>\n"
-    businesses_list += "• <code>купить бизнес [id]</code> - купить бизнес\n"
-    businesses_list += "• <code>улучшить бизнес [id]</code> - улучшить бизнес\n"
-    businesses_list += "• <code>пополнить бизнес [id]</code> - пополнить продукты\n"
-    businesses_list += "• <code>собрать бизнес [id]</code> - собрать прибыль\n"
-    businesses_list += "• <code>продать бизнес [id]</code> - продать государству\n"
-    
-    await msg.reply(businesses_list, parse_mode="HTML")
-
 async def show_planets(msg: Message):
     """Показать список планет"""
     planets_list = "<b>🪐 СПИСОК ПЛАНЕТ</b>\n\n"
@@ -3770,8 +5719,8 @@ async def show_planets(msg: Message):
         planets_list += f"   🔋 Генерация: {planet['plasma_per_hour']} плазмы/час\n\n"
     
     planets_list += "<b>📋 КОМАНДЫ:</b>\n"
-    planets_list += "• <code>купить планету [id]</code> - купить планету\n"
-    planets_list += "• <code>собрать плазму [id]</code> - собрать плазму\n"
+    planets_list += "- <code>купить планету [id]</code> - купить планету\n"
+    planets_list += "- <code>собрать плазму [id]</code> - собрать плазму\n"
     
     await msg.reply(planets_list, parse_mode="HTML")
 
@@ -3818,11 +5767,11 @@ async def show_mining_info(msg: Message):
     mining_info += f"""
 
 📋 <b>КОМАНДЫ:</b>
-• <code>купить видеокарту</code> - купить видеокарту ({format_money(BitcoinMining.get_gpu_price(user['mining_gpu_level']))})
-• <code>улучшить видеокарты</code> - улучшить все видеокарты
-• <code>забрать биткоины</code> - забрать намайненые BTC
-• <code>продать биткоин [кол-во]</code> - продать BTC
-• <code>продать биткоин все</code> - продать все BTC
+- <code>купить видеокарту</code> - купить видеокарту ({format_money(BitcoinMining.get_gpu_price(user['mining_gpu_level']))})
+- <code>улучшить видеокарты</code> - улучшить все видеокарты
+- <code>забрать биткоины</code> - забрать намайненые BTC
+- <code>продать биткоин [кол-во]</code> - продать BTC
+- <code>продать биткоин все</code> - продать все BTC
 """
     
     await msg.reply(mining_info, parse_mode="HTML")
@@ -3840,8 +5789,8 @@ async def show_investments(msg: Message):
         investments_list += f"   💵 Прибыль: +{int((inv['profit_multiplier'] - 1) * 100)}%\n\n"
     
     investments_list += "<b>📋 КОМАНДЫ:</b>\n"
-    investments_list += "• <code>начать инвестицию [id] [сумма]</code> - начать инвестицию\n"
-    investments_list += "• <code>завершить инвестицию [id]</code> - завершить инвестицию\n"
+    investments_list += "- <code>начать инвестицию [id] [сумма]</code> - начать инвестицию\n"
+    investments_list += "- <code>завершить инвестицию [id]</code> - завершить инвестицию\n"
     
     await msg.reply(investments_list, parse_mode="HTML")
 
@@ -3875,6 +5824,13 @@ async def process_coin(msg: Message, parts: list):
     if bet > user['balance']:
         await msg.reply(f"❌ Не хватает денег. Баланс: {user['balance']:,}", parse_mode="HTML")
         return
+    
+    # Проверка дневного лимита ставок
+    can_wager, error_msg = await check_daily_wager_limit(msg.from_user.id, bet)
+    if not can_wager:
+        await msg.reply(error_msg, parse_mode="HTML")
+        return
+    
     await update_game_cooldown(msg.from_user.id, "coin")
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3919,10 +5875,19 @@ async def process_dice(msg: Message, parts: list):
         await msg.reply(f"❌ Не хватает денег. Баланс: {user['balance']:,}", parse_mode="HTML")
         return
     
+
+    can_wager, error_msg = await check_daily_wager_limit(msg.from_user.id, bet)
+    if not can_wager:
+        await msg.reply(error_msg, parse_mode="HTML")
+        return
+
     success = await change_balance(msg.from_user.id, -bet)
     if not success:
         await msg.reply("❌ Ошибка при списании средств")
         return
+    
+    # Обновляем дневной счетчик ставок
+    await update_daily_wager(msg.from_user.id, bet)
     
     loading_msg = await msg.reply("🎲 Бросаем кости...")
     await asyncio.sleep(1.5)
@@ -3979,27 +5944,36 @@ async def process_slots(msg: Message, parts: list):
         await msg.reply(f"❌ Не хватает денег. Баланс: {user['balance']:,}", parse_mode="HTML")
         return
     
+    # Проверка дневного лимита ставок
+    can_wager, error_msg = await check_daily_wager_limit(msg.from_user.id, bet)
+    if not can_wager:
+        await msg.reply(error_msg, parse_mode="HTML")
+        return
+    
     success = await change_balance(msg.from_user.id, -bet)
     if not success:
         await msg.reply("❌ Ошибка при списании средств")
         return
     
+    # Обновляем дневной счетчик ставок
+    await update_daily_wager(msg.from_user.id, bet)
+    
     symbols = ["🍒", "🔔", "💎", "7️⃣", "🍋", "⭐"]
     loading_msg = await msg.reply("🎰 <b>Крутим слоты...</b>\n┃ 🎰 ┃ 🎰 ┃ 🎰 ┃", parse_mode="HTML")
     
+    for i in range(2):
+        slot1 = random.choice(symbols)
+        slot2 = random.choice(symbols)
+        slot3 = random.choice(symbols)
+        await loading_msg.edit_text(f"🎰 <b>Крутим слоты...</b>\n┃ {slot1} ┃ {slot2} ┃ {slot3} ┃", parse_mode="HTML")
+        await asyncio.sleep(0.05)
+
     for i in range(3):
         slot1 = random.choice(symbols)
         slot2 = random.choice(symbols)
         slot3 = random.choice(symbols)
         await loading_msg.edit_text(f"🎰 <b>Крутим слоты...</b>\n┃ {slot1} ┃ {slot2} ┃ {slot3} ┃", parse_mode="HTML")
-        await asyncio.sleep(0.1)
-    
-    for i in range(4):
-        slot1 = random.choice(symbols)
-        slot2 = random.choice(symbols)
-        slot3 = random.choice(symbols)
-        await loading_msg.edit_text(f"🎰 <b>Крутим слоты...</b>\n┃ {slot1} ┃ {slot2} ┃ {slot3} ┃", parse_mode="HTML")
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
     
     result = [random.choice(symbols) for _ in range(3)]
     
@@ -4029,6 +6003,20 @@ async def process_slots(msg: Message, parts: list):
     
     await loading_msg.edit_text(text, parse_mode="HTML")
 
+def extract_text_command_parts(text, aliases):
+    """Return parts if the first word matches one of the aliases."""
+    if not text:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    parts = stripped.split()
+    if not parts:
+        return None
+    if parts[0].lower() in aliases:
+        return parts
+    return None
+
 async def process_roulette(msg: Message, parts: list):
     """Обработка команды рулетка"""
     if len(parts) < 3:
@@ -4037,14 +6025,14 @@ async def process_roulette(msg: Message, parts: list):
             "🎯 <b>Формат:</b> <code>рулетка [ставка] [тип]</code>\n"
             "🎯 <b>Коротко:</b> <code>рул [ставка] [тип]</code>\n\n"
             "🎯 <b>Типы ставок:</b>\n"
-            "• <code>красное</code> / <code>крас</code> (x2)\n"
-            "• <code>черное</code> / <code>черн</code> (x2)\n"
-            "• <code>зеленое</code> / <code>зел</code> (x36)\n"
-            "• <code>четное</code> / <code>чет</code> (x2)\n"
-            "• <code>нечетное</code> / <code>нечет</code> (x2)\n"
-            "• <code>1-18</code> / <code>19-36</code> (x2)\n"
-            "• <code>1-12</code> / <code>13-24</code> / <code>25-36</code> (x3)\n"
-            "• <code>[число от 0 до 36]</code> (x36)\n\n"
+            "- <code>красное</code> / <code>крас</code> (x2)\n"
+            "- <code>черное</code> / <code>черн</code> (x2)\n"
+            "- <code>зеленое</code> / <code>зел</code> (x36)\n"
+            "- <code>четное</code> / <code>чет</code> (x2)\n"
+            "- <code>нечетное</code> / <code>нечет</code> (x2)\n"
+            "- <code>1-18</code> / <code>19-36</code> (x2)\n"
+            "- <code>1-12</code> / <code>13-24</code> / <code>25-36</code> (x3)\n"
+            "- <code>[число от 0 до 36]</code> (x36)\n\n"
             "🎯 <b>Примеры:</b>\n"
             "<code>рулетка 1000 красное</code>\n"
             "<code>рул 5к 17</code>\n"
@@ -4066,6 +6054,12 @@ async def process_roulette(msg: Message, parts: list):
     
     if bet > user['balance']:
         await msg.reply(f"❌ Не хватает денег. Баланс: {user['balance']:,}", parse_mode="HTML")
+        return
+    
+    # Проверка дневного лимита ставок
+    can_wager, error_msg = await check_daily_wager_limit(msg.from_user.id, bet)
+    if not can_wager:
+        await msg.reply(error_msg, parse_mode="HTML")
         return
     
     bet_type = parts[2].lower()
@@ -4104,6 +6098,9 @@ async def process_roulette(msg: Message, parts: list):
     if not success:
         await msg.reply("❌ Ошибка при списании средств")
         return
+    
+    # Обновляем дневной счетчик ставок
+    await update_daily_wager(msg.from_user.id, bet)
     
     loading_msg = await msg.reply("🎰 Крутим рулетку...")
     await asyncio.sleep(1)
@@ -4154,9 +6151,9 @@ async def process_darts(msg: Message, parts: list):
             "• Промах (❌): <b>x0</b> (проигрыш)\n\n"
             "🎯 <b>Использование:</b> <code>дротик [ставка]</code>\n"
             "📊 <b>Примеры:</b>\n"
-            "• <code>дротик 1000</code>\n"
-            "• <code>дротик 1к</code>\n"
-            "• <code>дротик 1кк</code>",
+            "- <code>дротик 1000</code>\n"
+            "- <code>дротик 1к</code>\n"
+            "- <code>дротик 1кк</code>",
             parse_mode="HTML"
         )
         return
@@ -4174,10 +6171,19 @@ async def process_darts(msg: Message, parts: list):
         await msg.reply(f"❌ Не хватает денег. Баланс: {user['balance']:,}", parse_mode="HTML")
         return
     
+
+    can_wager, error_msg = await check_daily_wager_limit(msg.from_user.id, bet)
+    if not can_wager:
+        await msg.reply(error_msg, parse_mode="HTML")
+        return
+
     success = await change_balance(msg.from_user.id, -bet)
     if not success:
         await msg.reply("❌ Ошибка при списании средств")
         return
+
+    # ????????? ??????? ??????? ??????
+    await update_daily_wager(msg.from_user.id, bet)
     
     loading_msg = await msg.reply("🎯 Целюсь в мишень...")
     await asyncio.sleep(1.5)
@@ -4299,7 +6305,7 @@ async def process_bj(msg: Message, parts: list):
             player_value = hand_value(hand)
             
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Взять карту", callback_data="bj_hit"),
+            [InlineKeyboardButton(text="➕ Взять карту", callback_data="bj_hit"),
                  InlineKeyboardButton(text="🛑 Остановиться", callback_data="bj_stand")],
                 [InlineKeyboardButton(text="🎴 Показать текущую игру", callback_data="bj_show")]
             ])
@@ -4338,6 +6344,12 @@ async def process_bj(msg: Message, parts: list):
         await msg.reply(f"❌ Не хватает денег. Баланс: {user['balance']:,}", parse_mode="HTML")
         return
     
+    # Проверка дневного лимита ставок
+    can_wager, error_msg = await check_daily_wager_limit(msg.from_user.id, bet)
+    if not can_wager:
+        await msg.reply(error_msg, parse_mode="HTML")
+        return
+    
     uid = msg.from_user.id
     
     game = load_bj_game(uid)
@@ -4372,6 +6384,9 @@ async def process_bj(msg: Message, parts: list):
     if not success:
         await msg.reply("❌ Ошибка при списании средств")
         return
+    
+    # Обновляем дневной счетчик ставок
+    await update_daily_wager(uid, bet)
     
     hand = [random.choice(CARDS), random.choice(CARDS)]
     dealer_hand = [random.choice(CARDS), random.choice(CARDS)]
@@ -4428,10 +6443,19 @@ async def process_crash(msg: Message, parts: list):
         await msg.reply(f"❌ Не хватает денег. Баланс: {format_money(user['balance'])}")
         return
     
+
+    can_wager, error_msg = await check_daily_wager_limit(msg.from_user.id, bet)
+    if not can_wager:
+        await msg.reply(error_msg, parse_mode="HTML")
+        return
+
     success = await change_balance(msg.from_user.id, -bet)
     if not success:
         await msg.reply("❌ Ошибка при списании средств")
         return
+
+    # ????????? ??????? ??????? ??????
+    await update_daily_wager(msg.from_user.id, bet)
     
     # Обновляем КД
     await update_game_cooldown(msg.from_user.id, "crash")
@@ -4507,20 +6531,39 @@ async def process_transfer(msg: Message, parts: list):
                 return
             
             recipient_id = row['id']
-            
+
             if recipient_id == sender_id:
                 await msg.reply("❌ Нельзя переводить деньги самому себе!")
                 return
-            
-            success = await change_balance(sender_id, -amount)
-            if not success:
-                await msg.reply("❌ Ошибка при списании средств")
-                return
-            
-            success = await change_balance(recipient_id, amount)
-            if not success:
-                await change_balance(sender_id, amount)
-                await msg.reply("❌ Ошибка при переводе. Деньги возвращены.")
+
+            # Атомарный перевод в одной транзакции
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                # Проверяем текущий баланс отправителя
+                cur = await db.execute("SELECT balance FROM users WHERE id = ?", (sender_id,))
+                srow = await cur.fetchone()
+                sbalance = srow[0] if srow else 0
+                if sbalance < amount:
+                    await db.rollback()
+                    await msg.reply(f"❌ Недостаточно средств! Баланс: {sbalance:,}", parse_mode="HTML")
+                    return
+
+                # Выполняем списание и зачисление
+                fee = int(amount * 0.02)
+                net_amount = amount - fee
+
+                await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, sender_id))
+                await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (net_amount, recipient_id))
+
+                await db.commit()
+
+            except Exception as e:
+                try:
+                    await db.rollback()
+                except:
+                    pass
+                logger.error(f"Ошибка в атомарном переводе: {e}")
+                await msg.reply("❌ Ошибка при переводе. Попробуйте позже.")
                 return
             
             updated_sender = await get_user(sender_id)
@@ -4817,11 +6860,6 @@ async def process_admin_take(msg: Message, parts: list):
             
             logger.info(f"✅ Админ {msg.from_user.id} забрал {amount:,} у пользователя {target_id}")
             
-            # **ВАЖНО: Очищаем кэш пользователя, чтобы изменения отобразились**
-            cache_key = f"user_{target_id}"
-            if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-                del get_user.cache[cache_key]
-            
             await msg.reply(
                 f"✅ <b>Деньги успешно забраны!</b>\n\n"
                 f"💸 <b>Сумма:</b> {format_money(amount)}\n"
@@ -4877,11 +6915,6 @@ async def process_admin_take_reply(msg: Message, parts: list):
             await db.commit()
             
             logger.info(f"✅ Админ {msg.from_user.id} забрал {amount:,} у пользователя {target_id}")
-            
-            # Очищаем кэш
-            cache_key = f"user_{target_id}"
-            if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-                del get_user.cache[cache_key]
             
             await msg.reply(
                 f"✅ <b>Деньги успешно забраны!</b>\n\n"
@@ -4999,11 +7032,6 @@ async def cmd_profile_slash(msg: Message):
 async def cmd_top_slash(msg: Message):
     await process_top(msg)
 
-@router.message(Command("мойбизнес", "моибизнесы", "mybusiness"))
-async def cmd_mybusiness_slash(msg: Message):
-    """Команда для просмотра собственных бизнесов"""
-    await show_my_businesses(msg)
-
 @router.message(Command("монетка", "coin", "мн"))
 async def cmd_coin_slash(msg: Message, command: CommandObject):
     if not command.args:
@@ -5047,13 +7075,13 @@ async def cmd_roulette_slash(msg: Message, command: CommandObject):
             "🎰 <b>Рулетка - Помощь</b>\n\n"
             "🎯 <b>Формат:</b> <code>рулетка [ставка] [тип]</code>\n\n"
             "🎯 <b>Типы ставок:</b>\n"
-            "• <code>красное</code> (x2)\n"
-            "• <code>черное</code> (x2)\n"
-            "• <code>зеленое</code> (x36)\n"
-            "• <code>четное</code> / <code>нечетное</code> (x2)\n"
-            "• <code>1-18</code> / <code>19-36</code> (x2)\n"
-            "• <code>1-12</code> / <code>13-24</code> / <code>25-36</code> (x3)\n"
-            "• <code>[число от 0 до 36]</code> (x36)\n\n"
+            "- <code>красное</code> (x2)\n"
+            "- <code>черное</code> (x2)\n"
+            "- <code>зеленое</code> (x36)\n"
+            "- <code>четное</code> / <code>нечетное</code> (x2)\n"
+            "- <code>1-18</code> / <code>19-36</code> (x2)\n"
+            "- <code>1-12</code> / <code>13-24</code> / <code>25-36</code> (x3)\n"
+            "- <code>[число от 0 до 36]</code> (x36)\n\n"
             "<b>📱 Поддержка сокращений:</b>\n"
             "• 1к = 1,000 | 1кк = 1,000,000\n"
             "• 10кк = 10,000,000 | 100кк = 100,000,000\n"
@@ -5137,10 +7165,6 @@ async def cmd_take_slash(msg: Message):
         await process_admin_take_reply(msg, parts)
     else:
         await process_admin_take(msg, parts)
-
-@router.message(Command("бизнесы", "business"))
-async def cmd_businesses_slash(msg: Message):
-    await show_businesses(msg)
 
 @router.message(Command("майнинг", "mining"))
 async def cmd_mining_slash(msg: Message):
@@ -5234,46 +7258,58 @@ async def profile_text_cmd(msg: Message):
 
 @router.message(F.text.lower().startswith(("топ", "лидеры", "top")))
 async def top_text_cmd(msg: Message):
+    if not extract_text_command_parts(msg.text, ("топ", "лидеры", "top")):
+        return
     await process_top(msg)
-
-@router.message(F.text.lower().startswith(("мойбизнес", "моибизнесы", "mybusiness")))
-async def mybusiness_text_cmd(msg: Message):
-    await show_my_businesses(msg)
 
 @router.message(F.text.lower().startswith(("монетка", "coin", "мн")))
 async def coin_text_cmd(msg: Message):
-    parts = msg.text.split()
+    parts = extract_text_command_parts(msg.text, ("монетка", "coin", "мн"))
+    if not parts:
+        return
     await process_coin(msg, parts)
 
 @router.message(F.text.lower().startswith(("дротик", "дартс", "дрот")))
 async def darts_text_cmd(msg: Message):
-    parts = msg.text.split()
+    parts = extract_text_command_parts(msg.text, ("дротик", "дартс", "дрот"))
+    if not parts:
+        return
     await process_darts(msg, parts)
 
 @router.message(F.text.lower().startswith(("кости", "dice", "кст")))
 async def dice_text_cmd(msg: Message):
-    parts = msg.text.split()
+    parts = extract_text_command_parts(msg.text, ("кости", "dice", "кст"))
+    if not parts:
+        return
     await process_dice(msg, parts)
 
 @router.message(F.text.lower().startswith(("слоты", "slots", "сл")))
 async def slots_text_cmd(msg: Message):
-    parts = msg.text.split()
+    parts = extract_text_command_parts(msg.text, ("слоты", "slots", "сл"))
+    if not parts:
+        return
     await process_slots(msg, parts)
 
 @router.message(F.text.lower().startswith(("рулетка", "рул")))
 async def roulette_text_cmd(msg: Message):
-    parts = msg.text.split()
+    parts = extract_text_command_parts(msg.text, ("рулетка", "рул"))
+    if not parts:
+        return
     await process_roulette(msg, parts)
 
 @router.message(F.text.lower().startswith(("блекджек", "блэкджек", "бж", "bj")))
 async def bj_text_cmd(msg: Message):
-    parts = msg.text.split()
+    parts = extract_text_command_parts(msg.text, ("блекджек", "блэкджек", "бж", "bj"))
+    if not parts:
+        return
     await process_bj(msg, parts)
 
 @router.message(F.text.lower().startswith("краш"))
 async def crash_text_cmd(msg: Message):
     """Команда для игры Краш"""
-    parts = msg.text.split()
+    parts = extract_text_command_parts(msg.text, ("краш",))
+    if not parts:
+        return
     await process_crash(msg, parts)
 
 @router.message(F.text.lower().startswith("продать биткоин"))
@@ -5286,9 +7322,9 @@ async def sell_bitcoin_cmd(msg: Message):
         await msg.reply(
             "💸 <b>ПРОДАЖА БИТКОИНОВ</b>\n\n"
             "📝 <b>Формат:</b>\n"
-            "• <code>продать биткоин все</code> - продать все BTC\n"
-            "• <code>продать биткоин 0.01</code> - продать 0.01 BTC\n"
-            "• <code>продать биткоин 0.5</code> - продать 0.5 BTC\n\n"
+            "- <code>продать биткоин все</code> - продать все BTC\n"
+            "- <code>продать биткоин 0.01</code> - продать 0.01 BTC\n"
+            "- <code>продать биткоин 0.5</code> - продать 0.5 BTC\n\n"
             "💰 <b>Примеры:</b>\n"
             "<code>продать биткоин все</code>\n"
             "<code>продать биткоин 0.1</code>\n"
@@ -5324,8 +7360,8 @@ async def sell_bitcoin_cmd(msg: Message):
         await msg.reply(
             "❌ <b>Неверный формат!</b>\n\n"
             "Используйте число:\n"
-            "• <code>продать биткоин 0.1</code>\n"
-            "• <code>продать биткоин все</code>",
+            "- <code>продать биткоин 0.1</code>\n"
+            "- <code>продать биткоин все</code>",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -5353,10 +7389,6 @@ async def give_text_cmd(msg: Message):
 @router.message(F.text.lower().startswith(("забрать",)))
 async def take_text_cmd(msg: Message):
     await handle_all_commands(msg)
-
-@router.message(F.text.lower().startswith(("бизнесы", "business")))
-async def businesses_text_cmd(msg: Message):
-    await show_businesses(msg)
 
 @router.message(F.text.lower().startswith(("майнинг", "mining")))
 async def mining_text_cmd(msg: Message):
@@ -5411,81 +7443,6 @@ async def collect_btc_text_cmd(msg: Message):
         )
 
 # ========== CALLBACK ОБРАБОТЧИКИ ==========
-
-# ========== ОБРАБОТЧИКИ ДЛЯ "МОЙ БИЗНЕС" (НОВЫЕ) ==========
-@router.callback_query(F.data == "show_my_businesses")
-async def show_my_businesses_cb(cb: CallbackQuery):
-    """Показать бизнесы пользователя - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
-    uid = cb.from_user.id
-    user_businesses = await get_user_businesses(uid)
-    
-    if not user_businesses:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
-        ])
-        
-        try:
-            await cb.message.edit_text(
-                "🏢 <b>Ваши бизнесы</b>\n\n"
-                "❌ У вас пока нет бизнесов.\n"
-                "📋 Чтобы купить бизнес, напишите: <code>купить бизнес [id]</code>\n"
-                "📝 Или посмотрите список бизнесов: <code>бизнесы</code>",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-        except:
-            await cb.message.answer(
-                "🏢 <b>Ваши бизнесы</b>\n\n"
-                "❌ У вас пока нет бизнесов.\n"
-                "📋 Чтобы купить бизнес, напишите: <code>купить бизнес [id]</code>\n"
-                "📝 Или посмотрите список бизнесов: <code>бизнесы</code>",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-        await cb.answer()
-        return
-    
-    # Если бизнесы есть, показываем их с кнопками
-    keyboard = []
-    for biz_id, biz_data in user_businesses.items():
-        if biz_id in BUSINESSES:
-            business_info = BUSINESSES[biz_id]
-            level = biz_data['level']
-            product_amount = biz_data['product_amount']
-            product_capacity = business_info['product_capacity']
-            
-            # Статус заполнения
-            if product_amount >= product_capacity:
-                status = "🟢"
-            elif product_amount > product_capacity * 0.5:
-                status = "🟡"
-            else:
-                status = "🔴"
-            
-            # Кнопка для управления этим бизнесом
-            keyboard.append([
-                InlineKeyboardButton(
-                    text=f"{status} {business_info['name']} (Ур. {level})",
-                    callback_data=f"mybiz_{biz_id}"
-                )
-            ])
-    
-    # Добавляем кнопку "Назад" если есть бизнесы
-    if keyboard:
-        keyboard.append([InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")])
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
-    
-    text = "🏢 <b>Ваши бизнесы</b>\n\n"
-    text += f"📊 Всего бизнесов: {len(user_businesses)}\n"
-    text += "Выберите бизнес для управления:\n\n"
-    text += "🟢 - Продукты заполнены\n🟡 - Продукты наполовину\n🔴 - Мало продуктов"
-    
-    try:
-        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    except:
-        await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
-    await cb.answer()
 
 # ========== АДМИН ОБРАБОТЧИКИ МАЙНИНГА ==========
 @router.callback_query(F.data == "admin_force_fix_self")
@@ -5669,165 +7626,6 @@ async def admin_reset_all_time_callback(cb: CallbackQuery):
     except Exception as e:
         await cb.answer(f"❌ Ошибка: {e}")
 
-@router.callback_query(F.data.startswith("mybiz_"))
-async def my_business_callback(cb: CallbackQuery):
-    """Обработка выбора бизнеса - с расходом продуктов по времени"""
-    try:
-        biz_id = int(cb.data.split("_")[1])
-        uid = cb.from_user.id
-        
-        user_businesses = await get_user_businesses(uid)
-        if biz_id not in user_businesses:
-            await cb.answer("❌ У вас нет этого бизнеса")
-            return
-        
-        biz_data = user_businesses[biz_id]
-        business_info = BUSINESSES[biz_id]
-        
-        # Расчет прибыли
-        profit_per_hour = business_info['profit_per_hour'] * (business_info['upgrade_multiplier'] ** (biz_data['level'] - 1))
-        
-        # Рассчитываем сколько часов может проработать бизнес
-        remaining_hours = biz_data['product_amount']  # Каждый продукт = 1 час работы
-        max_hours = business_info['product_capacity']
-        
-        # Процент заполнения продуктов
-        product_percent = int((biz_data['product_amount'] / business_info['product_capacity']) * 100)
-        
-        # Рассчитываем сколько часов прошло с последнего сбора
-        current_time = int(time.time())
-        last_collected = biz_data.get('last_collected', 0)
-        
-        if last_collected == 0:
-            last_collected = current_time
-        
-        time_passed = current_time - last_collected
-        hours_passed = time_passed / 3600
-        
-        # Сколько часов бизнес реально мог работать
-        possible_working_hours = min(hours_passed, remaining_hours)
-        accumulated_profit = int(profit_per_hour * possible_working_hours)
-        
-        # Статус бизнеса
-        if remaining_hours <= 0:
-            status = "🔴 Нет продуктов"
-        elif remaining_hours < max_hours * 0.3:
-            status = "🟡 Мало продуктов"
-        else:
-            status = "🟢 Работает"
-        
-        # Создаем клавиатуру
-        can_collect = hours_passed > 0 and remaining_hours > 0 and accumulated_profit > 0
-        
-        keyboard = [
-            [
-                InlineKeyboardButton(text="🔄 Пополнить", callback_data=f"biz_refill_{biz_id}"),
-                InlineKeyboardButton(text="💰 Собрать" if can_collect else "⏳ Нет прибыли", 
-                                   callback_data=f"biz_collect_{biz_id}" if can_collect else "no_action")
-            ],
-            [
-                InlineKeyboardButton(text="📈 Улучшить", callback_data=f"biz_upgrade_{biz_id}"),
-                InlineKeyboardButton(text="💸 Продать", callback_data=f"biz_sell_{biz_id}")
-            ],
-            [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="show_my_businesses")]
-        ]
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
-        
-        # Создаем прогресс-бар для продуктов
-        progress_bar = create_progress_bar(product_percent)
-        
-        text = f"""
-🏢 <b>{business_info['name']} (Уровень {biz_data['level']})</b>
-
-📊 <b>Информация:</b>
-• Статус: {status}
-• Уровень: {biz_data['level']}/{business_info['max_level']}
-• Продукты: {biz_data['product_amount']}/{business_info['product_capacity']}
-{progress_bar} {product_percent}%
-• Осталось часов работы: {remaining_hours} ч
-• Прибыль в час: {format_money(profit_per_hour)}
-• Накоплено прибыли: {format_money(accumulated_profit)}
-• Часов с прошлого сбора: {hours_passed:.1f} ч
-• Стоимость пополнения: {format_money(business_info['product_refill_cost'])}
-"""
-        
-        try:
-            await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except:
-            await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
-        await cb.answer()
-    except Exception as e:
-        logger.error(f"Ошибка в my_business_callback: {e}")
-        await cb.answer("❌ Ошибка")
-
-@router.callback_query(F.data.startswith("biz_refill_"))
-async def biz_refill_callback(cb: CallbackQuery):
-    """Пополнение продуктов бизнеса"""
-    try:
-        biz_id = int(cb.data.split("_")[2])
-        uid = cb.from_user.id
-        
-        success, message = await refill_products(uid, biz_id)
-        await cb.answer(message)
-        
-        # Обновляем сообщение
-        if success:
-            await my_business_callback(cb)
-    except Exception as e:
-        logger.error(f"Ошибка в biz_refill_callback: {e}")
-        await cb.answer("❌ Ошибка пополнения")
-
-@router.callback_query(F.data.startswith("biz_collect_"))
-async def biz_collect_callback(cb: CallbackQuery):
-    """Сбор прибыли с бизнеса"""
-    try:
-        biz_id = int(cb.data.split("_")[2])
-        uid = cb.from_user.id
-        
-        success, result = await collect_business_profit(uid, biz_id)
-        if success:
-            await cb.answer(f"✅ Собрано: {format_money(result)}")
-            await my_business_callback(cb)
-        else:
-            await cb.answer(f"❌ {result}")
-    except Exception as e:
-        logger.error(f"Ошибка в biz_collect_callback: {e}")
-        await cb.answer("❌ Ошибка сбора")
-
-@router.callback_query(F.data.startswith("biz_upgrade_"))
-async def biz_upgrade_callback(cb: CallbackQuery):
-    """Улучшение бизнеса"""
-    try:
-        biz_id = int(cb.data.split("_")[2])
-        uid = cb.from_user.id
-        
-        success, message = await upgrade_business(uid, biz_id)
-        await cb.answer(message)
-        
-        if success:
-            await my_business_callback(cb)
-    except Exception as e:
-        logger.error(f"Ошибка в biz_upgrade_callback: {e}")
-        await cb.answer("❌ Ошибка улучшения")
-
-@router.callback_query(F.data.startswith("biz_sell_"))
-async def biz_sell_callback(cb: CallbackQuery):
-    """Продажа бизнеса"""
-    try:
-        biz_id = int(cb.data.split("_")[2])
-        uid = cb.from_user.id
-        
-        success, amount = await sell_business(uid, biz_id)
-        if success:
-            await cb.answer(f"✅ Продано за {format_money(amount)}")
-            await show_my_businesses(cb.message)
-        else:
-            await cb.answer(f"❌ {amount}")
-    except Exception as e:
-        logger.error(f"Ошибка в biz_sell_callback: {e}")
-        await cb.answer("❌ Ошибка продажи")
-
 # ========== ОБРАБОТЧИКИ ДЛЯ ИНВЕСТИЦИЙ (НОВЫЕ) ==========
 # ========== ИНВЕСТИЦИИ - ЕДИНЫЙ ОБРАБОТЧИК ==========
 @router.callback_query(F.data.startswith("invest_"))
@@ -5911,7 +7709,7 @@ async def all_investment_callbacks(cb: CallbackQuery):
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu_callback(cb: CallbackQuery):
     """Вернуться в главное меню"""
-    await send_welcome_message(cb.message)
+    await send_welcome_message(cb.message, force_menu=True, edit=True)
     await cb.answer()
 
 # ========== СУЩЕСТВУЮЩИЕ CALLBACK ОБРАБОТЧИКИ ==========
@@ -5990,11 +7788,6 @@ async def get_work_cb(cb: CallbackQuery):
     await process_work(cb.message)
     await cb.answer()
 
-@router.callback_query(F.data == "show_businesses")
-async def show_businesses_cb(cb: CallbackQuery):
-    await show_businesses(cb.message)
-    await cb.answer()
-
 @router.callback_query(F.data == "show_planets")
 async def show_planets_cb(cb: CallbackQuery):
     await show_planets(cb.message)
@@ -6009,6 +7802,195 @@ async def show_mining_cb(cb: CallbackQuery):
 async def show_investments_callback(cb: CallbackQuery):
     await show_investments_panel(cb=cb)
     await cb.answer()
+
+@router.callback_query(F.data == "show_weapons_shop")
+async def show_weapons_shop_cb(cb: CallbackQuery):
+    """Военный магазин"""
+    uid = cb.from_user.id
+    
+    try:
+        user = await get_user(uid)
+        text = "🛒 <b>Военный магазин</b>\n\n"
+        text += "Выберите категорию товаров:\n\n"
+        text += "🔫 <b>Оружие:</b> Пистолеты, автоматы, снайперки\n"
+        text += "🛡️ <b>Броня:</b> Комплекты защиты\n"
+        text += "🚗 <b>Техника:</b> БТР, танки, артиллерия\n"
+            
+        keyboard = [
+            [InlineKeyboardButton(text="🔫 Оружие", callback_data="shop_category_weapon")],
+            [InlineKeyboardButton(text="🛡️ Броня", callback_data="shop_category_armor")],
+            [InlineKeyboardButton(text="🚗 Техника", callback_data="shop_category_vehicle")],
+            [InlineKeyboardButton(text="📦 Инвентарь", callback_data="show_inventory")],
+            [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
+        ]
+        
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Ошибка show_weapons_shop_cb: {e}")
+        await cb.answer("❌ Ошибка загрузки магазина")
+
+@router.callback_query(F.data.startswith("shop_category_"))
+async def shop_category_cb(cb: CallbackQuery):
+    """Категория товаров в магазине"""
+    category = cb.data.split("_")[2]
+    uid = cb.from_user.id
+    
+    category_names = {
+        'weapon': 'Оружие',
+        'armor': 'Броня', 
+        'vehicle': 'Техника'
+    }
+    
+    if category not in category_names:
+        await cb.answer("❌ Неизвестная категория")
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM items WHERE category = ? ORDER BY tier, price_money", (category,))
+            items = await cursor.fetchall()
+        
+        text = f"🛒 <b>{category_names[category]}</b>\n\n"
+        
+        keyboard = []
+        for item in items:
+            price_text = format_money(item['price_money'])
+            if item['price_plutonium']:
+                price_text += f" + {item['price_plutonium']}🔸"
+            if item['price_plasma']:
+                price_text += f" + {item['price_plasma']}🔹"
+            
+            keyboard.append([InlineKeyboardButton(
+                text=f"{item['name']} (ур.{item['tier']}) - {price_text}",
+                callback_data=f"buy_item_{item['item_id']}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton(text="🔙 К категориям", callback_data="show_weapons_shop")])
+        
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Ошибка shop_category_cb: {e}")
+        await cb.answer("❌ Ошибка загрузки категории")
+
+@router.callback_query(F.data.startswith("buy_item_"))
+async def buy_item_cb(cb: CallbackQuery):
+    """Покупка предмета"""
+    item_id = cb.data.split("_", 2)[2]
+    uid = cb.from_user.id
+    
+    if item_id not in ITEM_CONFIG:
+        await cb.answer("❌ Предмет не найден")
+        return
+    
+    item_data = ITEM_CONFIG[item_id]
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            
+            cursor = await db.execute("SELECT balance, plasma FROM users WHERE id = ?", (uid,))
+            user = await cursor.fetchone()
+            
+            if not user:
+                await db.rollback()
+                await cb.answer("❌ Пользователь не найден")
+                return
+            
+            # Проверяем ресурсы
+            cost_money = item_data['price_money']
+            cost_plutonium = item_data.get('price_plutonium', 0)
+            cost_plasma = item_data.get('price_plasma', 0)
+            
+            # Проверяем требования зданий
+            req_building = item_data.get('req_building')
+            req_level = item_data.get('req_building_level', 0)
+            if req_building:
+                cursor = await db.execute("SELECT level FROM country_buildings cb JOIN countries c ON cb.country_id = c.id WHERE c.owner_user_id = ? AND cb.building_type = ?", (uid, req_building))
+                building_level = (await cursor.fetchone() or [0])[0]
+                if building_level < req_level:
+                    await db.rollback()
+                    await cb.answer(f"❌ Требуется {req_building} уровня {req_level}")
+                    return
+            
+            if user['balance'] < cost_money:
+                await db.rollback()
+                await cb.answer(f"❌ Недостаточно денег ({format_money(cost_money)} нужно)")
+                return
+            
+            if user['plasma'] < cost_plutonium:
+                await db.rollback()
+                await cb.answer(f"❌ Недостаточно плутония ({cost_plutonium} нужно)")
+                return
+            
+            # Списываем ресурсы
+            await db.execute("UPDATE users SET balance = balance - ?, plasma = plasma - ? WHERE id = ?", 
+                           (cost_money, cost_plutonium, uid))
+            
+            # Добавляем предмет
+            cursor = await db.execute("SELECT amount FROM user_items WHERE user_id = ? AND item_id = ?", (uid, item_id))
+            existing = await cursor.fetchone()
+            
+            if existing:
+                await db.execute("UPDATE user_items SET amount = amount + 1 WHERE user_id = ? AND item_id = ?", (uid, item_id))
+            else:
+                await db.execute("INSERT INTO user_items (user_id, item_id, amount) VALUES (?, ?, 1)", (uid, item_id))
+            
+            await db.commit()
+        
+        await cb.answer(f"✅ {item_data['name']} куплен!")
+        # Возвращаемся к категории
+        category = item_data['category']
+        cb.data = f"shop_category_{category}"
+        await shop_category_cb(cb)
+    except Exception as e:
+        logger.error(f"Ошибка buy_item_cb: {e}")
+        await cb.answer("❌ Ошибка покупки")
+
+@router.callback_query(F.data == "show_inventory")
+async def show_inventory_cb(cb: CallbackQuery):
+    """Показать инвентарь армии"""
+    uid = cb.from_user.id
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT ui.amount, i.name, i.category, i.power, i.upkeep_day 
+                FROM user_items ui 
+                JOIN items i ON ui.item_id = i.item_id 
+                WHERE ui.user_id = ? AND ui.amount > 0
+                ORDER BY i.category, i.tier
+            """, (uid,))
+            items = await cursor.fetchall()
+        
+        text = "📦 <b>Инвентарь армии</b>\n\n"
+        
+        if not items:
+            text += "Ваш инвентарь пуст.\n\nКупите оружие и технику в военном магазине!"
+        else:
+            total_power = 0
+            total_upkeep = 0
+            
+            for item in items:
+                text += f"• {item['name']} x{item['amount']} (⚔️{item['power']}, 💰{item['upkeep_day']}/день)\n"
+                total_power += item['power'] * item['amount']
+                total_upkeep += item['upkeep_day'] * item['amount']
+            
+            text += f"\n<b>Общая сила:</b> {total_power}\n"
+            text += f"<b>Общее содержание:</b> {format_money(total_upkeep)}/день\n"
+        
+        keyboard = [[InlineKeyboardButton(text="🛒 В магазин", callback_data="show_weapons_shop")],
+                    [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]]
+        
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Ошибка show_inventory_cb: {e}")
+        await cb.answer("❌ Ошибка загрузки инвентаря")
 
 @router.callback_query(F.data == "show_profile")
 async def show_profile_cb(cb: CallbackQuery):
@@ -6174,6 +8156,14 @@ async def bj_stand_cb(cb: CallbackQuery):
 async def crash_cashout_callback(cb: CallbackQuery):
     """Обработка кэшаута в игре Краш - РАБОЧАЯ ВЕРСИЯ"""
     try:
+        # Уникальный id обработки — используем id callback'a
+        cb_id = str(cb.id)
+
+        # Дедупликация: если уже обрабатывали этот callback — выходим
+        if await is_callback_processed(cb_id):
+            await cb.answer("✅ Обработано", show_alert=False)
+            return
+
         player_id = int(cb.data.split("_")[2])
         
         # Проверяем, что это тот же пользователь
@@ -6195,18 +8185,53 @@ async def crash_cashout_callback(cb: CallbackQuery):
             await cb.answer("❌ Нет активной игры или игра уже завершена!", show_alert=True)
             return
         
-        # Получаем текущий множитель
-        multiplier = game_data["multiplier"]
-        bet = game_data["bet"]
-        win_amount = int(bet * multiplier)
-        
-        # Отмечаем, что игрок забрал деньги
+        # Получаем текущий множитель и считаем выплату с house edge
+        multiplier = float(game_data["multiplier"])
+        bet = int(game_data["bet"])
+
+        # Проверяем минимальный множитель для кэшаута
+        if multiplier < 1.10:
+            await cb.answer("❌ Минимальный множитель для вывода: 1.10x", show_alert=True)
+            return
+
+        HOUSE_EDGE = 0.97
+        effective_mul = round(multiplier * HOUSE_EDGE, 2)
+        payout = int(math.floor(bet * effective_mul))
+
+        # Выполняем атомарную операцию в БД: пометим callback как обработанный и начислим payout
+        async with aiosqlite.connect(DB_PATH) as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                cursor = await db.execute("SELECT 1 FROM processed_callbacks WHERE id = ?", (cb_id,))
+                if await cursor.fetchone():
+                    await db.rollback()
+                    await cb.answer("✅ Обработано", show_alert=False)
+                    return
+
+                # Помечаем callback
+                now_ts = int(time.time())
+                await db.execute("INSERT INTO processed_callbacks (id, ts) VALUES (?, ?)", (cb_id, now_ts))
+
+                # Начисляем деньги и увеличиваем счетчик побед
+                await db.execute("UPDATE users SET balance = balance + ?, wins = COALESCE(wins,0) + 1 WHERE id = ?", (payout, player_id))
+
+                await db.commit()
+
+            except Exception as e:
+                try:
+                    await db.rollback()
+                except:
+                    pass
+                logger.error(f"DB error in crash_cashout_callback: {e}")
+                await cb.answer("❌ Ошибка при выплате", show_alert=True)
+                return
+
+        # Отмечаем в памяти, что игрок забрал
         active_crash_games[game_id]["cashed_out"] = True
         active_crash_games[game_id]["cashout_multiplier"] = multiplier
         
-        # Начисляем выигрыш
-        await change_balance(player_id, win_amount)
-        await update_stats(player_id, True)
+        # Удаляем игру из активных, чтобы остановить её немедленно
+        del active_crash_games[game_id]
         
         # Обновляем сообщение
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -6217,15 +8242,15 @@ async def crash_cashout_callback(cb: CallbackQuery):
             f"💰 <b>ВЫ УСПЕЛИ ЗАБРАТЬ!</b>\n\n"
             f"🎯 Множитель: <b>{multiplier}x</b>\n"
             f"💰 Ставка: {format_money(bet)}\n"
-            f"💵 Выигрыш: <b>{format_money(win_amount)}</b>\n\n"
-            f"✅ <b>+{format_money(win_amount - bet)}</b>\n\n"
+            f"💵 Выигрыш: <b>{format_money(payout)}</b>\n\n"
+            f"✅ <b>+{format_money(payout - bet)}</b>\n\n"
             f"🎉 Поздравляем с победой!\n"
             f"⚠️ Ждите краха для завершения игры",
             parse_mode="HTML",
             reply_markup=keyboard
         )
         
-        await cb.answer(f"✅ Выигрыш: {format_money(win_amount)}! Ждите завершения игры.")
+        await cb.answer(f"✅ Выигрыш: {format_money(payout)}! Ждите завершения игры.")
         
     except Exception as e:
         logger.error(f"Ошибка crash_cashout_callback: {e}", exc_info=True)
@@ -6239,23 +8264,75 @@ async def coin_flip_cb(cb: CallbackQuery):
     except:
         await cb.answer("❌ Ошибка")
         return
-    
+
     uid = cb.from_user.id
-    await change_balance(uid, -bet)
-    
+
+    # Deduplicate callbacks and perform atomic DB updates
+    cb_id = str(cb.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT 1 FROM processed_callbacks WHERE id = ?", (cb_id,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("✅ Обработано", show_alert=False)
+                return
+
+            # Check balance
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            balance = row[0] if row else 0
+            if balance < bet:
+                await db.rollback()
+                await cb.answer("❌ Недостаточно средств", show_alert=True)
+                return
+
+            # Reserve: mark callback and deduct bet
+            now_ts = int(time.time())
+            await db.execute("INSERT INTO processed_callbacks (id, ts) VALUES (?, ?)", (cb_id, now_ts))
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (bet, uid))
+
+            # Flip the coin
+            await db.commit()
+            
+            # Обновляем дневной счетчик ставок
+            await update_daily_wager(uid, bet)
+
+        except Exception as e:
+            try:
+                await db.rollback()
+            except:
+                pass
+            logger.error(f"DB error in coin_flip_cb (reserve): {e}")
+            await cb.answer("❌ Ошибка", show_alert=True)
+            return
+
+    # После успешного резервирования — делаем бросок и финализируем (с отдельной транзакцией)
     await cb.message.edit_text("🎲 Подбрасываем монетку...")
     await asyncio.sleep(1.5)
-    
+
     result = random.choice(["orel", "reshka"])
-    
-    if result == choice:
-        win = bet * 2
-        await change_balance(uid, win)
-        await update_stats(uid, True)
-        result_text = f"✅ <b>ВЫИГРЫШ!</b>\n💰 +{bet:,}"
-    else:
-        await update_stats(uid, False)
-        result_text = f"❌ <b>ПРОИГРЫШ</b>\n💸 -{bet:,}"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            if result == choice:
+                win = bet * 2
+                await db.execute("UPDATE users SET balance = balance + ?, wins = COALESCE(wins,0) + 1 WHERE id = ?", (win, uid))
+                result_text = f"✅ <b>ВЫИГРЫШ!</b>\n💰 +{bet:,}"
+            else:
+                await db.execute("UPDATE users SET losses = COALESCE(losses,0) + 1 WHERE id = ?", (uid,))
+                result_text = f"❌ <b>ПРОИГРЫШ</b>\n💸 -{bet:,}"
+
+            await db.commit()
+        except Exception as e:
+            try:
+                await db.rollback()
+            except:
+                pass
+            logger.error(f"DB error in coin_flip_cb (finalize): {e}")
+            await cb.answer("❌ Ошибка при выплате", show_alert=True)
+            return
     
     ru_result = "🦅 Орел" if result == "orel" else "🪙 Решка"
     ru_choice = "🦅 Орел" if choice == "orel" else "🪙 Решка"
@@ -6274,6 +8351,847 @@ async def coin_flip_cb(cb: CallbackQuery):
     await cb.message.edit_text(text, parse_mode="HTML")
     await cb.answer()
 
+# ========== НОВЫЕ MESSAGE ХЕНДЛЕРЫ ==========
+
+@router.message(F.text.lower().in_(["страны", "countries"]))
+async def countries_command(msg: Message):
+    """Команда 'страны'"""
+    await show_country_selection(msg)
+
+async def show_my_country_msg(msg: Message):
+    uid = msg.from_user.id
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            country_id = await get_user_country_id(db, uid)
+
+        if not country_id:
+            await msg.reply("❌ У вас нет страны. Используйте команду «страны», чтобы выбрать.")
+            return
+
+        text, reply_markup = await build_country_view(country_id, uid)
+        if not text:
+            await msg.reply("❌ Страна не найдена.")
+            return
+
+        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Ошибка show_my_country_msg: {e}")
+        await msg.reply("❌ Ошибка загрузки страны.")
+
+@router.message(Command("страна", "country"))
+async def my_country_slash_cmd(msg: Message):
+    await show_my_country_msg(msg)
+
+@router.message(F.text.lower().in_(["страна", "моя страна", "country", "my country"]))
+async def my_country_text_cmd(msg: Message):
+    await show_my_country_msg(msg)
+
+@router.message(F.text.lower().in_(["кланы", "clans"]))
+async def clans_command(msg: Message):
+    """Команда 'кланы'"""
+    try:
+        text, reply_markup = await build_clans_view()
+        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error in clans_command: {e}")
+        await msg.reply("Error loading clans list.")
+
+@router.message(F.text.lower().in_(["\u043a\u0440\u0435\u0434\u0438\u0442\u044b", "credits"]))
+async def credits_command(msg: Message):
+    uid = msg.from_user.id
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await process_credit_defaults(db, uid)
+
+            cursor = await db.execute("SELECT * FROM credits WHERE borrower_id = ? ORDER BY issued_at DESC, id DESC LIMIT 5", (uid,))
+            borrowed = await cursor.fetchall()
+            cursor = await db.execute("SELECT c.*, u.username FROM credits c LEFT JOIN users u ON u.id = c.borrower_id WHERE c.lender_id = ? ORDER BY c.issued_at DESC, c.id DESC LIMIT 5", (uid,))
+            lent = await cursor.fetchall()
+
+            borrowed_lines = []
+            for credit in borrowed:
+                status = credit["status"]
+                interest_pct = int(round((credit["interest"] or 0) * 100))
+                total_due = int(credit["total_due"] or 0)
+                if status == "pending":
+                    days = max(1, int((credit["due_at"] or 0) // 86400))
+                    status_text = f"\u041e\u0436\u0438\u0434\u0430\u0435\u0442 \u043a\u0440\u0435\u0434\u0438\u0442\u043e\u0440\u0430, \u0441\u0440\u043e\u043a {days}\u0434"
+                    remaining = total_due
+                else:
+                    paid = await get_credit_paid_sum(db, credit["id"])
+                    remaining = max(0, total_due - paid)
+                    if status == "active":
+                        due_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(credit["due_at"]))
+                        status_text = f"\u0410\u043a\u0442\u0438\u0432\u0435\u043d \u0434\u043e {due_str}"
+                    elif status == "repaid":
+                        status_text = "\u041f\u043e\u0433\u0430\u0448\u0435\u043d"
+                    elif status == "defaulted":
+                        status_text = "\u0414\u0435\u0444\u043e\u043b\u0442"
+                    else:
+                        status_text = status
+
+                borrowed_lines.append(
+                    f"- ID {credit['id']} - {status_text}. \u0421\u0443\u043c\u043c\u0430: {format_money(credit['amount'])}, \u043f\u0440\u043e\u0446\u0435\u043d\u0442: {interest_pct}%, \u043e\u0441\u0442\u0430\u0442\u043e\u043a: {format_money(remaining)}"
+                )
+
+            lent_lines = []
+            for credit in lent:
+                status = credit["status"]
+                interest_pct = int(round((credit["interest"] or 0) * 100))
+                total_due = int(credit["total_due"] or 0)
+                paid = await get_credit_paid_sum(db, credit["id"]) if status != "pending" else 0
+                remaining = max(0, total_due - paid)
+                borrower_name = credit["username"] or str(credit["borrower_id"])
+                if status == "active":
+                    due_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(credit["due_at"]))
+                    status_text = f"\u0410\u043a\u0442\u0438\u0432\u0435\u043d \u0434\u043e {due_str}"
+                elif status == "repaid":
+                    status_text = "\u041f\u043e\u0433\u0430\u0448\u0435\u043d"
+                elif status == "defaulted":
+                    status_text = "\u0414\u0435\u0444\u043e\u043b\u0442"
+                else:
+                    status_text = status
+
+                lent_lines.append(
+                    f"- ID {credit['id']} - {borrower_name}. {status_text}. \u0421\u0443\u043c\u043c\u0430: {format_money(credit['amount'])}, \u043f\u0440\u043e\u0446\u0435\u043d\u0442: {interest_pct}%, \u043e\u0441\u0442\u0430\u0442\u043e\u043a: {format_money(remaining)}"
+                )
+
+        text = "<b>\u041a\u0440\u0435\u0434\u0438\u0442\u044b</b>\n\n"
+        if borrowed_lines:
+            text += "<b>\u0412\u0430\u0448\u0438 \u043a\u0440\u0435\u0434\u0438\u0442\u044b:</b>\n" + "\n".join(borrowed_lines) + "\n\n"
+        else:
+            text += "<b>\u0412\u0430\u0448\u0438 \u043a\u0440\u0435\u0434\u0438\u0442\u044b:</b> \u043d\u0435\u0442.\n\n"
+
+        if lent_lines:
+            text += "<b>\u0412\u044b \u0432\u044b\u0434\u0430\u043b\u0438:</b>\n" + "\n".join(lent_lines) + "\n\n"
+        else:
+            text += "<b>\u0412\u044b \u0432\u044b\u0434\u0430\u043b\u0438:</b> \u043d\u0435\u0442.\n\n"
+
+        text += (
+            "<b>\u041a\u043e\u043c\u0430\u043d\u0434\u044b:</b>\n"
+            "- <code>\u043a\u0440\u0435\u0434\u0438\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u0438\u0442\u044c &lt;\u0441\u0443\u043c\u043c\u0430&gt; &lt;\u043f\u0440\u043e\u0446\u0435\u043d\u0442&gt; &lt;\u0434\u043d\u0435\u0439&gt;</code>\n"
+            "- <code>\u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u044f</code>\n"
+            "- <code>\u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u0440\u0438\u043d\u044f\u0442\u044c &lt;id&gt;</code>\n"
+            "- <code>\u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u043b\u0430\u0442\u0438\u0442\u044c &lt;id&gt; &lt;\u0441\u0443\u043c\u043c\u0430&gt;</code>\n"
+            "- <code>\u043a\u0440\u0435\u0434\u0438\u0442 \u0441\u0438\u0433\u043c\u0430 &lt;\u0441\u0443\u043c\u043c\u0430&gt;</code>\n"
+        )
+        await msg.answer(text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"credits_command error: {e}")
+        await msg.reply("\u041e\u0448\u0438\u0431\u043a\u0430 \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438 \u043a\u0440\u0435\u0434\u0438\u0442\u043e\u0432.")
+
+
+@router.message(F.text.lower().startswith("\u043a\u0440\u0435\u0434\u0438\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u0438\u0442\u044c"))
+async def credit_request_cmd(msg: Message):
+    parts = msg.text.strip().split()
+    if len(parts) < 5:
+        await msg.reply("\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435: \u043a\u0440\u0435\u0434\u0438\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u0438\u0442\u044c <\u0441\u0443\u043c\u043c\u0430> <\u043f\u0440\u043e\u0446\u0435\u043d\u0442> <\u0434\u043d\u0435\u0439>")
+        return
+
+    amount = parse_amount(parts[2])
+    try:
+        interest_str = parts[3].replace('%', '').replace(',', '.')
+        interest_pct = float(interest_str)
+        days = int(parts[4])
+    except Exception:
+        await msg.reply("\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u044b.")
+        return
+
+    if interest_pct < CREDIT_MIN_INTEREST_PCT or interest_pct > CREDIT_MAX_INTEREST_PCT:
+        await msg.reply(f"\u041f\u0440\u043e\u0446\u0435\u043d\u0442 \u043e\u0442 {CREDIT_MIN_INTEREST_PCT}% \u0434\u043e {CREDIT_MAX_INTEREST_PCT}%.")
+        return
+    if days < CREDIT_MIN_DAYS or days > CREDIT_MAX_DAYS:
+        await msg.reply(f"\u0421\u0440\u043e\u043a \u043e\u0442 {CREDIT_MIN_DAYS} \u0434\u043e {CREDIT_MAX_DAYS} \u0434\u043d\u0435\u0439.")
+        return
+
+    interest = interest_pct / 100
+    total_due = amount + int(amount * interest)
+    uid = msg.from_user.id
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await process_credit_defaults(db, uid)
+            ok, reason = await check_credit_eligibility(db, uid, amount, False)
+            if not ok:
+                await msg.reply(reason)
+                return
+
+            await db.execute(
+                "INSERT INTO credits (lender_id, borrower_id, amount, interest, total_due, issued_at, due_at, status) VALUES (NULL, ?, ?, ?, ?, 0, ?, 'pending')",
+                (uid, amount, interest, total_due, days * 86400)
+            )
+            await db.commit()
+            logger.info(f"Credit request created: borrower={uid} amount={amount} interest={interest} days={days}")
+
+        await msg.reply("\u0417\u0430\u043f\u0440\u043e\u0441 \u0441\u043e\u0437\u0434\u0430\u043d. \u041f\u043e\u0438\u0449\u0438\u0442\u0435 \u043a\u0440\u0435\u0434\u0438\u0442\u043e\u0440\u0430: <code>\u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u044f</code>", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"credit_request_cmd error: {e}")
+        await msg.reply("\u041e\u0448\u0438\u0431\u043a\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u044f \u0437\u0430\u043f\u0440\u043e\u0441\u0430.")
+
+
+@router.message(F.text.lower().in_(["\u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u044f"]))
+async def credit_offers_cmd(msg: Message):
+    uid = msg.from_user.id
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await process_credit_defaults(db)
+            cursor = await db.execute(
+                "SELECT c.*, u.username FROM credits c LEFT JOIN users u ON u.id = c.borrower_id WHERE c.status = 'pending' AND c.lender_id IS NULL AND c.borrower_id != ? ORDER BY c.id DESC LIMIT 10",
+                (uid,)
+            )
+            offers = await cursor.fetchall()
+
+        if not offers:
+            await msg.reply("\u041d\u0435\u0442 \u0430\u043a\u0442\u0443\u0430\u043b\u044c\u043d\u044b\u0445 \u0437\u0430\u043f\u0440\u043e\u0441\u043e\u0432.")
+            return
+
+        lines = []
+        for credit in offers:
+            borrower_name = credit["username"] or str(credit["borrower_id"])
+            interest_pct = int(round((credit["interest"] or 0) * 100))
+            days = max(1, int((credit["due_at"] or 0) // 86400))
+            lines.append(
+                f"- ID {credit['id']} - {borrower_name}. \u0421\u0443\u043c\u043c\u0430: {format_money(credit['amount'])}, \u043f\u0440\u043e\u0446\u0435\u043d\u0442: {interest_pct}%, \u0441\u0440\u043e\u043a: {days}\u0434"
+            )
+
+        text = "<b>\u0417\u0430\u043f\u0440\u043e\u0441\u044b \u043d\u0430 \u043a\u0440\u0435\u0434\u0438\u0442</b>\n\n" + "\n".join(lines) + "\n\n<code>\u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u0440\u0438\u043d\u044f\u0442\u044c &lt;id&gt;</code>"
+        await msg.answer(text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"credit_offers_cmd error: {e}")
+        await msg.reply("\u041e\u0448\u0438\u0431\u043a\u0430 \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438 \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u0439.")
+
+
+@router.message(F.text.lower().startswith("\u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u0440\u0438\u043d\u044f\u0442\u044c"))
+async def credit_accept_cmd(msg: Message):
+    parts = msg.text.strip().split()
+    if len(parts) < 3:
+        await msg.reply("\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435: \u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u0440\u0438\u043d\u044f\u0442\u044c <id>")
+        return
+    try:
+        credit_id = int(parts[2])
+    except Exception:
+        await msg.reply("\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 ID.")
+        return
+
+    uid = msg.from_user.id
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await process_credit_defaults(db)
+            await db.execute("BEGIN IMMEDIATE")
+
+            cursor = await db.execute(
+                "SELECT * FROM credits WHERE id = ? AND status = 'pending' AND lender_id IS NULL",
+                (credit_id,)
+            )
+            credit = await cursor.fetchone()
+            if not credit:
+                await db.rollback()
+                await msg.reply("\u041d\u0435\u0442 \u0442\u0430\u043a\u043e\u0433\u043e \u0437\u0430\u043f\u0440\u043e\u0441\u0430.")
+                return
+
+            borrower_id = int(credit["borrower_id"])
+            if borrower_id == uid:
+                await db.rollback()
+                await msg.reply("\u041d\u0435\u043b\u044c\u0437\u044f \u043f\u0440\u0438\u043d\u044f\u0442\u044c \u0441\u0432\u043e\u0439 \u0436\u0435 \u0437\u0430\u043f\u0440\u043e\u0441.")
+                return
+
+            cursor = await db.execute(
+                "SELECT 1 FROM credits WHERE borrower_id = ? AND status = 'active'",
+                (borrower_id,)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("\u0423 \u0437\u0430\u0435\u043c\u0449\u0438\u043a\u0430 \u0443\u0436\u0435 \u0435\u0441\u0442\u044c \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0439 \u043a\u0440\u0435\u0434\u0438\u0442.")
+                return
+
+            cursor = await db.execute(
+                "SELECT 1 FROM credits WHERE borrower_id = ? AND status = 'pending' AND id != ?",
+                (borrower_id, credit_id)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("\u0423 \u0437\u0430\u0435\u043c\u0449\u0438\u043a\u0430 \u0443\u0436\u0435 \u0435\u0441\u0442\u044c \u0434\u0440\u0443\u0433\u043e\u0439 \u043e\u0436\u0438\u0434\u0430\u044e\u0449\u0438\u0439 \u043a\u0440\u0435\u0434\u0438\u0442.")
+                return
+
+            if await has_defaulted_credit(db, borrower_id):
+                await db.rollback()
+                await msg.reply("\u0423 \u0437\u0430\u0435\u043c\u0449\u0438\u043a\u0430 \u0434\u0435\u0444\u043e\u043b\u0442 \u043f\u043e \u043a\u0440\u0435\u0434\u0438\u0442\u0443.")
+                return
+
+            country_id = await get_user_country_id(db, borrower_id)
+            if not country_id:
+                await db.rollback()
+                await msg.reply("\u0423 \u0437\u0430\u0435\u043c\u0449\u0438\u043a\u0430 \u043d\u0435\u0442 \u0441\u0442\u0440\u0430\u043d\u044b.")
+                return
+
+            cursor = await db.execute("SELECT stability FROM countries WHERE id = ?", (country_id,))
+            row = await cursor.fetchone()
+            stability = int(row[0] or 0) if row else 0
+            if stability < CREDIT_MIN_STABILITY:
+                await db.rollback()
+                await msg.reply("\u0423 \u0437\u0430\u0435\u043c\u0449\u0438\u043a\u0430 \u043d\u0438\u0437\u043a\u0430\u044f \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u044c.")
+                return
+
+            if await get_active_war_for_country(db, country_id):
+                await db.rollback()
+                await msg.reply("\u0423 \u0437\u0430\u0435\u043c\u0449\u0438\u043a\u0430 \u0430\u043a\u0442\u0438\u0432\u043d\u0430\u044f \u0432\u043e\u0439\u043d\u0430.")
+                return
+
+            amount = int(credit["amount"] or 0)
+            interest = float(credit["interest"] or 0)
+            requested_days = int((credit["due_at"] or 0) // 86400)
+            if requested_days <= 0:
+                requested_days = CREDIT_MIN_DAYS
+            days = max(CREDIT_MIN_DAYS, min(CREDIT_MAX_DAYS, requested_days))
+
+            await db.execute("INSERT OR IGNORE INTO users (id, balance) VALUES (?, ?)", (uid, 0))
+            await db.execute("INSERT OR IGNORE INTO users (id, balance) VALUES (?, ?)", (borrower_id, 0))
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            lender_balance = int(row[0] or 0)
+            if lender_balance < amount:
+                await db.rollback()
+                await msg.reply("\u041d\u0435\u0445\u0432\u0430\u0442\u0430\u0435\u0442 \u0441\u0440\u0435\u0434\u0441\u0442\u0432 \u0434\u043b\u044f \u0432\u044b\u0434\u0430\u0447\u0438.")
+                return
+
+            now_ts = int(time.time())
+            due_at = now_ts + days * 86400
+            total_due = amount + int(amount * interest)
+
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, uid))
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, borrower_id))
+            await db.execute(
+                "UPDATE credits SET lender_id = ?, status = 'active', issued_at = ?, due_at = ?, total_due = ? WHERE id = ?",
+                (uid, now_ts, due_at, total_due, credit_id)
+            )
+            await db.commit()
+            logger.info(f"Credit accepted: id={credit_id} lender={uid} borrower={borrower_id} amount={amount}")
+
+        await msg.reply("\u041a\u0440\u0435\u0434\u0438\u0442 \u0432\u044b\u0434\u0430\u043d.")
+    except Exception as e:
+        logger.error(f"credit_accept_cmd error: {e}")
+        await msg.reply("\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u0438 \u0432\u044b\u0434\u0430\u0447\u0435 \u043a\u0440\u0435\u0434\u0438\u0442\u0430.")
+
+
+@router.message(F.text.lower().startswith("\u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u043b\u0430\u0442\u0438\u0442\u044c"))
+async def credit_pay_cmd(msg: Message):
+    parts = msg.text.strip().split()
+    if len(parts) < 4:
+        await msg.reply("\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435: \u043a\u0440\u0435\u0434\u0438\u0442 \u043f\u043b\u0430\u0442\u0438\u0442\u044c <id> <\u0441\u0443\u043c\u043c\u0430>")
+        return
+    try:
+        credit_id = int(parts[2])
+    except Exception:
+        await msg.reply("\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 ID.")
+        return
+    amount = parse_amount(parts[3])
+    if amount <= 0:
+        await msg.reply("\u0421\u0443\u043c\u043c\u0430 \u0434\u043e\u043b\u0436\u043d\u0430 \u0431\u044b\u0442\u044c \u0431\u043e\u043b\u044c\u0448\u0435 \u043d\u0443\u043b\u044f.")
+        return
+
+    uid = msg.from_user.id
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await process_credit_defaults(db, uid)
+            await db.execute("BEGIN IMMEDIATE")
+
+            cursor = await db.execute("SELECT * FROM credits WHERE id = ? AND borrower_id = ?", (credit_id, uid))
+            credit = await cursor.fetchone()
+            if not credit:
+                await db.rollback()
+                await msg.reply("\u041a\u0440\u0435\u0434\u0438\u0442 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d.")
+                return
+
+            if credit["status"] != "active":
+                await db.rollback()
+                status = credit["status"]
+                if status == "pending":
+                    status_text = "??????? ?????????"
+                elif status == "repaid":
+                    status_text = "???????"
+                elif status == "defaulted":
+                    status_text = "??????"
+                else:
+                    status_text = str(status)
+                await msg.reply(f"??????? ????? ?????? ???????? ??????. ??????: {status_text}.")
+                return
+
+            paid = await get_credit_paid_sum(db, credit_id)
+            total_due = int(credit["total_due"] or 0)
+            remaining = max(0, total_due - paid)
+            if remaining <= 0:
+                await db.execute("UPDATE credits SET status = 'repaid' WHERE id = ?", (credit_id,))
+                await db.commit()
+                await msg.reply("\u041a\u0440\u0435\u0434\u0438\u0442 \u0443\u0436\u0435 \u043f\u043e\u0433\u0430\u0448\u0435\u043d.")
+                return
+
+            if amount > remaining:
+                amount = remaining
+
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            balance = int(row[0] or 0) if row else 0
+            if balance < amount:
+                await db.rollback()
+                await msg.reply(f"\u041d\u0435\u0445\u0432\u0430\u0442\u0430\u0435\u0442 \u0434\u0435\u043d\u0435\u0433. \u041d\u0443\u0436\u043d\u043e: {format_money(amount)}")
+                return
+
+            lender_id = int(credit["lender_id"] or 0)
+            now_ts = int(time.time())
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, uid))
+            if lender_id != 0:
+                await db.execute("INSERT OR IGNORE INTO users (id, balance) VALUES (?, ?)", (lender_id, 0))
+                await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, lender_id))
+
+            await db.execute(
+                "INSERT INTO credit_payments (credit_id, amount, paid_at) VALUES (?, ?, ?)",
+                (credit_id, amount, now_ts)
+            )
+
+            remaining -= amount
+            if remaining <= 0:
+                await db.execute("UPDATE credits SET status = 'repaid' WHERE id = ?", (credit_id,))
+
+            await db.commit()
+            logger.info(f"Credit payment: id={credit_id} borrower={uid} amount={amount} remaining={remaining}")
+
+        if remaining <= 0:
+            await msg.reply("\u041a\u0440\u0435\u0434\u0438\u0442 \u043f\u043e\u0433\u0430\u0448\u0435\u043d.")
+        else:
+            await msg.reply(f"\u041f\u043b\u0430\u0442\u0435\u0436 \u043f\u0440\u0438\u043d\u044f\u0442. \u041e\u0441\u0442\u0430\u0442\u043e\u043a: {format_money(remaining)}")
+    except Exception as e:
+        logger.error(f"credit_pay_cmd error: {e}")
+        await msg.reply("\u041e\u0448\u0438\u0431\u043a\u0430 \u043e\u043f\u043b\u0430\u0442\u044b \u043a\u0440\u0435\u0434\u0438\u0442\u0430.")
+
+
+@router.message(F.text.lower().startswith("\u043a\u0440\u0435\u0434\u0438\u0442 \u0441\u0438\u0433\u043c\u0430"))
+async def credit_sigma_cmd(msg: Message):
+    parts = msg.text.strip().split()
+    if len(parts) < 3:
+        await msg.reply("\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435: \u043a\u0440\u0435\u0434\u0438\u0442 \u0441\u0438\u0433\u043c\u0430 <\u0441\u0443\u043c\u043c\u0430>")
+        return
+
+    amount = parse_amount(parts[2])
+    uid = msg.from_user.id
+    interest = CREDIT_SIGMA_INTEREST_PCT / 100
+    total_due = amount + int(amount * interest)
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await process_credit_defaults(db, uid)
+            ok, reason = await check_credit_eligibility(db, uid, amount, True)
+            if not ok:
+                await msg.reply(reason)
+                return
+
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute("INSERT OR IGNORE INTO users (id, balance) VALUES (?, ?)", (uid, 0))
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, uid))
+
+            now_ts = int(time.time())
+            due_at = now_ts + CREDIT_SIGMA_DAYS * 86400
+            await db.execute(
+                "INSERT INTO credits (lender_id, borrower_id, amount, interest, total_due, issued_at, due_at, status) VALUES (0, ?, ?, ?, ?, ?, ?, 'active')",
+                (uid, amount, interest, total_due, now_ts, due_at)
+            )
+            await db.commit()
+            logger.info(f"Sigma credit issued: borrower={uid} amount={amount} interest={interest} days={CREDIT_SIGMA_DAYS}")
+
+        await msg.reply(
+            f"\u041a\u0440\u0435\u0434\u0438\u0442 \u043e\u0442 \u0421\u0438\u0433\u043c\u044b \u0432\u044b\u0434\u0430\u043d. \u0421\u0442\u0430\u0432\u043a\u0430: {CREDIT_SIGMA_INTEREST_PCT}%, \u0441\u0440\u043e\u043a: {CREDIT_SIGMA_DAYS}\u0434.\u0422\u043e\u043b\u044c\u043a\u043e \u0431\u0443\u0434\u044c\u0442\u0435 \u043e\u0441\u0442\u043e\u0440\u043e\u0436\u043d\u044b."
+        )
+    except Exception as e:
+        logger.error(f"credit_sigma_cmd error: {e}")
+        await msg.reply("\u041e\u0448\u0438\u0431\u043a\u0430 \u043e\u0444\u043e\u0440\u043c\u043b\u0435\u043d\u0438\u044f \u043a\u0440\u0435\u0434\u0438\u0442\u0430 \u0421\u0438\u0433\u043c\u044b.")
+
+@router.message(F.text.lower().in_(["войны", "wars"]))
+async def wars_command(msg: Message):
+    """Команда 'войны'"""
+    text, reply_markup = await build_wars_view(msg.from_user.id)
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+
+@router.message(F.text.lower().in_(["война", "war"]))
+async def war_command(msg: Message):
+    """Команда 'война'"""
+    text, reply_markup = await build_war_view(msg.from_user.id)
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+
+async def _handle_war_confirm(msg: Message, token=None):
+    uid = msg.from_user.id
+    challenge = war_challenges.get(uid)
+    if not challenge:
+        return
+    if int(time.time()) > challenge["expires_at"]:
+        war_challenges.pop(uid, None)
+        await msg.reply("Подтверждение истекло. Запустите атаку заново.")
+        return
+    if token and token.upper() != challenge["token"]:
+        await msg.reply("Неверный токен подтверждения.")
+        return
+
+    now = int(time.time())
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await process_credit_defaults(db, uid)
+            if await has_defaulted_credit(db, uid):
+                await msg.reply("\u0423 \u0432\u0430\u0441 \u0434\u0435\u0444\u043e\u043b\u0442 \u043f\u043e \u043a\u0440\u0435\u0434\u0438\u0442\u0443. \u0412\u043e\u0439\u043d\u044b \u0437\u0430\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u043d\u044b.")
+                return
+            await db.execute("BEGIN IMMEDIATE")
+
+            cursor = await db.execute(
+                "SELECT id, owner_user_id, population, last_war_end_ts FROM countries WHERE id = ?",
+                (challenge["attacker_country_id"],)
+            )
+            attacker = await cursor.fetchone()
+            cursor = await db.execute(
+                "SELECT id, owner_user_id, population, last_war_end_ts FROM countries WHERE id = ?",
+                (challenge["defender_country_id"],)
+            )
+            defender = await cursor.fetchone()
+
+            if not attacker or attacker["owner_user_id"] != uid:
+                await db.rollback()
+                await msg.reply("Ваша страна не найдена.")
+                return
+            if not defender or not defender["owner_user_id"] or defender["owner_user_id"] == uid:
+                await db.rollback()
+                await msg.reply("Цель недоступна.")
+                return
+            if int(attacker["population"] or 0) < WAR_MIN_PEOPLE_START:
+                await db.rollback()
+                await msg.reply("Недостаточно армии для начала войны.")
+                return
+
+            cursor = await db.execute("""
+                SELECT 1 FROM wars
+                WHERE status = 'active'
+                  AND (
+                        attacker_country_id IN (?, ?)
+                     OR defender_country_id IN (?, ?)
+                  )
+                LIMIT 1
+            """, (attacker["id"], defender["id"], attacker["id"], defender["id"]))
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("Одна из стран уже в активной войне.")
+                return
+
+            a_cooldown_left = (attacker["last_war_end_ts"] or 0) + WAR_COOLDOWN - now
+            d_cooldown_left = (defender["last_war_end_ts"] or 0) + WAR_COOLDOWN - now
+            if a_cooldown_left > 0 or d_cooldown_left > 0:
+                await db.rollback()
+                await msg.reply("Одна из стран на кулдауне после войны.")
+                return
+
+            await db.execute("""
+                INSERT INTO wars
+                (attacker_country_id, defender_country_id, status, started_at, last_round_at,
+                 attacker_progress, defender_progress, rounds_played, ends_at)
+                VALUES (?, ?, 'active', ?, ?, 0, 0, 0, 0)
+            """, (attacker["id"], defender["id"], now, now))
+
+            await db.commit()
+
+        war_challenges.pop(uid, None)
+        await msg.reply("⚔️ Война объявлена! Первый раунд через 5 минут.")
+    except Exception as e:
+        logger.error(f"Ошибка запуска войны: {e}")
+        await msg.reply("Ошибка запуска войны.")
+
+
+@router.message(F.text.lower().startswith("подтверждаю"))
+async def war_confirm_token_msg(msg: Message):
+    parts = msg.text.strip().split()
+    token = parts[1] if len(parts) > 1 else ""
+    await _handle_war_confirm(msg, token)
+
+
+@router.message(F.text.lower() == "да")
+async def war_confirm_yes_msg(msg: Message):
+    await _handle_war_confirm(msg, None)
+
+@router.message(F.text.lower().in_(["боссы", "bosses"]))
+async def bosses_command(msg: Message):
+    """Команда 'боссы'"""
+    text, reply_markup = await build_bosses_panel(msg.from_user.id)
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+# Глобальная переменная для создания клана (MVP)
+# Command handlers for core economy features
+
+
+def _missing_country_message() -> str:
+    return "Сначала выбери страну: напиши 'выбор страны'."
+
+
+@router.message(F.text.lower() == "выбор страны")
+async def choose_country_cmd(msg: Message):
+    uid = msg.from_user.id
+    if await check_user_has_country(uid):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT name, treasury, stability, population FROM countries WHERE owner_user_id = ?",
+                (uid,)
+            )
+            country = await cursor.fetchone()
+        if not country:
+            await msg.answer("Не удалось найти твой выбор. Напиши 'выбор страны'.")
+            return
+
+        text = (
+            f"🌍 <b>Твоя страна</b>\n\n"
+            f"Название: {country['name']}\n"
+            f"Население: {country['population']:,}\n"
+            f"Казна: {country['treasury']:,}\n"
+            f"Стабильность: {country['stability']}%\n\n"
+            "Смена страны пока недоступна, но можно продолжать развивать текущую."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌍 Моя страна", callback_data="show_my_country")],
+            [InlineKeyboardButton(text="🏠 Назад", callback_data="back_to_menu")]
+        ])
+        await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await show_country_selection(msg)
+
+
+@router.message(F.text.lower() == "собрать доход")
+async def collect_income_cmd(msg: Message):
+    uid = msg.from_user.id
+    country_id = await get_user_country_id_simple(uid)
+    if not country_id:
+        await msg.answer(_missing_country_message())
+        return
+
+    result = await collect_country_income_for_user(uid, country_id)
+    if not result["success"]:
+        await msg.answer(result["error"])
+        return
+
+    lines = [
+        f"Income collected: {result['total_income']:,}",
+        f"Accumulated: {format_duration(result['accumulated_seconds'])} (max 24 h)",
+        f"Next collection: {format_timestamp(result['next_available'])}"
+    ]
+    response = "\n".join(lines)
+    if result.get("event_message"):
+        response += "\n\n" + result['event_message']
+
+    await msg.answer(response)
+@router.message(F.text.lower() == "улучшения")
+async def improvements_cmd(msg: Message):
+    uid = msg.from_user.id
+    country_id = await get_user_country_id_simple(uid)
+    if not country_id:
+        await msg.answer(_missing_country_message())
+        return
+
+    text, markup, err = await build_upgrade_country_menu(country_id, uid)
+    if err == "not_owner":
+        await msg.answer("Сначала нужно стать владельцем страны.")
+        return
+    if err:
+        await msg.answer("Ошибка загрузки меню улучшений.")
+        return
+
+    await msg.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.message(F.text.lower() == "бизнесы")
+async def businesses_cmd(msg: Message):
+    uid = msg.from_user.id
+    country_id = await get_user_country_id_simple(uid)
+    if not country_id:
+        await msg.answer(_missing_country_message())
+        return
+
+    text, markup, err = await build_country_businesses_view(country_id, uid)
+    if err == "not_owner":
+        await msg.answer("Ты не владелец страны.")
+        return
+    if err == "not_found":
+        await msg.answer("Страна не найдена.")
+        return
+    if err:
+        await msg.answer("Ошибка загрузки списка бизнесов.")
+        return
+
+    await msg.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.message(F.text.lower() == "налоги")
+async def taxes_cmd(msg: Message):
+    uid = msg.from_user.id
+    country_id = await get_user_country_id_simple(uid)
+    if not country_id:
+        await msg.answer(_missing_country_message())
+        return
+
+    text, markup, err = await build_tax_menu(country_id, uid)
+    if err == "not_owner":
+        await msg.answer("Ты не владелец своей страны.")
+        return
+    if err:
+        await msg.answer("Ошибка открытия меню налогов.")
+        return
+
+    await msg.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.message(F.text.lower() == "экономика")
+async def economy_cmd(msg: Message):
+    uid = msg.from_user.id
+    country_id = await get_user_country_id_simple(uid)
+    if not country_id:
+        await msg.answer(_missing_country_message())
+        return
+
+    text, markup = await build_country_view(country_id, uid)
+    if not text:
+        await msg.answer("Не удалось показать экономику страны.")
+        return
+
+    await msg.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+# "... (MVP)
+creating_clan = {}
+
+@router.message(F.text.lower().startswith("создать клан "))
+async def create_clan_name(msg: Message):
+    """Создание клана с названием"""
+    uid = msg.from_user.id
+    name = msg.text[13:].strip()  # После "создать клан "
+    
+    if len(name) < 3 or len(name) > 20:
+        await msg.reply("❌ Название клана должно быть 3-20 символов")
+        return
+    
+    price = 1000000  # 1M
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            balance = (await cursor.fetchone())[0]
+            
+            if balance < price:
+                await db.rollback()
+                await msg.reply("❌ Недостаточно средств для создания клана")
+                return
+            
+            cursor = await db.execute("SELECT 1 FROM clans WHERE owner_user_id = ?", (uid,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("❌ У вас уже есть клан")
+                return
+            
+            cursor = await db.execute("SELECT 1 FROM clan_members WHERE user_id = ?", (uid,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("❌ Вы уже в клане")
+                return
+            
+            now = int(time.time())
+            cursor = await db.execute("INSERT INTO clans (name, owner_user_id, created_at) VALUES (?, ?, ?)", (name, uid, now))
+            clan_id = cursor.lastrowid
+            
+            await db.execute("INSERT INTO clan_members (clan_id, user_id, role, joined_at) VALUES (?, ?, 'owner', ?)", (clan_id, uid, now))
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (price, uid))
+            
+            await db.commit()
+        
+        creating_clan.pop(uid, None)
+        await msg.reply(f"✅ Клан '{name}' создан! Стоимость: {price:,}")
+    except Exception as e:
+        logger.error(f"Ошибка create_clan_name: {e}")
+        await msg.reply("❌ Ошибка создания клана")
+
+
+@router.message(F.text.lower().in_(["хелп", "помощь"]))
+async def help_command(msg: Message):
+    is_admin = msg.from_user.id in ADMIN_IDS
+    await msg.answer(build_help_text(is_admin))
+
+
+@router.message(lambda msg: bool(msg.text) and creating_clan.get(msg.from_user.id))
+async def create_clan_name_from_prompt(msg: Message):
+    """Handle clan name input after prompt"""
+    uid = msg.from_user.id
+    if not creating_clan.get(uid):
+        return
+    name = msg.text.strip() if msg.text else ""
+    if not name:
+        return
+    cancel_words = {"otmena", "\u043e\u0442\u043c\u0435\u043d\u0430"}
+    if name.lower() in cancel_words:
+        creating_clan.pop(uid, None)
+        await msg.reply("Clan creation cancelled.")
+        return
+    if name.startswith("/"):
+        await msg.reply("Send a clan name or type 'otmena'.")
+        return
+
+    if len(name) < 3 or len(name) > 20:
+        await msg.reply("Clan name must be 3-20 chars.")
+        return
+
+    price = 1_000_000
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            balance = (await cursor.fetchone())[0]
+            if balance < price:
+                await db.rollback()
+                await msg.reply("Not enough money to create a clan.")
+                return
+
+            cursor = await db.execute("SELECT 1 FROM clans WHERE owner_user_id = ?", (uid,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("You already own a clan.")
+                return
+
+            cursor = await db.execute("SELECT 1 FROM clan_members WHERE user_id = ?", (uid,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("You are already in a clan.")
+                return
+
+            now = int(time.time())
+            cursor = await db.execute(
+                "INSERT INTO clans (name, owner_user_id, created_at) VALUES (?, ?, ?)",
+                (name, uid, now)
+            )
+            clan_id = cursor.lastrowid
+
+            await db.execute(
+                "INSERT INTO clan_members (clan_id, user_id, role, joined_at) VALUES (?, ?, 'owner', ?)",
+                (clan_id, uid, now)
+            )
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (price, uid))
+
+            await db.commit()
+
+        creating_clan.pop(uid, None)
+        await msg.reply(f"Clan '{name}' created. Spent: {price:,}.")
+    except Exception as e:
+        logger.error(f"create_clan_name_from_prompt error: {e}")
+        await msg.reply("Clan creation error.")
+
 # ========== ОБНОВЛЕНИЕ ЮЗЕРНЕЙМА ==========
 @router.message()
 async def update_username_handler(msg: Message):
@@ -6281,6 +9199,7 @@ async def update_username_handler(msg: Message):
     username = msg.from_user.username
     if username:
         await update_username(uid, username)
+    raise SkipHandler
 
 # ========== ФУНКЦИИ ИЗ ДОПОЛНЕНИЯ ==========
 async def cleanup_old_games():
@@ -6820,6 +9739,7 @@ async def mining_claim_callback(cb: CallbackQuery):
         success, btc_amount, result = await claim_mining_profit(uid)
         
         if success:
+            await add_referral_action(uid)
             btc_price = BitcoinMining.get_bitcoin_price()
             usd_value = result if isinstance(result, (int, float)) else btc_amount * btc_price
             
@@ -7571,9 +10491,9 @@ async def sell_plasma_menu_callback(cb: CallbackQuery):
 • Вся плазма → {format_money(plasma_price * user['plasma'])}
 
 📝 <b>Команды для продажи:</b>
-• <code>продать плазму 10</code> - продать 10 единиц
-• <code>продать плазму все</code> - продать всю плазму
-• <code>продать плазму 50</code> - продать 50 единиц
+- <code>продать плазму 10</code> - продать 10 единиц
+- <code>продать плазму все</code> - продать всю плазму
+- <code>продать плазму 50</code> - продать 50 единиц
 """
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -7629,28 +10549,6 @@ async def sell_plasma_callback(cb: CallbackQuery):
         logger.error(f"Ошибка sell_plasma_callback: {e}")
         await cb.answer("❌ Ошибка продажи")
 
-@router.message(F.text.lower().startswith("купить бизнес"))
-async def buy_business_cmd(msg: Message):
-    parts = msg.text.split()
-
-    if len(parts) < 3:
-        await msg.reply("❌ Использование:\n<code>купить бизнес [id]</code>", parse_mode="HTML")
-        return
-
-    try:
-        business_id = int(parts[2])
-    except ValueError:
-        await msg.reply("❌ ID бизнеса должен быть числом")
-        return
-
-    success, result = await buy_business(msg.from_user.id, business_id)
-
-    if success:
-        await msg.reply(result)
-    else:
-        await msg.reply(f"❌ {result}")
-
-        # Команды для продажи BTC
 @router.message(F.text.lower() == "продать биткоины")
 @router.message(F.text.lower() == "продать все биткоины")
 @router.message(F.text.lower() == "продать весь биткоин")
@@ -7773,9 +10671,9 @@ async def my_btc_cmd(msg: Message):
         f"💵 <b>Стоимость:</b> {format_money(int(total_value))}$\n"
         f"📈 <b>Курс BTC:</b> {format_money(int(btc_price))}$ за 1 BTC\n\n"
         f"💡 <b>Команды для продажи:</b>\n"
-        f"• <code>продать биткоин все</code>\n"
-        f"• <code>продать биткоин 0.1</code>\n"
-        f"• <code>продать биткоины</code>",
+        f"- <code>продать биткоин все</code>\n"
+        f"- <code>продать биткоин 0.1</code>\n"
+        f"- <code>продать биткоины</code>",
         parse_mode="HTML",
         reply_markup=keyboard
     )
@@ -7791,30 +10689,6 @@ async def test_handler(msg: Message):
     """Тестовый хендлер для проверки работы бота"""
     await msg.answer("✅ Тест работает! Бот отвечает.")
 
-async def main():
-    await init_db()
-
-    bot = Bot(token=TOKEN)
-    dp = Dispatcher()
-    
-    # Отладочный вывод
-    print("=" * 50)
-    print("📋 ЗАРЕГИСТРИРОВАННЫЕ КОМАНДЫ:")
-    print("=" * 50)
-    
-    dp.include_router(router)
-    
-    # Получаем все зарегистрированные хендлеры
-    for handler in router.message.handlers:
-        if hasattr(handler, 'filters'):
-            for filter in handler.filters:
-                print(f"✅ Команда: {filter}")
-    
-    print("=" * 50)
-    
-    await bot.delete_webhook(drop_pending_updates=True)
-    logger.info(f"✅ Бот запущен!")
-    # ... остальной код
 
 @router.message(F.text.lower() == "проверитьбаланс")
 async def check_balance_test(msg: Message):
@@ -7881,11 +10755,6 @@ async def fix_mining_cmd(msg: Message):
         await db.execute("UPDATE users SET last_mining_claim = ? WHERE id = ?", 
                        (two_hours_ago, uid))
         await db.commit()
-        
-        # Очищаем кэш
-        cache_key = f"user_{uid}"
-        if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-            del get_user.cache[cache_key]
     
     await msg.reply(
         f"✅ <b>Майнинг пофикшен!</b>\n\n"
@@ -7951,10 +10820,6 @@ async def reset_mining_time_callback(cb: CallbackQuery):
         await db.execute("UPDATE users SET last_mining_claim = ? WHERE id = ?", 
                        (current_time - 7200, uid))  # 2 часа назад
         await db.commit()
-        
-        cache_key = f"user_{uid}"
-        if hasattr(get_user, 'cache') and cache_key in get_user.cache:
-            del get_user.cache[cache_key]
     
     await cb.answer("✅ Время сброшено на 2 часа назад!")
     await debug_mining_cmd(cb.message)
@@ -7971,51 +10836,60 @@ async def reset_all_cmd(msg: Message):
     """Сброс всего майнинга"""
     uid = msg.from_user.id
     
-    # Простой SQL запрос
     try:
-        import sqlite3
-        conn = sqlite3.connect('murasaki.db')
-        cursor = conn.cursor()
-        
-        # Время на 5 часов назад
-        new_time = int(time.time()) - 18000
-        
-        cursor.execute("UPDATE users SET last_mining_claim = ?, bitcoin = 0.1, mining_gpu_count = 5 WHERE id = ?", 
-                      (new_time, uid))
-        conn.commit()
-        conn.close()
-        
-        await msg.reply("✅ ВСЁ СБРОШЕНО!\nТеперь введите: майнинг")
-    except Exception as e:
-        await msg.reply(f"❌ Ошибка: {e}")
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Время на 5 часов назад
+            new_time = int(time.time()) - 18000
+            
+            # Обновляем данные пользователя
+            await db.execute("""
+                UPDATE users 
+                SET last_mining_claim = ?, 
+                    bitcoin = 0.1,
+                    mining_gpu_count = CASE WHEN mining_gpu_count = 0 THEN 5 ELSE mining_gpu_count END,
+                    mining_gpu_level = CASE WHEN mining_gpu_level = 0 THEN 1 ELSE mining_gpu_level END
+                WHERE id = ?
+            """, (new_time, uid))
 
+    except Exception as e:
+        pass          
 @router.message(F.text.lower() == "майнинг2")
 async def mining2_cmd(msg: Message):
-    """Альтернативная панель майнинга"""
-    uid = msg.from_user.id
-    
     try:
-        import sqlite3
-        conn = sqlite3.connect('murasaki.db')
-        cursor = conn.cursor()
+        uid = msg.from_user.id
         
-        cursor.execute("SELECT mining_gpu_count, bitcoin FROM users WHERE id = ?", (uid,))
-        data = cursor.fetchone()
-        conn.close()
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            
+            cursor = await db.execute(
+                "SELECT mining_gpu_count, bitcoin, mining_gpu_level, balance FROM users WHERE id = ?", 
+                (uid,)
+            )
+            row = await cursor.fetchone()
         
-        if data:
+        if row:
+            # Рассчитываем хешрейт для информации
+            hashrate = BitcoinMining.calculate_hashrate(row['mining_gpu_count'], row['mining_gpu_level'])
+            btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+            btc_price = BitcoinMining.get_bitcoin_price()
+            
             await msg.reply(
                 f"⛏️ <b>МАЙНИНГ 2.0</b>\n\n"
-                f"🎮 Видеокарт: {data[0] or 0}\n"
-                f"₿ BTC: {data[1] or 0:.8f}\n\n"
+                f"🎮 Видеокарт: {row['mining_gpu_count']} (ур. {row['mining_gpu_level']})\n"
+                f"⚡ Хешрейт: {hashrate:,.0f} MH/s\n"
+                f"₿ BTC: {row['bitcoin']:.8f}\n"
+                f"💰 Стоимость: {format_money(int(row['bitcoin'] * btc_price))}$\n"
+                f"📈 Доход/час: {btc_per_hour:.6f} BTC\n\n"
+                f"💳 Баланс: {format_money(row['balance'])}\n\n"
                 f"💡 Команды:\n"
-                f"• <code>сброс</code> - сбросить всё\n"
-                f"• <code>забрать2</code> - забрать BTC\n"
-                f"• <code>купитьгпу</code> - купить 10 карт",
+                f"- <code>сброс</code> - сбросить всё\n"
+                f"- <code>забрать2</code> - забрать BTC\n"
+                f"- <code>купитьгпу</code> - купить 10 карт\n"
+                f"- <code>майнинг</code> - основная панель",
                 parse_mode="HTML"
             )
         else:
-            await msg.reply("❌ Нет данных")
+            await msg.reply("❌ Пользователь не найден")
     except Exception as e:
         await msg.reply(f"❌ Ошибка: {e}")
 
@@ -8025,29 +10899,53 @@ async def collect2_cmd(msg: Message):
     uid = msg.from_user.id
     
     try:
-        import sqlite3
-        conn = sqlite3.connect('murasaki.db')
-        cursor = conn.cursor()
-        
-        # Получаем BTC
-        cursor.execute("SELECT bitcoin FROM users WHERE id = ?", (uid,))
-        btc = cursor.fetchone()[0] or 0
-        
-        if btc <= 0:
-            cursor.execute("UPDATE users SET bitcoin = 0.05 WHERE id = ?", (uid,))
-            btc = 0.05
-        
-        # Выдаем деньги (1 BTC = 100,000,000$)
-        reward = int(btc * 100000000)
-        cursor.execute("UPDATE users SET balance = balance + ?, bitcoin = 0, last_mining_claim = ? WHERE id = ?", 
-                      (reward, int(time.time()), uid))
-        
-        conn.commit()
-        conn.close()
-        
-        await msg.reply(f"✅ ЗАБРАНО {btc:.8f} BTC!\n💵 +{reward:,}$")
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            
+            # Получаем BTC пользователя
+            cursor = await db.execute("SELECT bitcoin FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            
+            if not row:
+                await msg.reply("❌ Пользователь не найден")
+                return
+            
+            btc = row['bitcoin'] or 0
+            
+            # Если BTC нет, даем немного для теста
+            if btc <= 0:
+                btc = 0.05
+                await db.execute("UPDATE users SET bitcoin = ? WHERE id = ?", (btc, uid))
+            
+            # Выдаем деньги (1 BTC = 100,000,000$)
+            reward = int(btc * 100_000_000)
+            current_time = int(time.time())
+            
+            # Обновляем баланс и сбрасываем BTC
+            await db.execute("""
+                UPDATE users 
+                SET balance = balance + ?, 
+                    bitcoin = 0,
+                    last_mining_claim = ?
+                WHERE id = ?
+            """, (reward, current_time, uid))
+            
+            await db.commit()
+            
+            # Получаем новый баланс для отображения
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            new_balance_row = await cursor.fetchone()
+            new_balance = new_balance_row['balance'] if new_balance_row else reward
+            
+            await msg.reply(
+            f"✅ ЗАБРАНО {btc:.8f} BTC!\n\n"
+            f"💰 <b>Начислено:</b> {reward:,}$\n"
+            f"💳 <b>Новый баланс:</b> {format_money(new_balance)}\n\n"
+            f"🎮 BTC обнулены, майнинг продолжается!"
+        )
     except Exception as e:
-        await msg.reply(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка в collect2_cmd: {e}")
+        await msg.reply(f"❌ Ошибка: {str(e)[:100]}")
 
 @router.message(F.text.lower() == "купитьгпу")
 async def buy_gpu_simple(msg: Message):
@@ -8055,20 +10953,55 @@ async def buy_gpu_simple(msg: Message):
     uid = msg.from_user.id
     
     try:
-        import sqlite3
-        conn = sqlite3.connect('murasaki.db')
-        cursor = conn.cursor()
-        
-        # Добавляем 10 видеокарт уровня 1
-        cursor.execute("UPDATE users SET mining_gpu_count = mining_gpu_count + 10 WHERE id = ?", (uid,))
-        cursor.execute("UPDATE users SET mining_gpu_level = 1 WHERE mining_gpu_level = 0 AND id = ?", (uid,))
-        
-        conn.commit()
-        conn.close()
-        
-        await msg.reply("✅ Куплено 10 видеокарт!")
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Сначала получаем текущие данные пользователя
+            cursor = await db.execute(
+                "SELECT mining_gpu_count, mining_gpu_level, balance FROM users WHERE id = ?", 
+                (uid,)
+            )
+            row = await cursor.fetchone()
+            
+            if not row:
+                await msg.reply("❌ Пользователь не найден")
+                return
+            
+            current_gpu_count = row['mining_gpu_count'] or 0
+            current_gpu_level = row['mining_gpu_level'] or 1
+            
+            # Добавляем 10 видеокарт уровня 1
+            new_gpu_count = current_gpu_count + 10
+            
+            # Обновляем количество видеокарт и уровень если нужно
+            await db.execute("""
+                UPDATE users 
+                SET mining_gpu_count = ?,
+                    mining_gpu_level = CASE WHEN mining_gpu_level = 0 THEN 1 ELSE mining_gpu_level END
+                WHERE id = ?
+            """, (new_gpu_count, uid))
+            
+            await db.commit()
+            
+            # Рассчитываем новую доходность для информации
+            hashrate = BitcoinMining.calculate_hashrate(new_gpu_count, current_gpu_level)
+            btc_per_hour = BitcoinMining.calculate_btc_per_hour(hashrate)
+            btc_price = BitcoinMining.get_bitcoin_price()
+            usd_per_hour = btc_per_hour * btc_price
+            
+        await msg.reply(
+            f"✅ Куплено 10 видеокарт!\n\n"
+            f"📊 <b>Статистика:</b>\n"
+            f"• Было: {current_gpu_count} видеокарт\n"
+            f"• Стало: {new_gpu_count} видеокарт\n"
+            f"• Уровень: {current_gpu_level}/5\n\n"
+            f"⚡ <b>Новые показатели:</b>\n"
+            f"• Хешрейт: {hashrate:,.0f} MH/s\n"
+            f"• BTC/час: {btc_per_hour:.6f}\n"
+            f"• $/час: {format_money(int(usd_per_hour))}\n\n"
+            f"💡 Теперь майнинг будет приносить больше BTC!"
+        )
     except Exception as e:
-        await msg.reply(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка в buy_gpu_simple: {e}")
+        await msg.reply(f"❌ Ошибка: {str(e)[:100]}")
 
 # ВСТАВИТЬ ПЕРЕД async def main():
 # ========== ЗАПУСК ЛОТЕРЕЙНОЙ СИСТЕМЫ ==========
@@ -8091,38 +11024,3457 @@ async def lottery_scheduler():
         except Exception as e:
             logger.error(f"Ошибка в планировщике лотереи: {e}")
 
+@router.message(F.text.lower() == "дебагбаланс")
+async def debug_balance_cmd(msg: Message):
+    """Дебаг баланса"""
+    uid = msg.from_user.id
+    
+    # Делаем несколько запросов подряд
+    balances = []
+    for i in range(5):
+        user = await get_user(uid)
+        balances.append(user['balance'])
+        await asyncio.sleep(0.1)
+    
+        await msg.reply(
+        f"🔍 ДЕБАГ БАЛАНСА {uid}\n\n"
+        f"Балансы за 5 запросов:\n"
+        f"1. {balances[0]:,}\n"
+        f"2. {balances[1]:,}\n"
+        f"3. {balances[2]:,}\n"
+        f"4. {balances[3]:,}\n"
+        f"5. {balances[4]:,}\n\n"
+        f"Разные? {'ДА' if len(set(balances)) > 1 else 'НЕТ'}"
+        )
+
+@router.message(F.text.lower() == "синхронизация")
+async def sync_cmd(msg: Message):
+    """Принудительная синхронизация баланса"""
+    uid = msg.from_user.id
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Получаем ТОЧНЫЙ баланс из БД
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            row = await cursor.fetchone()
+            
+            if row:
+                real_balance = row[0]
+                await msg.reply(
+                    f"✅ ТОЧНЫЙ баланс из БД: {real_balance:,}\n\n"
+                    f"Если в других командах показывается другое число - это ошибка."
+                )
+            else:
+                await msg.reply("❌ Пользователь не найден")
+    except Exception as e:
+        await msg.reply(f"❌ Ошибка: {e}")
+
+async def periodic_world_events():
+    """Периодическая проверка и запуск мировых событий"""
+    while True:
+        try:
+            await check_and_start_world_event()
+        except Exception as e:
+            logger.error(f"Ошибка в periodic_world_events: {e}")
+        await asyncio.sleep(3600)  # Проверяем каждый час
+
 # ========== ЗАПУСК ==========
 async def main():
-        await init_db()
-
-        bot = Bot(token=TOKEN)
-        dp = Dispatcher()
-
-        dp.include_router(router)  # ← ВАЖНЕЕ ВСЕГО
-
-        asyncio.create_task(periodic_cleanup())
-
-        await bot.delete_webhook(drop_pending_updates=True)
-
-        logger.info(f"✅ Бот запущен!")
-        logger.info("🎯 Теперь команды работают И С / И БЕЗ / !")
-        logger.info("🏢 ДОБАВЛЕНЫ БИЗНЕСЫ: 13 бизнесов с системой продуктов!")
-        logger.info("🪐 ДОБАВЛЕНЫ ПЛАНЕТЫ: 5 планет с генерацией плазмы!")
-        logger.info("⛏️ ДОБАВЛЕН МАЙНИНГ: Майнинг ферма с видеокартами и BTC!")
-        logger.info("💼 ДОБАВЛЕНЫ ИНВЕСТИЦИИ: 5 видов инвестиций с риском!")
-        logger.info("🎰 ДОБАВЛЕНЫ АЗАРТНЫЕ ИГРЫ: Монетка, Кости, Слоты, Рулетка, Блэкджек!")
-        logger.info("💰 Бонус: 5-20М каждый час с прогресс-баром!")
-        logger.info("💼 Работа: 1-5М каждые 30 секунд!")
-        logger.info("🎁 СТАРТОВЫЙ БОНУС: 10.000.000!")
-        logger.info("👥 РЕФЕРАЛЬНАЯ СИСТЕМА: 30-100М за каждого друга!")
-        logger.info("📱 Полная поддержка сокращений: 1к, 10кк, 100кк, 1.5к и т.д.")
-        logger.info("🎯 ДОБАВЛЕНА КОМАНДА 'МОЙ БИЗНЕС' с inline-кнопками!")
-        logger.info("💼 ИНВЕСТИЦИИ: Теперь 'начать инвестицию [id]' показывает панель с выбором суммы!")
-        logger.info("⛏️ ДОБАВЛЕНА ПАНЕЛЬ МАЙНИНГА!")
-        logger.info("🪐 ДОБАВЛЕНА ПАНЕЛЬ 'МОИ ПЛАНЕТЫ'!")
-        logger.info("💼 ДОБАВЛЕНА ПАНЕЛЬ ИНВЕСТИЦИЙ!")
+    # Инициализируем БД
+    await init_db()
     
+    # Создаем бота и диспетчер
+    bot = Bot(token=TOKEN)
+    dp = Dispatcher()
+    
+    # Добавляем роутер
+    dp.include_router(router)
+    
+    # Удаляем вебхук
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Запускаем очистку старых игр
+    asyncio.create_task(periodic_cleanup())
+    
+    # Запускаем проверку мировых событий
+    asyncio.create_task(periodic_world_events())
+    
+    # Логируем запуск
+    logger.info("✅ Бот запущен! Используйте команды:")
+
+    logger.info("  /start или 'меню' - главное меню")
+    logger.info("  'профиль' - ваш профиль")
+    logger.info("  'бонус' - получить бонус 200k-1.5MМ")
+    logger.info("  'работа' - заработать 1-5М")
+    logger.info("  'страна' - ваша страна")
+    logger.info("  'страны' - список стран")
+    logger.info("  'кланы' - список кланов")
+    logger.info("  'войны' - текущие войны")
+    logger.info("  'боссы' - рейды на боссов")
+    
+    try:
+        # Запускаем поллинг
         await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Ошибка при запуске поллинга: {e}")
+        raise
+    finally:
+        # Закрываем сессию бота для избежания предупреждений
+        await bot.close()
+
+async def update_population(country_id):
+    import random
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT population, last_population_tick, happiness FROM countries WHERE id = ?", (country_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return
+        population = row[0]
+        last_tick = row[1]
+        happiness = row[2]
+        if last_tick == 0:
+            await db.execute("UPDATE countries SET last_population_tick = ? WHERE id = ?", (now, country_id))
+            await db.commit()
+            return
+        days_passed = (now - last_tick) / 86400
+        if days_passed < 1:
+            return
+        # Получить hospital_level
+        cursor = await db.execute("SELECT level FROM country_buildings WHERE country_id = ? AND building_type = 'hospital'", (country_id,))
+        hospital_row = await cursor.fetchone()
+        hospital_level = hospital_row[0] if hospital_row else 0
+        hospital_bonus = hospital_level * 0.1
+        daily_births = population * 0.003 * (1 + happiness / 200) * (1 + hospital_bonus) * random.uniform(0.8, 1.2)
+        births = daily_births * days_passed
+        deaths = population * 0.001 * days_passed
+        new_population = population + births - deaths
+        new_population = max(0, int(new_population))
+        await db.execute("UPDATE countries SET population = ?, last_population_tick = ? WHERE id = ?", (new_population, now, country_id))
+        # Проверить jobs
+        cursor = await db.execute("SELECT jobs_available FROM countries WHERE id = ?", (country_id,))
+        jobs_row = await cursor.fetchone()
+        jobs = jobs_row[0] if jobs_row else 0
+        if new_population > jobs and jobs > 0:
+            new_birth_rate = 0.003 * 0.5
+            new_happiness = max(0, happiness - 10)
+            await db.execute("UPDATE countries SET birth_rate = ?, happiness = ? WHERE id = ?", (new_birth_rate, new_happiness, country_id))
+        await db.commit()
+        await update_country_stats(country_id)
+
+async def calculate_jobs_available(country_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT building_type, level FROM country_buildings WHERE country_id = ?", (country_id,))
+        buildings = await cursor.fetchall()
+        jobs = 0
+        for btype, level in buildings:
+            if btype in BUILDING_CONFIG and level > 0:
+                jobs += BUILDING_CONFIG[btype]['jobs_provided'] * level
+        businesses, _ = await get_country_businesses(db, country_id)
+        jobs += calculate_business_jobs(businesses)
+        await db.execute("UPDATE countries SET jobs_available = ? WHERE id = ?", (jobs, country_id))
+        await db.commit()
+    return jobs
+
+async def update_country_stats(country_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT tax_rate FROM countries WHERE id = ?", (country_id,))
+        tax_row = await cursor.fetchone()
+        tax_rate = tax_row[0] if tax_row else 0.1
+        cursor = await db.execute("SELECT building_type, level FROM country_buildings WHERE country_id = ?", (country_id,))
+        buildings = await cursor.fetchall()
+        happiness = 70
+        literacy = 50
+        crime = 20
+        for btype, level in buildings:
+            if btype in BUILDING_CONFIG:
+                effects = BUILDING_CONFIG[btype]['effects']
+                happiness += effects.get('happiness_bonus', 0) * level
+                literacy += effects.get('literacy_bonus', 0) * level
+                crime -= effects.get('crime_reduction', 0) * level
+        # Применить налоги
+        if tax_rate > 0.1:
+            happiness_penalty = (tax_rate - 0.1) * 50
+            crime_bonus = (tax_rate - 0.1) * 20
+            happiness -= happiness_penalty
+            crime += crime_bonus
+        happiness = max(0, min(100, happiness))
+        literacy = max(0, min(100, literacy))
+        crime = max(0, min(100, crime))
+        await db.execute("UPDATE countries SET happiness = ?, literacy = ?, crime = ? WHERE id = ?", (happiness, literacy, crime, country_id))
+        await db.commit()
+
+# ========== НОВЫЕ ХЕНДЛЕРЫ ДЛЯ СТРАН, КЛАНОВ, ВОЙН, БОССОВ ==========
+
+async def build_countries_view():
+    max_len = 3500
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT c.id, c.name, c.level, c.owner_user_id, c.treasury, c.stability, c.tax_rate, c.population, c.employment_rate, c.literacy, cl.bonus_income, cl.name as clan_name
+            FROM countries c
+            LEFT JOIN clan_members cm ON c.owner_user_id = cm.user_id
+            LEFT JOIN clans cl ON cm.clan_id = cl.id
+            ORDER BY c.level DESC, c.treasury DESC
+        """)
+        countries = await cursor.fetchall()
+
+    if not countries:
+        text = "🌍 <b>СТРАНЫ</b>\n\nСтраны еще не созданы."
+        return text, None
+
+    text = "🌍 <b>Список стран</b>\n\n"
+    keyboard = []
+
+    for country in countries:
+        owner = "Свободна" if not country['owner_user_id'] else f"Владелец: {country['owner_user_id']}"
+        income_per_day = int(calculate_country_income_hour(country['level'], country['stability'], 0.0) * 24)
+        text += f"🏳️ <b>{country['name']}</b> (ур.{country['level']})\n"
+        text += f"👤 {owner}\n"
+        text += f"👥 Население: {country['population']:,}\n"
+        text += f"💰 Казна: {country['treasury']:,}\n"
+        text += f"📈 Доход/день: {income_per_day:,}\n"
+        text += f"🛡️ Стабильность: {country['stability']}%\n\n"
+
+        keyboard.append([InlineKeyboardButton(text=f"🏳️ {country['name']}", callback_data=f"view_country_{country['id']}")])
+        if len(text) > max_len:
+            text += "?\n\n?? <i>?????? ??????, ??????????? ?????? ??? ?????? ??????.</i>\n"
+            break
+
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def build_clans_view():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT c.id, c.name, c.owner_user_id, c.treasury_money, c.treasury_plasma, c.bonus_income,
+                   COUNT(cm.user_id) as members_count
+            FROM clans c
+            LEFT JOIN clan_members cm ON c.id = cm.clan_id
+            GROUP BY c.id ORDER BY members_count DESC
+        """)
+        clans = await cursor.fetchall()
+
+    if not clans:
+        text = "🏰 <b>Кланы</b>\n\nКланов еще нет."
+        keyboard = [
+            [InlineKeyboardButton(text="➕ Создать клан", callback_data="create_clan")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")],
+        ]
+        return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    text = "🏰 <b>Список кланов</b>\n\n"
+    keyboard = []
+
+    for clan in clans:
+        text += f"⚔️ <b>{clan['name']}</b>\n"
+        text += f"👑 Владелец: {clan['owner_user_id']}\n"
+        text += f"👥 Участники: {clan['members_count']}\n"
+        text += f"💰 Бонус дохода: +{clan['bonus_income']*100:.0f}%\n"
+        text += f"💰 Казна: {clan['treasury_money']:,}\n"
+        text += f"🔷 Плазма: {clan['treasury_plasma']}\n\n"
+
+        keyboard.append([InlineKeyboardButton(text=f"⚔️ {clan['name']}", callback_data=f"view_clan_{clan['id']}")])
+
+    keyboard.append([InlineKeyboardButton(text="➕ Создать клан", callback_data="create_clan")])
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def build_clan_view(clan_id: int, uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT c.*, COUNT(cm.user_id) as members_count
+            FROM clans c
+            LEFT JOIN clan_members cm ON c.id = cm.clan_id
+            WHERE c.id = ?
+            GROUP BY c.id
+        """, (clan_id,))
+        clan = await cursor.fetchone()
+        if not clan:
+            return None, None
+
+        cursor = await db.execute(
+            "SELECT clan_id, role FROM clan_members WHERE user_id = ?",
+            (uid,)
+        )
+        my_row = await cursor.fetchone()
+        my_clan_id = my_row["clan_id"] if my_row else None
+        my_role = my_row["role"] if my_row else None
+
+        cursor = await db.execute(
+            "SELECT 1 FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
+            (clan_id, uid)
+        )
+        has_request = await cursor.fetchone()
+
+        req_count = 0
+        if clan["owner_user_id"] == uid:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM clan_join_requests WHERE clan_id = ?",
+                (clan_id,)
+            )
+            row = await cursor.fetchone()
+            req_count = int(row[0] or 0)
+
+    status_text = "открытый" if clan["is_open"] else "закрытый"
+    text = "🏰 <b>Клан</b>\n\n"
+    text += f"Название: <b>{clan['name']}</b>\n"
+    text += f"Статус: {status_text}\n"
+    text += f"Участников: {clan['members_count']}\n"
+    text += f"Бонус дохода: +{clan['bonus_income']*100:.0f}%\n"
+    text += f"Казна: {clan['treasury_money']:,}\n"
+    text += f"Плазма: {clan['treasury_plasma']}\n\n"
+
+    keyboard = []
+    if my_clan_id == clan_id:
+        text += "Вы состоите в этом клане.\n"
+        if my_role == "owner":
+            text += f"Заявок: {req_count}\n"
+            keyboard.append([InlineKeyboardButton(
+                text="⚙️ Открыть/закрыть",
+                callback_data=f"clan_toggle_{clan_id}"
+            )])
+            keyboard.append([InlineKeyboardButton(
+                text="📨 Заявки",
+                callback_data=f"clan_requests_{clan_id}"
+            )])
+    else:
+        if my_clan_id:
+            text += "Вы уже в другом клане.\n"
+        else:
+            if clan["is_open"]:
+                keyboard.append([InlineKeyboardButton(
+                    text="✅ Вступить",
+                    callback_data=f"join_clan_{clan_id}"
+                )])
+            else:
+                if has_request:
+                    text += "Заявка уже отправлена.\n"
+                else:
+                    keyboard.append([InlineKeyboardButton(
+                        text="📨 Подать заявку",
+                        callback_data=f"request_clan_{clan_id}"
+                    )])
+
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад к кланам", callback_data="show_clans")])
+    keyboard.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def build_wars_view(uid: int):
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        country_id = await get_user_country_id(db, uid)
+        if not country_id:
+            text = "⚔️ <b>Войны</b>\n\nУ вас нет страны."
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
+            ])
+            return text, reply_markup
+
+        active_war = await get_active_war_for_country(db, country_id)
+        winner_user_id = None
+        if active_war:
+            await db.execute("BEGIN IMMEDIATE")
+            result = await process_war_rounds(db, active_war["id"])
+            await db.commit()
+            if result["ended"]:
+                winner_user_id = result["winner_user_id"]
+
+            cursor = await db.execute("SELECT * FROM wars WHERE id = ?", (active_war["id"],))
+            active_war = await cursor.fetchone()
+
+    if winner_user_id:
+        await check_and_award_titles(winner_user_id)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT attacker_country_id, defender_country_id
+            FROM wars
+            WHERE status = 'active'
+        """)
+        active_rows = await cursor.fetchall()
+        active_set = set()
+        for row in active_rows:
+            active_set.add(row["attacker_country_id"])
+            active_set.add(row["defender_country_id"])
+
+        cursor = await db.execute("""
+            SELECT id, name, population, last_war_end_ts
+            FROM countries
+            WHERE owner_user_id IS NOT NULL AND owner_user_id != ?
+            ORDER BY level DESC, population DESC
+            LIMIT 30
+        """, (uid,))
+        targets = await cursor.fetchall()
+
+    text = "⚔️ <b>Войны</b>\n\n"
+    keyboard = []
+
+    allow_attack = True
+    if active_war and active_war["status"] == "active":
+        text += "🛡️ У вас есть активная война.\n"
+        text += "Нажмите «Смотреть войну» для логов и таймера.\n\n"
+        keyboard.append([InlineKeyboardButton(text="📜 Смотреть войну", callback_data="view_war")])
+        allow_attack = False
+
+    if not targets:
+        text += "Нет доступных целей."
+    else:
+        text += "Доступные цели:\n"
+        for t in targets:
+            status = "готово"
+            if t["id"] in active_set:
+                status = "в войне"
+            else:
+                cooldown_left = max(0, (t["last_war_end_ts"] or 0) + WAR_COOLDOWN - now)
+                if cooldown_left > 0:
+                    hours = cooldown_left // 3600
+                    minutes = (cooldown_left % 3600) // 60
+                    status = f"кд {hours}ч {minutes}м"
+
+            text += f"• {t['name']} (люди {t['population']:,}) — {status}\n"
+            if status == "готово" and allow_attack:
+                keyboard.append([InlineKeyboardButton(
+                    text=f"⚔️ Атаковать {t['name']}",
+                    callback_data=f"war_attack_{t['id']}"
+                )])
+
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def build_war_view(uid: int):
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        country_id = await get_user_country_id(db, uid)
+        if not country_id:
+            text = "⚔️ <b>Война</b>\n\nУ вас нет страны."
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="show_wars")]
+            ])
+            return text, reply_markup
+
+        active_war = await get_active_war_for_country(db, country_id)
+        winner_user_id = None
+        if active_war:
+            await db.execute("BEGIN IMMEDIATE")
+            result = await process_war_rounds(db, active_war["id"])
+            await db.commit()
+            if result["ended"]:
+                winner_user_id = result["winner_user_id"]
+
+            cursor = await db.execute("SELECT * FROM wars WHERE id = ?", (active_war["id"],))
+            active_war = await cursor.fetchone()
+
+        if winner_user_id:
+            await check_and_award_titles(winner_user_id)
+
+        if not active_war:
+            text = "⚔️ <b>Война</b>\n\nАктивных войн нет."
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="show_wars")]
+            ])
+            return text, reply_markup
+
+        attacker_id = active_war["attacker_country_id"]
+        defender_id = active_war["defender_country_id"]
+
+        cursor = await db.execute("SELECT name, population FROM countries WHERE id = ?", (attacker_id,))
+        a_row = await cursor.fetchone()
+        cursor = await db.execute("SELECT name, population FROM countries WHERE id = ?", (defender_id,))
+        d_row = await cursor.fetchone()
+
+        a_name = a_row["name"] if a_row else "?"
+        d_name = d_row["name"] if d_row else "?"
+        a_people = int(a_row["population"] or 0) if a_row else 0
+        d_people = int(d_row["population"] or 0) if d_row else 0
+
+        last_round_at = active_war["last_round_at"] or active_war["started_at"]
+        next_round_in = max(0, WAR_ROUND_INTERVAL - (now - last_round_at))
+        nr_h = next_round_in // 3600
+        nr_m = (next_round_in % 3600) // 60
+
+        text = "⚔️ <b>Война</b>\n\n"
+        text += f"{a_name} vs {d_name}\n"
+        text += f"Счет раундов: {active_war['attacker_progress']} : {active_war['defender_progress']}\n"
+        text += f"Раундов: {active_war['rounds_played']}/{WAR_MAX_ROUNDS}\n"
+        text += f"Люди: {a_people:,} vs {d_people:,}\n"
+        text += f"След. раунд через: {nr_h}ч {nr_m}м\n\n"
+
+        cursor = await db.execute("""
+            SELECT action, power, losses_people, losses_weapons, losses_tech, ts, actor_country_id
+            FROM war_logs
+            WHERE war_id = ?
+            ORDER BY id DESC
+            LIMIT 8
+        """, (active_war["id"],))
+        logs = await cursor.fetchall()
+
+        if logs:
+            text += "Последние события:\n"
+            for log in logs:
+                action = log["action"]
+                actor = "Атакующий" if log["actor_country_id"] == attacker_id else "Защитник"
+                if action == "round_win":
+                    action_text = "победил в раунде"
+                elif action == "round_loss":
+                    action_text = "проиграл раунд"
+                elif action == "round_draw":
+                    action_text = "ничья в раунде"
+                elif action == "war_end_win":
+                    action_text = "победа в войне"
+                elif action == "war_end_draw":
+                    action_text = "ничья в войне"
+                else:
+                    action_text = action
+                text += (
+                    f"• {actor}: {action_text} | "
+                    f"потери люд. {log['losses_people']}, "
+                    f"оруж. {log['losses_weapons']}, техн. {log['losses_tech']}\n"
+                )
+        else:
+            text += "Событий пока нет."
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к войнам", callback_data="show_wars")],
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_menu")]
+    ])
+    return text, reply_markup
+
+
+async def award_boss_rewards(boss_id: int):
+    """Выдать награды за победу над боссом"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            
+            # Получаем топ-3 участников по урону
+            cursor = await db.execute("""
+                SELECT user_id, damage 
+                FROM boss_hits 
+                WHERE boss_id = ? AND damage > 0 
+                ORDER BY damage DESC 
+                LIMIT 3
+            """, (boss_id,))
+            top_participants = await cursor.fetchall()
+            
+            # Получаем всех участников с уроном > 0
+            cursor = await db.execute("""
+                SELECT DISTINCT user_id, damage 
+                FROM boss_hits 
+                WHERE boss_id = ? AND damage > 0
+            """, (boss_id,))
+            all_participants = await cursor.fetchall()
+            
+            # Получить эффекты мирового события
+            world_effects = await get_world_event_effects()
+            boss_buff = world_effects.get('boss_buff', 0.0)
+            reward_multiplier = 1 + boss_buff
+            
+            # Награды за участие
+            for participant in all_participants:
+                uid = participant['user_id']
+                damage = participant['damage']
+                money_reward = min(50000, damage * 5) * reward_multiplier
+                
+                await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (int(money_reward), uid))
+                await db.execute("UPDATE users SET weapons_shop_unlocked = 1 WHERE id = ?", (uid,))
+            
+            # Дополнительные награды топ-3
+            rewards = [
+                (100000, 5, 2),  # 1 место: деньги, плутоний, плазма
+                (75000, 3, 1),   # 2 место
+                (50000, 2, 0)    # 3 место
+            ]
+            
+            for i, participant in enumerate(top_participants):
+                if i < len(rewards):
+                    uid = participant['user_id']
+                    money, plut, plasma = rewards[i]
+                    money *= reward_multiplier
+                    plut *= reward_multiplier
+                    plasma *= reward_multiplier
+                    
+                    await db.execute("UPDATE users SET balance = balance + ?, plasma = plasma + ? WHERE id = ?", 
+                                   (int(money), int(plasma), uid))
+                    # Плазма не добавлена, но предположим есть поле для плазмы
+            
+            await db.commit()
+            
+            logger.info(f"Выданы награды за босса {boss_id}: {len(all_participants)} участников")
+    except Exception as e:
+        logger.error(f"Ошибка award_boss_rewards: {e}")
+
+
+def build_bosses_view():
+    text = (
+        "👹 <b>Боссы</b>\n\n"
+        "Рейды на боссов будут доступны в следующих обновлениях."
+    )
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
+    ])
+    return text, reply_markup
+
+
+async def ensure_active_bosses(db: aiosqlite.Connection):
+    now = int(time.time())
+    active_bosses = []
+    for template in BOSS_TEMPLATES:
+        tier = template["tier"]
+        cursor = await db.execute("""
+            SELECT * FROM bosses
+            WHERE status = 'active' AND tier = ? AND ends_at > ?
+            ORDER BY spawned_at DESC
+            LIMIT 1
+        """, (tier, now))
+        boss = await cursor.fetchone()
+        if not boss:
+            spawned_at = now
+            ends_at = now + BOSS_LIFETIME
+            cursor = await db.execute("""
+                INSERT INTO bosses (name, tier, max_hp, hp, attack_power, status, phase, spawned_at, ends_at, level)
+                VALUES (?, ?, ?, ?, ?, 'active', 1, ?, ?, 1)
+            """, (
+                template["name"],
+                template["tier"],
+                template["max_hp"],
+                template["max_hp"],
+                template["attack_power"],
+                spawned_at,
+                ends_at,
+            ))
+            boss_id = cursor.lastrowid
+            cursor = await db.execute("SELECT * FROM bosses WHERE id = ?", (boss_id,))
+            boss = await cursor.fetchone()
+        active_bosses.append(boss)
+    await db.commit()
+    return active_bosses
+
+async def get_user_clan_id(db: aiosqlite.Connection, uid: int):
+    cursor = await db.execute("SELECT clan_id FROM clan_members WHERE user_id = ?", (uid,))
+    row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def get_user_country_id(db: aiosqlite.Connection, uid: int):
+    cursor = await db.execute("SELECT id FROM countries WHERE owner_user_id = ? LIMIT 1", (uid,))
+    row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def get_user_country_id_simple(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        return await get_user_country_id(db, uid)
+
+
+async def get_active_war_for_country(db: aiosqlite.Connection, country_id: int):
+    cursor = await db.execute("""
+        SELECT *
+        FROM wars
+        WHERE status = 'active' AND (attacker_country_id = ? OR defender_country_id = ?)
+        ORDER BY started_at DESC
+        LIMIT 1
+    """, (country_id, country_id))
+    return await cursor.fetchone()
+
+async def has_active_or_pending_credit(db: aiosqlite.Connection, borrower_id: int) -> bool:
+    cursor = await db.execute(
+        "SELECT 1 FROM credits WHERE borrower_id = ? AND status IN ('pending', 'active')",
+        (borrower_id,)
+    )
+    return bool(await cursor.fetchone())
+
+
+async def has_defaulted_credit(db: aiosqlite.Connection, borrower_id: int) -> bool:
+    cursor = await db.execute(
+        "SELECT 1 FROM credits WHERE borrower_id = ? AND status = 'defaulted'",
+        (borrower_id,)
+    )
+    return bool(await cursor.fetchone())
+
+
+async def get_credit_paid_sum(db: aiosqlite.Connection, credit_id: int) -> int:
+    cursor = await db.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM credit_payments WHERE credit_id = ?",
+        (credit_id,)
+    )
+    row = await cursor.fetchone()
+    return int(row[0] or 0)
+
+
+async def apply_credit_default_penalties(db: aiosqlite.Connection, borrower_id: int, is_sigma: bool):
+    country_id = await get_user_country_id(db, borrower_id)
+    if not country_id:
+        return 0
+
+    cursor = await db.execute(
+        "SELECT stability, tax_rate, treasury FROM countries WHERE id = ?",
+        (country_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return 0
+
+    stability, tax_rate, treasury = row
+    stability = int(stability or 0)
+    tax_rate = float(tax_rate or 0.10)
+    treasury = int(treasury or 0)
+
+    if is_sigma:
+        stability_penalty = SIGMA_DEFAULT_STABILITY_PENALTY
+        tax_penalty = SIGMA_DEFAULT_TAX_PENALTY
+        treasury_penalty_pct = SIGMA_DEFAULT_TREASURY_PENALTY_PCT
+    else:
+        stability_penalty = CREDIT_DEFAULT_STABILITY_PENALTY
+        tax_penalty = CREDIT_DEFAULT_TAX_PENALTY
+        treasury_penalty_pct = CREDIT_DEFAULT_TREASURY_PENALTY_PCT
+
+    new_stability = max(0, stability - stability_penalty)
+    new_tax = max(0.01, tax_rate - tax_penalty)
+    fine = int(treasury * treasury_penalty_pct)
+    new_treasury = max(0, treasury - fine)
+
+    await db.execute(
+        "UPDATE countries SET stability = ?, tax_rate = ?, treasury = ? WHERE id = ?",
+        (new_stability, new_tax, new_treasury, country_id)
+    )
+    return fine
+
+
+async def mark_debtor_title(db: aiosqlite.Connection, borrower_id: int, now_ts: int):
+    await db.execute(
+        "INSERT OR IGNORE INTO user_titles (user_id, title_code, obtained_at) VALUES (?, 'debtor', ?)",
+        (borrower_id, now_ts)
+    )
+
+
+async def process_credit_defaults(db: aiosqlite.Connection, borrower_id=None) -> int:
+    db.row_factory = aiosqlite.Row
+    now_ts = int(time.time())
+    params = [now_ts]
+    query = "SELECT * FROM credits WHERE status = 'active' AND due_at > 0 AND due_at <= ?"
+    if borrower_id is not None:
+        query += " AND borrower_id = ?"
+        params.append(borrower_id)
+
+    cursor = await db.execute(query, params)
+    overdue = await cursor.fetchall()
+    if not overdue:
+        return 0
+
+    for credit in overdue:
+        lender_id = int(credit["lender_id"] or 0)
+        is_sigma = lender_id == 0
+        await db.execute("UPDATE credits SET status = 'defaulted' WHERE id = ?", (credit["id"],))
+        fine = await apply_credit_default_penalties(db, int(credit["borrower_id"]), is_sigma)
+        await mark_debtor_title(db, int(credit["borrower_id"]), now_ts)
+        logger.info(
+            f"Credit default: id={credit['id']} borrower={credit['borrower_id']} lender={lender_id} fine={fine} sigma={is_sigma}"
+        )
+
+    await db.commit()
+    return len(overdue)
+
+
+async def check_credit_eligibility(db: aiosqlite.Connection, uid: int, amount: int, is_sigma: bool) -> tuple:
+    if amount <= 0:
+        return False, "\u0421\u0443\u043c\u043c\u0430 \u0434\u043e\u043b\u0436\u043d\u0430 \u0431\u044b\u0442\u044c \u0431\u043e\u043b\u044c\u0448\u0435 \u043d\u0443\u043b\u044f."
+
+    if await has_defaulted_credit(db, uid):
+        return False, "\u0423 \u0432\u0430\u0441 \u0434\u0435\u0444\u043e\u043b\u0442 \u043f\u043e \u043a\u0440\u0435\u0434\u0438\u0442\u0443. \u041a\u0440\u0435\u0434\u0438\u0442\u044b \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b."
+
+    if await has_active_or_pending_credit(db, uid):
+        return False, "\u0423 \u0432\u0430\u0441 \u0443\u0436\u0435 \u0435\u0441\u0442\u044c \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0439 \u0438\u043b\u0438 \u043e\u0436\u0438\u0434\u0430\u044e\u0449\u0438\u0439 \u043a\u0440\u0435\u0434\u0438\u0442."
+
+    country_id = await get_user_country_id(db, uid)
+    if not country_id:
+        return False, "\u0423 \u0432\u0430\u0441 \u043d\u0435\u0442 \u0441\u0442\u0440\u0430\u043d\u044b."
+
+    cursor = await db.execute("SELECT stability FROM countries WHERE id = ?", (country_id,))
+    row = await cursor.fetchone()
+    stability = int(row[0] or 0) if row else 0
+    if stability < CREDIT_MIN_STABILITY:
+        return False, "\u0421\u043b\u0438\u0448\u043a\u043e\u043c \u043d\u0438\u0437\u043a\u0430\u044f \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u044c \u0441\u0442\u0440\u0430\u043d\u044b."
+
+    active_war = await get_active_war_for_country(db, country_id)
+    if active_war:
+        return False, "\u041d\u0435\u043b\u044c\u0437\u044f \u0431\u0440\u0430\u0442\u044c \u043a\u0440\u0435\u0434\u0438\u0442 \u0432\u043e \u0432\u0440\u0435\u043c\u044f \u0432\u043e\u0439\u043d\u044b."
+
+    max_amount = CREDIT_SIGMA_MAX_AMOUNT if is_sigma else CREDIT_MAX_AMOUNT
+    if amount < CREDIT_MIN_AMOUNT or amount > max_amount:
+        return False, f"\u0421\u0443\u043c\u043c\u0430 \u0434\u043e\u043b\u0436\u043d\u0430 \u0431\u044b\u0442\u044c \u043e\u0442 {format_money(CREDIT_MIN_AMOUNT)} \u0434\u043e {format_money(max_amount)}."
+
+    return True, ""
+
+async def get_country_army_state(db: aiosqlite.Connection, country_id: int):
+    cursor = await db.execute(
+        "SELECT owner_user_id, population FROM countries WHERE id = ?",
+        (country_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    owner_user_id = row[0]
+    people = int(row[1] or 0)
+
+    cursor = await db.execute("""
+        SELECT ui.item_id, ui.amount, i.power, i.category
+        FROM user_items ui
+        JOIN items i ON ui.item_id = i.item_id
+        WHERE ui.user_id = ? AND ui.amount > 0
+          AND i.category IN ('weapon', 'armor', 'vehicle')
+    """, (owner_user_id,))
+    rows = await cursor.fetchall()
+
+    weapons_count = 0
+    weapons_power = 0
+    tech_count = 0
+    tech_power = 0
+    weapons_items = []
+    tech_items = []
+
+    for item_id, amount, power, category in rows:
+        amount = int(amount or 0)
+        power = int(power or 0)
+        if category == "vehicle":
+            tech_count += amount
+            tech_power += amount * power
+            tech_items.append((item_id, amount))
+        else:
+            weapons_count += amount
+            weapons_power += amount * power
+            weapons_items.append((item_id, amount))
+
+    return {
+        "owner_user_id": owner_user_id,
+        "people": people,
+        "weapons_count": weapons_count,
+        "weapons_power": weapons_power,
+        "tech_count": tech_count,
+        "tech_power": tech_power,
+        "weapons_items": weapons_items,
+        "tech_items": tech_items,
+    }
+
+
+def _calc_loss_amount(total: int, pct_range):
+    if total <= 0:
+        return 0
+    pct = random.uniform(pct_range[0], pct_range[1])
+    return max(0, int(total * pct))
+
+
+def _distribute_losses(items, loss_total: int):
+    if loss_total <= 0:
+        return {}
+    total = sum(amount for _, amount in items)
+    if total <= 0:
+        return {}
+    loss_total = min(loss_total, total)
+    ratio = loss_total / total
+    allocations = []
+    for item_id, amount in items:
+        raw = amount * ratio
+        base = int(raw)
+        frac = raw - base
+        allocations.append([item_id, amount, base, frac])
+
+    remaining = loss_total - sum(a[2] for a in allocations)
+    allocations.sort(key=lambda x: x[3], reverse=True)
+    for i in range(remaining):
+        allocations[i % len(allocations)][2] += 1
+
+    result = {}
+    for item_id, amount, base, _ in allocations:
+        if base <= 0:
+            continue
+        result[item_id] = min(base, amount)
+    return result
+
+
+async def _apply_category_losses(db: aiosqlite.Connection, owner_user_id: int, categories, loss_total: int):
+    if loss_total <= 0:
+        return 0
+    placeholders = ",".join(["?"] * len(categories))
+    cursor = await db.execute(
+        f"""
+        SELECT ui.item_id, ui.amount
+        FROM user_items ui
+        JOIN items i ON ui.item_id = i.item_id
+        WHERE ui.user_id = ? AND ui.amount > 0 AND i.category IN ({placeholders})
+        """,
+        (owner_user_id, *categories)
+    )
+    rows = await cursor.fetchall()
+    items = [(row[0], int(row[1] or 0)) for row in rows]
+    total = sum(amount for _, amount in items)
+    if total <= 0:
+        return 0
+    loss_total = min(loss_total, total)
+    losses = _distribute_losses(items, loss_total)
+    for item_id, loss in losses.items():
+        await db.execute(
+            "UPDATE user_items SET amount = amount - ? WHERE user_id = ? AND item_id = ?",
+            (loss, owner_user_id, item_id)
+        )
+    return sum(losses.values())
+
+
+async def apply_item_losses(db: aiosqlite.Connection, owner_user_id: int, weapons_loss: int, tech_loss: int):
+    lost_weapons = await _apply_category_losses(db, owner_user_id, ("weapon", "armor"), weapons_loss)
+    lost_tech = await _apply_category_losses(db, owner_user_id, ("vehicle",), tech_loss)
+    return lost_weapons, lost_tech
+
+
+async def process_war_rounds(db: aiosqlite.Connection, war_id: int):
+    cursor = await db.execute("SELECT * FROM wars WHERE id = ?", (war_id,))
+    war = await cursor.fetchone()
+    if not war or war["status"] != "active":
+        return {"changed": False, "ended": False, "winner_user_id": None}
+
+    now = int(time.time())
+    last_round_at = war["last_round_at"] or war["started_at"]
+    rounds_due = (now - last_round_at) // WAR_ROUND_INTERVAL
+    rounds_due = min(WAR_MAX_LAZY_ROUNDS, rounds_due)
+    if rounds_due <= 0:
+        return {"changed": False, "ended": False, "winner_user_id": None}
+
+    attacker_id = war["attacker_country_id"]
+    defender_id = war["defender_country_id"]
+    attacker_score = war["attacker_progress"]
+    defender_score = war["defender_progress"]
+    rounds_played = war["rounds_played"]
+    ended = False
+    winner_country_id = None
+
+    for _ in range(rounds_due):
+        if rounds_played >= WAR_MAX_ROUNDS:
+            break
+
+        attacker_state = await get_country_army_state(db, attacker_id)
+        defender_state = await get_country_army_state(db, defender_id)
+        if not attacker_state or not defender_state:
+            break
+
+        a_people = attacker_state["people"]
+        d_people = defender_state["people"]
+
+        if a_people < WAR_MIN_PEOPLE_ACTIVE or d_people < WAR_MIN_PEOPLE_ACTIVE:
+            if a_people < WAR_MIN_PEOPLE_ACTIVE and d_people < WAR_MIN_PEOPLE_ACTIVE:
+                winner_country_id = None
+            elif a_people < WAR_MIN_PEOPLE_ACTIVE:
+                winner_country_id = defender_id
+            else:
+                winner_country_id = attacker_id
+            ended = True
+            break
+
+        a_power = a_people + attacker_state["weapons_power"] + attacker_state["tech_power"]
+        d_power = d_people + defender_state["weapons_power"] + defender_state["tech_power"]
+
+        a_bonus = await get_country_combat_bonus(db, attacker_id)
+        d_bonus = await get_country_combat_bonus(db, defender_id)
+        a_power = int(a_power * a_bonus)
+        d_power = int(d_power * d_bonus)
+
+        if a_power > d_power:
+            outcome = "attacker"
+            attacker_score += 1
+        elif d_power > a_power:
+            outcome = "defender"
+            defender_score += 1
+        else:
+            outcome = "draw"
+
+        if outcome == "attacker":
+            a_ranges = WAR_LOSS_RANGES["winner"]
+            d_ranges = WAR_LOSS_RANGES["loser"]
+            a_action = "round_win"
+            d_action = "round_loss"
+        elif outcome == "defender":
+            a_ranges = WAR_LOSS_RANGES["loser"]
+            d_ranges = WAR_LOSS_RANGES["winner"]
+            a_action = "round_loss"
+            d_action = "round_win"
+        else:
+            a_ranges = WAR_LOSS_RANGES["draw"]
+            d_ranges = WAR_LOSS_RANGES["draw"]
+            a_action = "round_draw"
+            d_action = "round_draw"
+
+        a_people_loss = _calc_loss_amount(a_people, a_ranges["people"])
+        d_people_loss = _calc_loss_amount(d_people, d_ranges["people"])
+        a_weapons_loss = _calc_loss_amount(attacker_state["weapons_count"], a_ranges["weapons"])
+        d_weapons_loss = _calc_loss_amount(defender_state["weapons_count"], d_ranges["weapons"])
+        a_tech_loss = _calc_loss_amount(attacker_state["tech_count"], a_ranges["tech"])
+        d_tech_loss = _calc_loss_amount(defender_state["tech_count"], d_ranges["tech"])
+
+        await db.execute(
+            """
+            UPDATE countries
+            SET population = CASE WHEN population >= ? THEN population - ? ELSE 0 END
+            WHERE id = ?
+            """,
+            (a_people_loss, a_people_loss, attacker_id)
+        )
+        await db.execute(
+            """
+            UPDATE countries
+            SET population = CASE WHEN population >= ? THEN population - ? ELSE 0 END
+            WHERE id = ?
+            """,
+            (d_people_loss, d_people_loss, defender_id)
+        )
+
+        a_owner = attacker_state["owner_user_id"]
+        d_owner = defender_state["owner_user_id"]
+        a_weapons_loss, a_tech_loss = await apply_item_losses(
+            db, a_owner, a_weapons_loss, a_tech_loss
+        )
+        d_weapons_loss, d_tech_loss = await apply_item_losses(
+            db, d_owner, d_weapons_loss, d_tech_loss
+        )
+
+        ts = int(time.time())
+        await db.execute(
+            """
+            INSERT INTO war_logs
+            (war_id, actor_country_id, action, power, losses_people, losses_weapons, losses_tech, ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (war_id, attacker_id, a_action, a_power, a_people_loss, a_weapons_loss, a_tech_loss, ts)
+        )
+        await db.execute(
+            """
+            INSERT INTO war_logs
+            (war_id, actor_country_id, action, power, losses_people, losses_weapons, losses_tech, ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (war_id, defender_id, d_action, d_power, d_people_loss, d_weapons_loss, d_tech_loss, ts)
+        )
+
+        rounds_played += 1
+        last_round_at += WAR_ROUND_INTERVAL
+
+    if not ended and rounds_played >= WAR_MAX_ROUNDS:
+        if attacker_score > defender_score:
+            winner_country_id = attacker_id
+        elif defender_score > attacker_score:
+            winner_country_id = defender_id
+        else:
+            winner_country_id = None
+        ended = True
+
+    winner_user_id = None
+    if ended:
+        tribute_amount = 0
+        if winner_country_id:
+            loser_country_id = defender_id if winner_country_id == attacker_id else attacker_id
+            cursor = await db.execute(
+                "SELECT treasury, owner_user_id FROM countries WHERE id = ?",
+                (loser_country_id,)
+            )
+            loser_row = await cursor.fetchone()
+            loser_treasury = int(loser_row[0] or 0) if loser_row else 0
+            loser_owner_id = loser_row[1] if loser_row else None
+
+            pct = random.uniform(WAR_TRIBUTE_PCT_RANGE[0], WAR_TRIBUTE_PCT_RANGE[1])
+            tribute_amount = min(WAR_TRIBUTE_CAP, int(loser_treasury * pct))
+            tribute_amount = min(tribute_amount, loser_treasury)
+
+            if tribute_amount > 0:
+                await db.execute(
+                    "UPDATE countries SET treasury = treasury - ? WHERE id = ?",
+                    (tribute_amount, loser_country_id)
+                )
+                await db.execute(
+                    "UPDATE countries SET treasury = treasury + ? WHERE id = ?",
+                    (tribute_amount, winner_country_id)
+                )
+
+            if loser_owner_id:
+                await db.execute(
+                    "UPDATE users SET losses = COALESCE(losses,0) + 1 WHERE id = ?",
+                    (loser_owner_id,)
+                )
+            cursor = await db.execute(
+                "SELECT owner_user_id FROM countries WHERE id = ?",
+                (winner_country_id,)
+            )
+            winner_row = await cursor.fetchone()
+            winner_user_id = winner_row[0] if winner_row else None
+            if winner_user_id:
+                await db.execute(
+                    "UPDATE users SET wins = COALESCE(wins,0) + 1 WHERE id = ?",
+                    (winner_user_id,)
+                )
+
+        now_ts = int(time.time())
+        await db.execute(
+            """
+            UPDATE wars
+            SET status = ?, ends_at = ?, winner_country_id = ?, tribute_amount = ?,
+                attacker_progress = ?, defender_progress = ?, rounds_played = ?, last_round_at = ?
+            WHERE id = ?
+            """,
+            (
+                "finished" if winner_country_id else "draw",
+                now_ts,
+                winner_country_id,
+                tribute_amount,
+                attacker_score,
+                defender_score,
+                rounds_played,
+                last_round_at,
+                war_id,
+            )
+        )
+        await db.execute(
+            "UPDATE countries SET last_war_end_ts = ? WHERE id IN (?, ?)",
+            (now_ts, attacker_id, defender_id)
+        )
+        end_action = "war_end_draw" if not winner_country_id else "war_end_win"
+        await db.execute(
+            """
+            INSERT INTO war_logs
+            (war_id, actor_country_id, action, power, losses_people, losses_weapons, losses_tech, ts)
+            VALUES (?, ?, ?, ?, 0, 0, 0, ?)
+            """,
+            (war_id, winner_country_id or attacker_id, end_action, 0, now_ts)
+        )
+    else:
+        await db.execute(
+            """
+            UPDATE wars
+            SET attacker_progress = ?, defender_progress = ?, rounds_played = ?, last_round_at = ?
+            WHERE id = ?
+            """,
+            (attacker_score, defender_score, rounds_played, last_round_at, war_id)
+        )
+
+    return {"changed": True, "ended": ended, "winner_user_id": winner_user_id}
+
+async def count_user_country_businesses(uid: int) -> int:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            country_id = await get_user_country_id(db, uid)
+            if not country_id:
+                return 0
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM country_businesses WHERE country_id = ? AND level > 0",
+                (country_id,)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        logger.error(f"Ошибка count_user_country_businesses: {e}")
+        return 0
+
+def calculate_business_upgrade_cost(bdef, next_level: int) -> int:
+    return int(bdef["base_cost"] * (next_level ** 1.35))
+
+async def get_country_businesses(db: aiosqlite.Connection, country_id: int):
+    cursor = await db.execute(
+        "SELECT business_code, level, last_upkeep_ts FROM country_businesses WHERE country_id = ?",
+        (country_id,)
+    )
+    rows = await cursor.fetchall()
+    businesses = {}
+    upkeep_ts = {}
+    for row in rows:
+        code, level, last_ts = row
+        businesses[code] = level
+        upkeep_ts[code] = last_ts
+    return businesses, upkeep_ts
+
+async def apply_business_upkeep(db: aiosqlite.Connection, country_id: int) -> int:
+    businesses, upkeep_ts = await get_country_businesses(db, country_id)
+    now = int(time.time())
+    total_upkeep = 0
+
+    for code, level in businesses.items():
+        if level <= 0:
+            continue
+        bdef = BUSINESS_DEFS.get(code)
+        if not bdef:
+            continue
+        last_ts = upkeep_ts.get(code, 0)
+        if last_ts <= 0:
+            await db.execute(
+                "UPDATE country_businesses SET last_upkeep_ts = ? WHERE country_id = ? AND business_code = ?",
+                (now, country_id, code)
+            )
+            continue
+        days = (now - last_ts) // 86400
+        if days <= 0:
+            continue
+        total_upkeep += bdef["upkeep_day"] * level * days
+        new_ts = last_ts + days * 86400
+        await db.execute(
+            "UPDATE country_businesses SET last_upkeep_ts = ? WHERE country_id = ? AND business_code = ?",
+            (new_ts, country_id, code)
+        )
+
+    if total_upkeep > 0:
+        await db.execute(
+            "UPDATE countries SET treasury = CASE WHEN treasury >= ? THEN treasury - ? ELSE 0 END WHERE id = ?",
+            (total_upkeep, total_upkeep, country_id)
+        )
+    return total_upkeep
+
+
+async def ensure_active_boss(db: aiosqlite.Connection):
+    """Гарантирует наличие активных боссов для tier 1-3"""
+    now = int(time.time())
+    
+    for tier in range(1, 4):  # Tier 1, 2, 3
+        cursor = await db.execute("SELECT 1 FROM bosses WHERE status = 'active' AND tier = ?", (tier,))
+        if not await cursor.fetchone():
+            # Создаём босса для этого tier
+            template = next((b for b in BOSS_TEMPLATES if b["tier"] == tier), BOSS_TEMPLATES[0])
+            spawned_at = now
+            ends_at = now + BOSS_LIFETIME
+            cursor = await db.execute("""
+                INSERT INTO bosses (name, tier, max_hp, hp, attack_power, status, phase, spawned_at, ends_at, level)
+                VALUES (?, ?, ?, ?, ?, 'active', 1, ?, ?, 1)
+            """, (
+                template["name"],
+                tier,
+                template["max_hp"],
+                template["max_hp"],
+                template["attack_power"],
+                spawned_at,
+                ends_at,
+            ))
+            await db.commit()
+
+
+async def get_country_combat_bonus(db: aiosqlite.Connection, country_id: int) -> float:
+    cursor = await db.execute("""
+        SELECT building_type, level
+        FROM country_buildings
+        WHERE country_id = ? AND building_type IN ('miltech_center', 'military_academy')
+    """, (country_id,))
+    rows = await cursor.fetchall()
+    total_bonus = 0.0
+    for row in rows:
+        btype = row[0]
+        level = row[1]
+        bonus = BUILDING_CONFIG.get(btype, {}).get("effects", {}).get("combat_bonus", 0)
+        total_bonus += bonus * level
+    return 1.0 + (total_bonus / 100.0)
+
+
+async def get_boss_damage_bonus(db: aiosqlite.Connection, country_id: int) -> float:
+    cursor = await db.execute("SELECT item_id FROM country_unique_items WHERE country_id = ?", (country_id,))
+    rows = await cursor.fetchall()
+    bonus = 0.0
+    for row in rows:
+        item_id = row[0]
+        item = UNIQUE_ITEM_CONFIG.get(item_id)
+        if not item:
+            continue
+        bonus += item.get("boss_damage_bonus_pct", 0)
+    return 1.0 + (bonus / 100.0)
+
+
+async def calculate_boss_damage(db: aiosqlite.Connection, uid: int, country_id: int) -> int:
+    cursor = await db.execute("SELECT population FROM countries WHERE id = ?", (country_id,))
+    country = await cursor.fetchone()
+    people = int(country[0] or 0) if country else 0
+
+    cursor = await db.execute("""
+        SELECT ui.amount, i.power, i.category
+        FROM user_items ui
+        JOIN items i ON ui.item_id = i.item_id
+        WHERE ui.user_id = ? AND i.category IN ('weapon', 'vehicle')
+    """, (uid,))
+    rows = await cursor.fetchall()
+
+    weapons_power = 0
+    vehicles_power = 0
+    weapons_count = 0
+    vehicles_count = 0
+    for amount, power, category in rows:
+        if category == "weapon":
+            weapons_count += amount
+            weapons_power += amount * power
+        else:
+            vehicles_count += amount
+            vehicles_power += amount * power
+
+    required_people = max(1, weapons_count + vehicles_count * 3)
+    people_factor = min(1.0, people / required_people)
+    weapons_power = weapons_power * people_factor
+
+    base_damage = people + weapons_power + vehicles_power
+    country_bonus = await get_country_combat_bonus(db, country_id)
+    boss_bonus = await get_boss_damage_bonus(db, country_id)
+    
+    # Применить эффекты мирового события
+    world_effects = await get_world_event_effects()
+    boss_buff = world_effects.get('boss_buff', 0.0)
+    boss_bonus *= (1 + boss_buff)
+    
+    rand_factor = random.uniform(0.9, 1.1)
+    return max(1, int(base_damage * country_bonus * boss_bonus * rand_factor))
+
+
+async def maybe_award_unique_item(db: aiosqlite.Connection, country_id: int, tier: int):
+    reward = BOSS_REWARD_CONFIG.get(tier)
+    if not reward:
+        return None
+    cursor = await db.execute("SELECT COUNT(*) FROM country_unique_items WHERE country_id = ?", (country_id,))
+    count_row = await cursor.fetchone()
+    if count_row and count_row[0] > 0:
+        return None
+
+    if random.random() > reward["unique_chance"]:
+        return None
+
+    item_id = random.choice(list(UNIQUE_ITEM_CONFIG.keys()))
+    await db.execute("""
+        INSERT OR IGNORE INTO country_unique_items (country_id, item_id, acquired_at)
+        VALUES (?, ?, ?)
+    """, (country_id, item_id, int(time.time())))
+    return item_id
+
+
+async def build_bosses_view(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        # Гарантируем наличие хотя бы одного активного босса
+        await ensure_active_boss(db)
+        
+        cursor = await db.execute("""
+            SELECT * FROM bosses
+            ORDER BY spawned_at DESC
+            LIMIT 10
+        """)
+        bosses = await cursor.fetchall()
+
+        if not bosses:
+            return "🐉 <b>Боссы</b>\n\nБоссы отсутствуют.", InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
+            ])
+
+        text = "🐉 <b>БОССЫ</b>\n\n"
+        keyboard = []
+
+        for boss in bosses:
+            boss_id = boss["id"]
+            max_hp = boss["max_hp"] or 0
+            hp = max(0, boss["hp"] or 0)
+            hp_pct = (hp / max_hp * 100) if max_hp else 0
+            status_text = "🟢 жив" if boss["status"] == "active" else "✅ побеждён"
+            phase_text = f"Фаза {boss['phase'] or 1}"
+
+            text += f"• <b>{boss['name']}</b> (Тир {boss['tier']}) | {status_text}\n"
+            text += f"  HP: {hp:,} / {max_hp:,} ({hp_pct:.1f}%)\n"
+            text += f"  {phase_text}\n\n"
+
+            # Проверяем, атаковал ли пользователь этого босса
+            cursor = await db.execute("SELECT 1 FROM boss_hits WHERE boss_id = ? AND user_id = ?", (boss_id, uid))
+            has_hit = await cursor.fetchone()
+
+            if boss["status"] == "active":
+                if has_hit:
+                    keyboard.append([InlineKeyboardButton(text=f"⚔️ Атаковать {boss['name']}", callback_data=f"attack_boss_{boss_id}")])
+                else:
+                    keyboard.append([InlineKeyboardButton(text=f"⚔️ Атаковать {boss['name']}", callback_data=f"attack_boss_{boss_id}")])
+            else:
+                if has_hit:
+                    keyboard.append([InlineKeyboardButton(text=f"🎁 Забрать награду {boss['name']}", callback_data=f"claim_boss_{boss_id}")])
+
+        keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+        return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def build_bosses_panel(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        bosses = await ensure_active_bosses(db)
+        if not bosses:
+            return "👹 <b>Боссы</b>\n\nНет доступных боссов.", InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
+            ])
+
+        text = "👹 <b>Боссы</b>\n\n"
+        keyboard = []
+        for boss in bosses:
+            max_hp = boss["max_hp"] or 0
+            hp = max(0, boss["hp"] or 0)
+            hp_pct = (hp / max_hp * 100) if max_hp else 0
+            status_text = "🟢 активен" if boss["status"] == "active" else "✅ повержен"
+            text += f"• {boss['name']} (Тир {boss['tier']}) — {hp_pct:.1f}% HP — {status_text}\n"
+            keyboard.append([InlineKeyboardButton(text=f"👹 {boss['name']}", callback_data=f"view_boss_{boss['id']}")])
+
+        cursor = await db.execute("""
+            SELECT b.id, b.name, b.tier
+            FROM bosses b
+            JOIN boss_hits bh ON bh.boss_id = b.id
+            LEFT JOIN boss_rewards_claimed brc
+                ON brc.boss_id = b.id AND brc.user_id = ?
+            WHERE b.status = 'defeated' AND bh.user_id = ? AND brc.boss_id IS NULL
+            ORDER BY b.spawned_at DESC
+        """, (uid, uid))
+        reward_rows = await cursor.fetchall()
+        if reward_rows:
+            text += "\n🎁 Доступные награды:\n"
+            for row in reward_rows:
+                text += f"• {row['name']} (Тир {row['tier']})\n"
+                keyboard.append([InlineKeyboardButton(text=f"🎁 Забрать {row['name']}", callback_data=f"view_boss_{row['id']}")])
+
+        keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+        return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def build_boss_view(uid: int, boss_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await ensure_active_bosses(db)
+        cursor = await db.execute("SELECT * FROM bosses WHERE id = ?", (boss_id,))
+        boss = await cursor.fetchone()
+        if not boss:
+            return "👹 <b>Босс</b>\n\nБосс не найден.", InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 К списку", callback_data="show_bosses")]
+            ])
+
+        max_hp = boss["max_hp"] or 0
+        hp = max(0, boss["hp"] or 0)
+        hp_pct = (hp / max_hp * 100) if max_hp else 0
+
+        cursor = await db.execute("""
+            SELECT bh.user_id, bh.damage, u.username
+            FROM boss_hits bh
+            LEFT JOIN users u ON u.id = bh.user_id
+            WHERE bh.boss_id = ?
+            ORDER BY bh.damage DESC
+            LIMIT 5
+        """, (boss_id,))
+        top_rows = await cursor.fetchall()
+
+        cursor = await db.execute("SELECT ts FROM boss_hits WHERE boss_id = ? AND user_id = ?", (boss_id, uid))
+        last_hit = await cursor.fetchone()
+        now = int(time.time())
+        cooldown_left = 0
+        has_hit = bool(last_hit)
+        if last_hit:
+            cooldown_left = max(0, BOSS_COOLDOWN - (now - int(last_hit[0])))
+
+        cursor = await db.execute("""
+            SELECT 1 FROM boss_rewards_claimed WHERE boss_id = ? AND user_id = ?
+        """, (boss_id, uid))
+        claimed = await cursor.fetchone()
+
+    status_text = "🟢 активен" if boss["status"] == "active" else "✅ повержен"
+    phase_text = f"Фаза {boss['phase'] or 1}"
+
+    text = f"👹 <b>Босс</b>\n\n"
+    text += f"Имя: <b>{boss['name']}</b>\n"
+    text += f"Тир: {boss['tier']} | {status_text}\n"
+    text += f"{phase_text}\n"
+    text += f"HP: {hp:,} / {max_hp:,} ({hp_pct:.1f}%)\n\n"
+
+    if top_rows:
+        text += "Топ урона:\n"
+        for i, row in enumerate(top_rows, 1):
+            uname = row["username"] or str(row["user_id"])
+            text += f"{i}. {uname}: {row['damage']:,}\n"
+        text += "\n"
+    else:
+        text += "Топ урона: пусто.\n\n"
+
+    keyboard = []
+    if boss["status"] == "active":
+        if has_hit:
+            text += "Вы уже били этого босса.\n"
+        elif cooldown_left > 0:
+            text += f"КД: {cooldown_left}с\n"
+        else:
+            keyboard.append([InlineKeyboardButton(text="⚔️ Атаковать", callback_data=f"attack_boss_{boss_id}")])
+    else:
+        if not claimed and has_hit:
+            keyboard.append([InlineKeyboardButton(text="🎁 Забрать награду", callback_data=f"claim_boss_{boss_id}")])
+
+    keyboard.append([InlineKeyboardButton(text="🔙 К списку", callback_data="show_bosses")])
+    keyboard.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+@router.callback_query(F.data == "show_countries")
+async def show_countries_cb(cb: CallbackQuery):
+    """Показать список стран"""
+    try:
+        username = cb.from_user.username or cb.from_user.first_name
+        text, reply_markup = await build_start_country_selection(cb.from_user.id, username)
+        if not text:
+            await cb.answer("Все стартовые страны уже заняты.", show_alert=True)
+            return
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Ошибка show_countries_cb: {e}")
+        await cb.answer("❌ Ошибка загрузки стран")
+
+async def build_country_view(country_id: int, uid: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await apply_business_upkeep(db, country_id)
+            cursor = await db.execute(
+                "SELECT c.*, cl.bonus_income, cl.name as clan_name FROM countries c "
+                "LEFT JOIN clan_members cm ON c.owner_user_id = cm.user_id "
+                "LEFT JOIN clans cl ON cm.clan_id = cl.id WHERE c.id = ?",
+                (country_id,)
+            )
+            country = await cursor.fetchone()
+
+            if not country:
+                return None, None
+
+            cursor = await db.execute("SELECT building_type, level FROM country_buildings WHERE country_id = ?", (country_id,))
+            buildings = await cursor.fetchall()
+            buildings_dict = {b['building_type']: b['level'] for b in buildings}
+            businesses, _ = await get_country_businesses(db, country_id)
+
+        await update_population(country_id)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT jobs_available, population FROM countries WHERE id = ?", (country_id,))
+            row = await cursor.fetchone()
+            if row:
+                jobs = row[0]
+                pop = row[1]
+                employment_rate = min(100, jobs / pop * 100) if pop > 0 else 0
+                await db.execute("UPDATE countries SET employment_rate = ? WHERE id = ?", (employment_rate, country_id))
+                await db.commit()
+            else:
+                employment_rate = 0
+
+        owner = "Свободна" if not country['owner_user_id'] else ("Вы владелец" if country['owner_user_id'] == uid else f"Владелец: {country['owner_user_id']}")
+        income_bonus = calculate_total_income_bonus(buildings, businesses)
+        income_per_day = int(calculate_country_income_hour(country['level'], country['stability'], income_bonus) * 24)
+
+        text = f"🏛️ <b>{country['name']}</b>\n\n"
+        text += f"👑 {owner}\n"
+        text += f"📊 Уровень: {country['level']}\n"
+        text += f"👥 Население: {country['population']:,}\n"
+        text += f"📊 Занятость: {employment_rate:.1f}%\n"
+        text += f"🎓 Грамотность: {country['literacy']}%\n"
+        text += f"😊 Счастье: {country['happiness']}%\n"
+        text += f"🚔 Преступность: {country['crime']}%\n"
+        text += f"💰 Казна: {country['treasury']:,}\n"
+        text += f"📈 Доход/сутки: {income_per_day:,}\n"
+        text += f"🛡️ Стабильность: {country['stability']}%\n"
+        text += f"💸 Налог: {country['tax_rate']*100:.1f}%\n\n"
+        text += "🏗️ <b>Улучшения:</b>\n"
+        for btype, bdata in BUILDING_CONFIG.items():
+            level = buildings_dict.get(btype, 0)
+            text += f"• {bdata['name']}: {level}\n"
+
+        keyboard = []
+        if country['owner_user_id'] == uid:
+            keyboard.append([InlineKeyboardButton(text="💰 Собрать доход", callback_data=f"collect_country_income_{country_id}")])
+            keyboard.append([InlineKeyboardButton(text="🏗️ Улучшить", callback_data=f"upgrade_country_{country_id}")])
+            keyboard.append([InlineKeyboardButton(text="💸 Налоги", callback_data=f"tax_country_{country_id}")])
+        elif not country['owner_user_id']:
+            keyboard.append([InlineKeyboardButton(text="💰 Купить страну", callback_data=f"buy_country_{country_id}")])
+
+        keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+
+        return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+    except Exception as e:
+        logger.error(f"Ошибка build_country_view: {e}")
+        return None, None
+
+@router.callback_query(F.data.startswith("view_country_"))
+async def view_country_cb(cb: CallbackQuery):
+    """Просмотр страны"""
+    country_id = int(cb.data.split("_")[2])
+    uid = cb.from_user.id
+    
+    try:
+        text, reply_markup = await build_country_view(country_id, uid)
+        if not text:
+            await cb.answer("❌ Страна не найдена")
+            return
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Ошибка view_country_cb: {e}")
+        await cb.answer("❌ Ошибка загрузки страны")
+
+@router.callback_query(F.data == "show_my_country")
+async def show_my_country_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            country_id = await get_user_country_id(db, uid)
+
+        if not country_id:
+            await cb.answer("❌ У вас нет страны", show_alert=True)
+            return
+
+        text, reply_markup = await build_country_view(country_id, uid)
+        if not text:
+            await cb.answer("❌ Страна не найдена", show_alert=True)
+            return
+
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Ошибка show_my_country_cb: {e}")
+        await cb.answer("❌ Ошибка загрузки страны", show_alert=True)
+
+@router.callback_query(F.data.startswith("buy_country_"))
+async def buy_country_cb(cb: CallbackQuery):
+    """Купить страну"""
+    country_id = int(cb.data.split("_")[2])
+    uid = cb.from_user.id
+    price = 5000000  # 5M
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            user_balance = (await cursor.fetchone())[0]
+            
+            if user_balance < price:
+                await db.rollback()
+                await cb.answer("❌ Недостаточно средств", show_alert=True)
+                return
+            
+            cursor = await db.execute("SELECT owner_user_id FROM countries WHERE id = ?", (country_id,))
+            owner = (await cursor.fetchone())[0]
+            
+            if owner:
+                await db.rollback()
+                await cb.answer("❌ Страна уже куплена", show_alert=True)
+                return
+            
+            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (price, uid))
+            await db.execute("UPDATE countries SET owner_user_id = ? WHERE id = ?", (uid, country_id))
+            
+            import random
+            population = random.randint(80000, 200000)
+            await db.execute("UPDATE countries SET population = ?, last_population_tick = ? WHERE id = ?", (population, int(time.time()), country_id))
+            
+            await db.commit()
+        
+        await cb.answer("✅ Страна куплена!", show_alert=True)
+        await view_country_cb(cb)  # Обновить вид
+    except Exception as e:
+        logger.error(f"Ошибка buy_country_cb: {e}")
+        await cb.answer("❌ Ошибка покупки")
+
+async def build_upgrade_country_menu(country_id: int, uid: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM countries WHERE id = ? AND owner_user_id = ?", (country_id, uid))
+            country = await cursor.fetchone()
+
+            if not country:
+                return None, None, "not_owner"
+
+            cursor = await db.execute("SELECT building_type, level FROM country_buildings WHERE country_id = ?", (country_id,))
+            buildings = await cursor.fetchall()
+            buildings_dict = {b['building_type']: b['level'] for b in buildings}
+
+        header = f"🌆 <b>Улучшения страны {country['name']}</b>"
+        prompt = "Выберите категорию, чтобы посмотреть доступные улучшения:"
+        text = f"{header}\n\n{prompt}"
+
+        keyboard = [
+            [InlineKeyboardButton(text="💰 Экономика", callback_data=f"upgrade_cat_economy_{country_id}")],
+            [InlineKeyboardButton(text="🏛 Инфраструктура", callback_data=f"upgrade_cat_infra_{country_id}")],
+            [InlineKeyboardButton(text="🏭 Промышленность", callback_data=f"upgrade_cat_industry_{country_id}")],
+            [InlineKeyboardButton(text="🔥 Военное", callback_data=f"upgrade_cat_military_{country_id}")],
+            [InlineKeyboardButton(text="🚀 Космос", callback_data=f"upgrade_cat_space_{country_id}")],
+            [InlineKeyboardButton(text="📄 Назад к стране", callback_data=f"view_country_{country_id}")]
+        ]
+
+        return text, InlineKeyboardMarkup(inline_keyboard=keyboard), None
+    except Exception as e:
+        logger.error(f"build_upgrade_country_menu error: {e}")
+        return None, None, "error"
+@router.callback_query(F.data.startswith("upgrade_country_"))
+async def upgrade_country_cb(cb: CallbackQuery):
+    country_id = int(cb.data.split("_")[2])
+    uid = cb.from_user.id
+
+    text, reply_markup, err = await build_upgrade_country_menu(country_id, uid)
+    if err == "not_owner":
+        await cb.answer("¢?? '‘< ?ç ?>ø?ç>ç‘Å ‘?‘'?ü ‘?‘'‘?ø?‘<")
+        return
+    if err:
+        await cb.answer("¢?? ?‘?ñ+óø úø?‘?‘?úóñ ?ç?‘?")
+        return
+
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+@router.callback_query(F.data.startswith("upgrade_cat_"))
+async def upgrade_cat_cb(cb: CallbackQuery):
+    """Меню улучшений по категории"""
+    parts = cb.data.split("_")
+    category = parts[2]
+    country_id = int(parts[3])
+    uid = cb.from_user.id
+    
+    categories = {
+        'economy': ['parks', 'tax_office', 'development_bank', 'trade_port'],
+        'infra': ['police', 'court', 'hospital', 'power_grid'],
+        'industry': ['logistics_hub', 'industrial_complex', 'nuclear_plant'],
+        'military': ['barracks', 'miltech_center', 'weapons_factory', 'tank_factory', 'air_defense', 'intelligence'],
+        'space': ['space_station', 'research_institute']
+    }
+    
+    if category not in categories:
+        await cb.answer("❌ Неизвестная категория")
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM countries WHERE id = ? AND owner_user_id = ?", (country_id, uid))
+            country = await cursor.fetchone()
+            
+            if not country:
+                await cb.answer("❌ Вы не владелец этой страны")
+                return
+            
+            cursor = await db.execute("SELECT building_type, level FROM country_buildings WHERE country_id = ?", (country_id,))
+            buildings = await cursor.fetchall()
+            buildings_dict = {b['building_type']: b['level'] for b in buildings}
+        
+        text = f"🏗️ <b>Улучшения {category.title()}</b>\n\n"
+        
+        keyboard = []
+        for btype in categories[category]:
+            bdata = BUILDING_CONFIG[btype]
+            level = buildings_dict.get(btype, 0)
+            max_level = bdata['max_level']
+            
+            if level >= max_level:
+                status = f"✅ Макс ({level})"
+                can_upgrade = False
+            else:
+                next_level = level + 1
+                cost = int(bdata['base_cost'] * (next_level ** 1.35))
+                status = f"Ур.{level} → {next_level} ({format_money(cost)})"
+                can_upgrade = True
+            
+            keyboard.append([InlineKeyboardButton(
+                text=f"{bdata['name']}: {status}",
+                callback_data=f"upgrade_building_{btype}_{country_id}" if can_upgrade else f"building_max_{btype}_{country_id}"
+            )])
+
+        if category == "economy":
+            keyboard.append([InlineKeyboardButton(text="💼 Бизнесы", callback_data=f"country_businesses_{country_id}")])
+
+        keyboard.append([InlineKeyboardButton(text="🔙 К категориям", callback_data=f"upgrade_country_{country_id}")])
+        keyboard.append([InlineKeyboardButton(text="🏛️ К стране", callback_data=f"view_country_{country_id}")])
+        
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Ошибка upgrade_cat_cb: {e}")
+        await cb.answer("❌ Ошибка загрузки категории")
+
+async def build_country_businesses_view(country_id: int, uid: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT owner_user_id, treasury FROM countries WHERE id = ?", (country_id,))
+            country = await cursor.fetchone()
+            if not country:
+                return None, None, "not_found"
+            if country["owner_user_id"] != uid:
+                return None, None, "not_owner"
+
+            await apply_business_upkeep(db, country_id)
+            businesses, _ = await get_country_businesses(db, country_id)
+
+        text = "💼 <b>Бизнесы страны</b>\n\n"
+        text += "Развивайте бизнесы для роста дохода и рабочих мест.\n\n"
+
+        keyboard = []
+        for code, bdef in BUSINESS_DEFS.items():
+            level = businesses.get(code, 0)
+            max_level = bdef["max_level"]
+            if level >= max_level:
+                status = f"✅ Макс ({level})"
+                callback = f"business_max_{code}_{country_id}"
+            else:
+                next_level = level + 1
+                cost = calculate_business_upgrade_cost(bdef, next_level)
+                status = f"Ур.{level} → {next_level} ({format_money(cost)})"
+                callback = f"upgrade_country_business_{code}_{country_id}"
+            keyboard.append([InlineKeyboardButton(text=f"{bdef['name']}: {status}", callback_data=callback)])
+
+        keyboard.append([InlineKeyboardButton(text="🔙 К экономике", callback_data=f"upgrade_cat_economy_{country_id}")])
+        return text, InlineKeyboardMarkup(inline_keyboard=keyboard), None
+    except Exception as e:
+        logger.error(f"Ошибка build_country_businesses_view: {e}")
+        return None, None, "error"
+
+@router.callback_query(F.data.startswith("country_businesses_"))
+async def country_businesses_cb(cb: CallbackQuery):
+    try:
+        country_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("❌ Неверные данные", show_alert=True)
+        return
+
+    uid = cb.from_user.id
+    text, reply_markup, err = await build_country_businesses_view(country_id, uid)
+    if err == "not_owner":
+        await cb.answer("❌ Вы не владелец этой страны", show_alert=True)
+        return
+    if err == "not_found":
+        await cb.answer("❌ Страна не найдена", show_alert=True)
+        return
+    if not text:
+        await cb.answer("❌ Ошибка загрузки бизнесов", show_alert=True)
+        return
+
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("business_max_"))
+async def business_max_cb(cb: CallbackQuery):
+    await cb.answer("✅ Уже максимальный уровень")
+
+@router.callback_query(F.data.startswith("upgrade_country_business_"))
+async def upgrade_country_business_cb(cb: CallbackQuery):
+    prefix = "upgrade_country_business_"
+    data = cb.data[len(prefix):]
+    try:
+        code, country_id_str = data.rsplit("_", 1)
+        country_id = int(country_id_str)
+    except Exception:
+        await cb.answer("❌ Неверные данные", show_alert=True)
+        return
+
+    uid = cb.from_user.id
+    bdef = BUSINESS_DEFS.get(code)
+    if not bdef:
+        await cb.answer("❌ Бизнес не найден", show_alert=True)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            cursor = await db.execute("SELECT owner_user_id, treasury FROM countries WHERE id = ?", (country_id,))
+            country = await cursor.fetchone()
+            if not country or country["owner_user_id"] != uid:
+                await db.rollback()
+                await cb.answer("❌ Вы не владелец этой страны", show_alert=True)
+                return
+
+            await apply_business_upkeep(db, country_id)
+
+            cursor = await db.execute(
+                "SELECT level, last_upkeep_ts FROM country_businesses WHERE country_id = ? AND business_code = ?",
+                (country_id, code)
+            )
+            row = await cursor.fetchone()
+            current_level = row["level"] if row else 0
+            last_upkeep_ts = row["last_upkeep_ts"] if row else 0
+
+            if current_level >= bdef["max_level"]:
+                await db.rollback()
+                await cb.answer("✅ Уже максимум", show_alert=True)
+                return
+
+            next_level = current_level + 1
+            cost = calculate_business_upgrade_cost(bdef, next_level)
+            if country["treasury"] < cost:
+                await db.rollback()
+                await cb.answer(f"❌ Недостаточно казны ({format_money(cost)} нужно)", show_alert=True)
+                return
+
+            await db.execute(
+                "UPDATE countries SET treasury = treasury - ? WHERE id = ?",
+                (cost, country_id)
+            )
+
+            if row:
+                await db.execute(
+                    "UPDATE country_businesses SET level = ? WHERE country_id = ? AND business_code = ?",
+                    (next_level, country_id, code)
+                )
+            else:
+                ts = int(time.time())
+                await db.execute(
+                    "INSERT INTO country_businesses (country_id, business_code, level, last_upkeep_ts) VALUES (?, ?, ?, ?)",
+                    (country_id, code, next_level, ts if last_upkeep_ts == 0 else last_upkeep_ts)
+                )
+
+            await db.commit()
+
+        await calculate_jobs_available(country_id)
+        await update_country_stats(country_id)
+
+        new_cb = cb.model_copy(update={"data": f"country_businesses_{country_id}"})
+        await country_businesses_cb(new_cb)
+    except Exception as e:
+        logger.error(f"Ошибка upgrade_country_business_cb: {e}")
+        await cb.answer("❌ Ошибка улучшения бизнеса", show_alert=True)
+
+@router.callback_query(F.data.startswith("upgrade_building_"))
+async def upgrade_building_cb(cb: CallbackQuery):
+    """Улучшить здание"""
+    prefix = "upgrade_building_"
+    data = cb.data[len(prefix):]
+    try:
+        btype, country_id_str = data.rsplit("_", 1)
+        country_id = int(country_id_str)
+    except Exception:
+        await cb.answer("¢?? ?çñú?ç‘?‘'?ø‘? óø‘'ç??‘?ñ‘?")
+        return
+    uid = cb.from_user.id
+    
+    if btype not in BUILDING_CONFIG:
+        await cb.answer("❌ Неизвестное здание")
+        return
+    
+    bdata = BUILDING_CONFIG[btype]
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            
+            cursor = await db.execute("SELECT * FROM countries WHERE id = ? AND owner_user_id = ?", (country_id, uid))
+            country = await cursor.fetchone()
+            
+            if not country:
+                await db.rollback()
+                await cb.answer("❌ Вы не владелец этой страны")
+                return
+            
+            cursor = await db.execute("SELECT level FROM country_buildings WHERE country_id = ? AND building_type = ?", (country_id, btype))
+            current_level = (await cursor.fetchone() or [0])[0]
+            
+            if current_level >= bdata['max_level']:
+                await db.rollback()
+                await cb.answer("❌ Максимальный уровень достигнут")
+                return
+            
+            next_level = current_level + 1
+            cost = int(bdata['base_cost'] * (next_level ** 1.35))
+            
+            if country['treasury'] < cost:
+                await db.rollback()
+                await cb.answer(f"❌ Недостаточно средств в казне ({format_money(cost)} нужно)")
+                return
+            
+            # Списываем деньги
+            await db.execute("UPDATE countries SET treasury = treasury - ? WHERE id = ?", (cost, country_id))
+            
+            # Обновляем уровень здания
+            if current_level == 0:
+                await db.execute("INSERT INTO country_buildings (country_id, building_type, level) VALUES (?, ?, ?)", (country_id, btype, 1))
+            else:
+                await db.execute("UPDATE country_buildings SET level = level + 1 WHERE country_id = ? AND building_type = ?", (country_id, btype))
+            
+            await db.commit()
+        
+        await calculate_jobs_available(country_id)
+        
+        await update_country_stats(country_id)
+        
+        await cb.answer(f"✅ {bdata['name']} улучшен до уровня {next_level}!")
+        # Возвращаемся к меню категории
+        cat_data = {
+            'parks': 'economy', 'tax_office': 'economy', 'development_bank': 'economy', 'trade_port': 'economy',
+            'police': 'infra', 'court': 'infra', 'hospital': 'infra', 'power_grid': 'infra',
+            'logistics_hub': 'industry', 'industrial_complex': 'industry', 'nuclear_plant': 'industry',
+            'barracks': 'military', 'miltech_center': 'military', 'weapons_factory': 'military', 'tank_factory': 'military', 'air_defense': 'military', 'intelligence': 'military',
+            'space_station': 'space', 'research_institute': 'space'
+        }
+        category = cat_data.get(btype, 'economy')
+        new_cb = cb.model_copy(update={"data": f"upgrade_cat_{category}_{country_id}"})
+        await upgrade_cat_cb(new_cb)
+    except Exception as e:
+        logger.error(f"Ошибка upgrade_building_cb: {e}")
+        await cb.answer("❌ Ошибка улучшения")
+
+async def collect_country_income_for_user(uid: int, country_id: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+
+            cursor = await db.execute("SELECT owner_user_id, level, stability, last_tick FROM countries WHERE id = ?", (country_id,))
+            country = await cursor.fetchone()
+
+            if not country or country[0] != uid:
+                await db.rollback()
+                return {"success": False, "error": "Вы не владелец страны."}
+
+            now = int(time.time())
+            last_tick = country[3] or 0
+            elapsed = max(0, now - last_tick)
+            collected_seconds = min(elapsed, 24 * 3600)
+            hours_passed = collected_seconds / 3600
+
+            cursor = await db.execute("SELECT building_type, level FROM country_buildings WHERE country_id = ?", (country_id,))
+            buildings = await cursor.fetchall()
+            businesses, _ = await get_country_businesses(db, country_id)
+            await apply_business_upkeep(db, country_id)
+            income_bonus = calculate_total_income_bonus(buildings, businesses)
+
+            income_per_hour = calculate_country_income_hour(country[1], country[2], income_bonus)
+            total_income = int(income_per_hour * hours_passed)
+
+            current_ts = now
+            cursor = await db.execute("SELECT income_boost_percent, income_boost_until_ts FROM users WHERE id = ?", (uid,))
+            boost_row = await cursor.fetchone()
+            if boost_row and boost_row[0] > 0 and current_ts < boost_row[1]:
+                total_income = int(total_income * (1 + boost_row[0]))
+
+            title_bonuses = await calculate_title_bonuses(uid)
+            income_bonus = title_bonuses.get('income', 0.0)
+            total_income = int(total_income * (1 + income_bonus))
+
+            world_effects = await get_world_event_effects()
+            income_effect = world_effects.get('income', 0.0)
+            total_income = int(total_income * (1 + income_effect))
+
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_income, uid))
+            await db.execute("UPDATE countries SET last_tick = ? WHERE id = ?", (now, country_id))
+
+            event_message = await check_random_events(db, country_id, uid)
+
+            await db.commit()
+
+            await check_and_award_titles(uid)
+
+        return {
+            "success": True,
+            "total_income": total_income,
+            "hours": hours_passed,
+            "accumulated_seconds": collected_seconds,
+            "event_message": event_message,
+            "next_available": now + 24 * 3600
+        }
+    except Exception as e:
+        logger.error(f"collect_country_income_for_user error: {e}")
+        return {"success": False, "error": "Ошибка сбора дохода."}
+
+@router.callback_query(F.data.startswith("collect_country_income_"))
+async def collect_country_income_cb(cb: CallbackQuery):
+    country_id = int(cb.data.split("_")[3])
+    uid = cb.from_user.id
+
+    result = await collect_country_income_for_user(uid, country_id)
+    if not result["success"]:
+        await cb.answer(result["error"], show_alert=True)
+        return
+
+    lines = [
+        f"Income: {result['total_income']:,}",
+        f"Accumulated: {format_duration(result['accumulated_seconds'])} (max 24 h)",
+        f"Next collection: {format_timestamp(result['next_available'])}"
+    ]
+    response = "\n".join(lines)
+    if result.get("event_message"):
+        response += "\n\n" + result['event_message']
+
+    await cb.answer(response, show_alert=True)
+    await view_country_cb(cb)
+
+async def build_tax_menu(country_id: int, uid: int):
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT owner_user_id, tax_rate, stability FROM countries WHERE id = ?", (country_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return None, None, "not_found"
+            if row[0] != uid:
+                return None, None, "not_owner"
+            tax_rate = row[1] or 0.1
+            stability = row[2] or 0
+
+        text = (
+            "🌐 <b>Управление налогами</b>\n\n"
+            f"Текущая ставка: {tax_rate * 100:.1f}%\n"
+            f"Стабильность страны: {stability}%\n\n"
+            "Высокие налоги усиливают доход, но снижают рост и стабильность."
+        )
+
+        keyboard = [
+            [InlineKeyboardButton(text="0%", callback_data=f"set_tax_{country_id}_0")],
+            [InlineKeyboardButton(text="5%", callback_data=f"set_tax_{country_id}_5")],
+            [InlineKeyboardButton(text="10%", callback_data=f"set_tax_{country_id}_10")],
+            [InlineKeyboardButton(text="15%", callback_data=f"set_tax_{country_id}_15")],
+            [InlineKeyboardButton(text="20%", callback_data=f"set_tax_{country_id}_20")],
+            [InlineKeyboardButton(text="🔙 К стране", callback_data=f"view_country_{country_id}")]
+        ]
+
+        return text, InlineKeyboardMarkup(inline_keyboard=keyboard), None
+    except Exception as e:
+        logger.error(f"build_tax_menu error: {e}")
+        return None, None, "error"
+@router.callback_query(F.data.startswith("tax_country_"))
+async def tax_country_cb(cb: CallbackQuery):
+    country_id = int(cb.data.split("_")[2])
+    uid = cb.from_user.id
+
+    text, reply_markup, err = await build_tax_menu(country_id, uid)
+    if err == "not_owner":
+        await cb.answer("в?? ђ?ђз ђ?ђш‘?ђш ‘?‘'‘?ђшђ?ђш", show_alert=True)
+        return
+    if err:
+        await cb.answer("Ошибка управления налогами", show_alert=True)
+        return
+
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+@router.callback_query(F.data.startswith("set_tax_"))
+async def set_tax_cb(cb: CallbackQuery):
+    parts = cb.data.split("_")
+    country_id = int(parts[2])
+    tax_percent = int(parts[3])
+    tax_rate = tax_percent / 100
+    uid = cb.from_user.id
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT owner_user_id FROM countries WHERE id = ?", (country_id,))
+            owner = (await cursor.fetchone())[0]
+            if owner != uid:
+                await cb.answer("❌ Не ваша страна")
+                return
+            
+            await db.execute("UPDATE countries SET tax_rate = ? WHERE id = ?", (tax_rate, country_id))
+            await db.commit()
+            await update_country_stats(country_id)
+        
+        await cb.answer(f"✅ Налог установлен: {tax_percent}%")
+        await view_country_cb(cb)
+    except Exception as e:
+        logger.error(f"Ошибка set_tax_cb: {e}")
+        await cb.answer("❌ Ошибка")
+
+@router.callback_query(F.data == "show_clans")
+async def show_clans_cb(cb: CallbackQuery):
+    """Показать список кланов"""
+    try:
+        text, reply_markup = await build_clans_view()
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Ошибка show_clans_cb: {e}")
+        await cb.answer("❌ Ошибка загрузки кланов")
+
+@router.callback_query(F.data == "create_clan")
+async def create_clan_cb(cb: CallbackQuery):
+    """Создать клан"""
+    creating_clan[cb.from_user.id] = True
+    await cb.message.edit_text(
+        "🏰 <b>СОЗДАНИЕ КЛАНА</b>\n\n"
+        "Введите название клана (3-20 символов):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Отмена", callback_data="show_clans")]
+        ])
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("view_clan_"))
+async def view_clan_cb(cb: CallbackQuery):
+    try:
+        clan_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Ошибка клана.", show_alert=True)
+        return
+    text, reply_markup = await build_clan_view(clan_id, cb.from_user.id)
+    if not text:
+        await cb.answer("Клан не найден.", show_alert=True)
+        return
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("join_clan_"))
+async def join_clan_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        clan_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Ошибка клана.", show_alert=True)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT is_open FROM clans WHERE id = ?", (clan_id,))
+            row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                await cb.answer("Клан не найден.", show_alert=True)
+                return
+            if int(row[0] or 0) != 1:
+                await db.rollback()
+                await cb.answer("Клан закрыт.", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT 1 FROM clan_members WHERE user_id = ?", (uid,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("Вы уже в клане.", show_alert=True)
+                return
+
+            now = int(time.time())
+            await db.execute(
+                "INSERT INTO clan_members (clan_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+                (clan_id, uid, now)
+            )
+            await db.execute(
+                "DELETE FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
+                (clan_id, uid)
+            )
+            await db.commit()
+
+        text, reply_markup = await build_clan_view(clan_id, uid)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await cb.answer("Вы вступили в клан!")
+    except Exception as e:
+        logger.error(f"join_clan_cb error: {e}")
+        await cb.answer("Ошибка вступления.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("request_clan_"))
+async def request_clan_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        clan_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Ошибка клана.", show_alert=True)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT is_open FROM clans WHERE id = ?", (clan_id,))
+            row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                await cb.answer("Клан не найден.", show_alert=True)
+                return
+            if int(row[0] or 0) == 1:
+                await db.rollback()
+                await cb.answer("Клан открыт — можно вступить сразу.", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT 1 FROM clan_members WHERE user_id = ?", (uid,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("Вы уже в клане.", show_alert=True)
+                return
+
+            cursor = await db.execute(
+                "SELECT 1 FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
+                (clan_id, uid)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("Заявка уже отправлена.", show_alert=True)
+                return
+
+            await db.execute(
+                "INSERT INTO clan_join_requests (clan_id, user_id, created_at) VALUES (?, ?, ?)",
+                (clan_id, uid, int(time.time()))
+            )
+            await db.commit()
+
+        text, reply_markup = await build_clan_view(clan_id, uid)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await cb.answer("Заявка отправлена!")
+    except Exception as e:
+        logger.error(f"request_clan_cb error: {e}")
+        await cb.answer("Ошибка заявки.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("clan_toggle_"))
+async def clan_toggle_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        clan_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Ошибка клана.", show_alert=True)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT owner_user_id, is_open FROM clans WHERE id = ?",
+                (clan_id,)
+            )
+            row = await cursor.fetchone()
+            if not row or row[0] != uid:
+                await db.rollback()
+                await cb.answer("Нет прав.", show_alert=True)
+                return
+
+            new_state = 0 if int(row[1] or 0) == 1 else 1
+            await db.execute("UPDATE clans SET is_open = ? WHERE id = ?", (new_state, clan_id))
+            await db.commit()
+
+        text, reply_markup = await build_clan_view(clan_id, uid)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await cb.answer("Статус изменен.")
+    except Exception as e:
+        logger.error(f"clan_toggle_cb error: {e}")
+        await cb.answer("Ошибка настроек.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("clan_requests_"))
+async def clan_requests_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        clan_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Ошибка клана.", show_alert=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT owner_user_id FROM clans WHERE id = ?", (clan_id,))
+        row = await cursor.fetchone()
+        if not row or row["owner_user_id"] != uid:
+            await cb.answer("Нет прав.", show_alert=True)
+            return
+
+        cursor = await db.execute("""
+            SELECT r.user_id, u.username, r.created_at
+            FROM clan_join_requests r
+            LEFT JOIN users u ON u.id = r.user_id
+            WHERE r.clan_id = ?
+            ORDER BY r.created_at ASC
+            LIMIT 10
+        """, (clan_id,))
+        reqs = await cursor.fetchall()
+
+    text = "📨 <b>Заявки в клан</b>\n\n"
+    keyboard = []
+    if not reqs:
+        text += "Заявок нет."
+    else:
+        for row in reqs:
+            uname = row["username"] or str(row["user_id"])
+            text += f"• {uname}\n"
+            keyboard.append([
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"clan_accept_{clan_id}_{row['user_id']}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"clan_reject_{clan_id}_{row['user_id']}")
+            ])
+
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"view_clan_{clan_id}")])
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("clan_accept_"))
+async def clan_accept_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split("_")
+    if len(parts) < 4:
+        await cb.answer("Ошибка.", show_alert=True)
+        return
+    clan_id = int(parts[2])
+    target_id = int(parts[3])
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT owner_user_id FROM clans WHERE id = ?", (clan_id,))
+            row = await cursor.fetchone()
+            if not row or row[0] != uid:
+                await db.rollback()
+                await cb.answer("Нет прав.", show_alert=True)
+                return
+
+            cursor = await db.execute(
+                "SELECT 1 FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
+                (clan_id, target_id)
+            )
+            if not await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("Заявка не найдена.", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT 1 FROM clan_members WHERE user_id = ?", (target_id,))
+            if await cursor.fetchone():
+                await db.execute(
+                    "DELETE FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
+                    (clan_id, target_id)
+                )
+                await db.commit()
+                await cb.answer("Уже в клане.", show_alert=True)
+                return
+
+            now = int(time.time())
+            await db.execute(
+                "INSERT INTO clan_members (clan_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+                (clan_id, target_id, now)
+            )
+            await db.execute(
+                "DELETE FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
+                (clan_id, target_id)
+            )
+            await db.commit()
+
+        await clan_requests_cb(cb)
+    except Exception as e:
+        logger.error(f"clan_accept_cb error: {e}")
+        await cb.answer("Ошибка.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("clan_reject_"))
+async def clan_reject_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split("_")
+    if len(parts) < 4:
+        await cb.answer("Ошибка.", show_alert=True)
+        return
+    clan_id = int(parts[2])
+    target_id = int(parts[3])
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT owner_user_id FROM clans WHERE id = ?", (clan_id,))
+            row = await cursor.fetchone()
+            if not row or row[0] != uid:
+                await db.rollback()
+                await cb.answer("Нет прав.", show_alert=True)
+                return
+
+            await db.execute(
+                "DELETE FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
+                (clan_id, target_id)
+            )
+            await db.commit()
+
+        await clan_requests_cb(cb)
+    except Exception as e:
+        logger.error(f"clan_reject_cb error: {e}")
+        await cb.answer("Ошибка.", show_alert=True)
+
+@router.callback_query(F.data == "show_wars")
+async def show_wars_cb(cb: CallbackQuery):
+    """Показать войны"""
+    text, reply_markup = await build_wars_view(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "view_war")
+async def view_war_cb(cb: CallbackQuery):
+    """Показать активную войну"""
+    text, reply_markup = await build_war_view(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("war_attack_"))
+async def war_attack_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await process_credit_defaults(db, uid)
+            if await has_defaulted_credit(db, uid):
+                await cb.answer("\u0423 \u0432\u0430\u0441 \u0434\u0435\u0444\u043e\u043b\u0442 \u043f\u043e \u043a\u0440\u0435\u0434\u0438\u0442\u0443. \u0412\u043e\u0439\u043d\u044b \u0437\u0430\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u043d\u044b.", show_alert=True)
+                return
+    except Exception as e:
+        logger.error(f"credit default check in war_attack_cb: {e}")
+    try:
+        defender_country_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Ошибка цели.", show_alert=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        attacker_country_id = await get_user_country_id(db, uid)
+        if not attacker_country_id:
+            await cb.answer("У вас нет страны.", show_alert=True)
+            return
+
+    token = hashlib.md5(f"{uid}:{defender_country_id}:{time.time()}".encode()).hexdigest()[:6].upper()
+    war_challenges[uid] = {
+        "token": token,
+        "attacker_country_id": attacker_country_id,
+        "defender_country_id": defender_country_id,
+        "expires_at": int(time.time()) + 300
+    }
+
+    text = (
+        "⚔️ <b>Подтверждение войны</b>\n\n"
+        "Чтобы начать войну, отправьте:\n"
+        f"<code>подтверждаю {token}</code>\n"
+        "или просто <code>ДА</code> (в течение 5 минут)."
+    )
+    await cb.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к войнам", callback_data="show_wars")]
+        ])
+    )
+    await cb.answer()
+
+@router.callback_query(F.data == "show_bosses")
+async def show_bosses_cb(cb: CallbackQuery):
+    """Показать боссов"""
+    text, reply_markup = await build_bosses_panel(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("view_boss_"))
+async def view_boss_cb(cb: CallbackQuery):
+    try:
+        boss_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Ошибка босса.", show_alert=True)
+        return
+    text, reply_markup = await build_boss_view(cb.from_user.id, boss_id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("attack_boss_"))
+async def attack_boss_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        boss_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Некорректный босс.", show_alert=True)
+        return
+
+    cb_id = str(cb.id)
+    if await is_callback_processed(cb_id):
+        await cb.answer("Уже обработано.", show_alert=False)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT 1 FROM processed_callbacks WHERE id = ?", (cb_id,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("Уже обработано.", show_alert=False)
+                return
+
+            cursor = await db.execute("SELECT * FROM bosses WHERE id = ?", (boss_id,))
+            boss = await cursor.fetchone()
+            if not boss or boss["status"] != "active":
+                await db.rollback()
+                await cb.answer("Босс не активен.", show_alert=True)
+                return
+
+            clan_id = await get_user_clan_id(db, uid)
+            if not clan_id:
+                await db.rollback()
+                await cb.answer("Нужно состоять в клане.", show_alert=True)
+                return
+
+            country_id = await get_user_country_id(db, uid)
+            if not country_id:
+                await db.rollback()
+                await cb.answer("Нужна страна.", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT ts FROM boss_hits WHERE user_id = ? ORDER BY ts DESC LIMIT 1", (uid,))
+            last_any_hit = await cursor.fetchone()
+            now = int(time.time())
+            if last_any_hit and now - int(last_any_hit[0]) < BOSS_COOLDOWN:
+                await db.rollback()
+                await cb.answer("КД ещё не закончился.", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT 1 FROM boss_hits WHERE boss_id = ? AND user_id = ?", (boss_id, uid))
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("Вы уже атаковали этого босса.", show_alert=True)
+                return
+
+            damage = await calculate_boss_damage(db, uid, country_id)
+            if boss["tier"] == 6 and boss["hp"] <= boss["max_hp"] * 0.5:
+                damage = int(damage * 0.9)
+
+            new_hp = max(0, boss["hp"] - damage)
+            new_phase = boss["phase"]
+            if boss["tier"] == 6 and new_hp <= boss["max_hp"] * 0.5:
+                new_phase = 2
+
+            await db.execute("""
+                INSERT INTO boss_hits (boss_id, clan_id, user_id, country_id, damage, ts)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (boss_id, clan_id, uid, country_id, damage, now))
+
+            if new_hp <= 0:
+                await db.execute("""
+                    UPDATE bosses SET hp = ?, status = 'defeated', phase = ?, ends_at = ?
+                    WHERE id = ?
+                """, (new_hp, new_phase, now, boss_id))
+            else:
+                await db.execute("""
+                    UPDATE bosses SET hp = ?, phase = ?
+                    WHERE id = ?
+                """, (new_hp, new_phase, boss_id))
+
+            await db.execute("INSERT INTO processed_callbacks (id, ts) VALUES (?, ?)", (cb_id, now))
+            await db.commit()
+
+        await cb.answer(f"Урон: {damage:,}!", show_alert=True)
+        text, reply_markup = await build_boss_view(uid, boss_id)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Boss attack error: {e}")
+        await cb.answer("Атака не удалась.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("claim_boss_"))
+async def claim_boss_rewards_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        boss_id = int(cb.data.split("_")[2])
+    except Exception:
+        await cb.answer("Некорректный босс.", show_alert=True)
+        return
+
+    cb_id = str(cb.id)
+    if await is_callback_processed(cb_id):
+        await cb.answer("Уже обработано.", show_alert=False)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT 1 FROM processed_callbacks WHERE id = ?", (cb_id,))
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("Уже обработано.", show_alert=False)
+                return
+
+            cursor = await db.execute("SELECT * FROM bosses WHERE id = ?", (boss_id,))
+            boss = await cursor.fetchone()
+            if not boss or boss["status"] != "defeated":
+                await db.rollback()
+                await cb.answer("Босс ещё не побеждён.", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT damage, country_id FROM boss_hits WHERE boss_id = ? AND user_id = ?", (boss_id, uid))
+            hit = await cursor.fetchone()
+            if not hit or hit["damage"] <= 0:
+                await db.rollback()
+                await cb.answer("Вы не участвовали.", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT 1 FROM boss_rewards_claimed WHERE boss_id = ? AND user_id = ?", (boss_id, uid))
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("Награда уже получена.", show_alert=True)
+                return
+
+            tier = boss["tier"]
+            reward = BOSS_REWARD_CONFIG.get(tier, {"money": 0, "plasma": 0, "unique_chance": 0})
+            participation_money = min(50_000, hit["damage"] * 5)
+            total_money = participation_money + reward["money"]
+            plasma_reward = reward["plasma"]
+
+            await db.execute("""
+                UPDATE users
+                SET balance = balance + ?, plasma = plasma + ?
+                WHERE id = ?
+            """, (total_money, plasma_reward, uid))
+
+            if tier >= 4:
+                unlock_until = int(time.time()) + 7 * 24 * 60 * 60
+                await db.execute("""
+                    UPDATE users
+                    SET weapons_shop_unlocked = 1,
+                        weapons_shop_unlock_until = CASE
+                            WHEN weapons_shop_unlock_until > ? THEN weapons_shop_unlock_until
+                            ELSE ?
+                        END
+                    WHERE id = ?
+                """, (unlock_until, unlock_until, uid))
+
+            unique_item_id = await maybe_award_unique_item(db, hit["country_id"], tier)
+
+            await db.execute("INSERT INTO boss_rewards_claimed (boss_id, user_id) VALUES (?, ?)", (boss_id, uid))
+            await db.execute("INSERT INTO processed_callbacks (id, ts) VALUES (?, ?)", (cb_id, int(time.time())))
+            await db.commit()
+
+        msg = f"Награды: +{total_money:,} денег, +{plasma_reward} плазмы."
+        if unique_item_id:
+            msg += f" Уникальный предмет: {UNIQUE_ITEM_CONFIG[unique_item_id]['name']}."
+        await cb.answer(msg, show_alert=True)
+        text, reply_markup = await build_boss_view(uid, boss_id)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Boss claim error: {e}")
+        await cb.answer("Не удалось забрать награду.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("select_country_"))
+async def select_country_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    country_code = cb.data.split("_")[2]
+    
+    # Проверяем, не выбрал ли уже страну
+    if await check_user_has_country(uid):
+        await cb.answer("Вы уже выбрали страну!", show_alert=True)
+        return
+    
+    # Создаем страну
+    success = await create_user_country(uid, country_code)
+    
+    if success:
+        # Получаем данные страны
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT name FROM countries WHERE owner_user_id = ?", (uid,))
+            row = await cursor.fetchone()
+            country_name = row[0] if row else "Неизвестная"
+        
+        text = f"""
+🏰 <b>СТРАНА ВЫБРАНА!</b>
+
+🌍 <b>Вы стали правителем страны "{country_name}"!</b>
+
+Теперь вы можете развивать свою страну, собирать налоги, строить здания и участвовать в войнах.
+
+Используйте <code>моя страна</code> для управления.
+
+Добро пожаловать в MURASAKI EMPIRE! 🎉
+"""
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌍 Моя страна", callback_data="show_my_country")],
+            [InlineKeyboardButton(text="🎮 Начать игру", callback_data="back_to_menu")]
+        ])
+        
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await cb.answer("Страна создана! Добро пожаловать!")
+    else:
+        await cb.answer("Ошибка создания страны. Попробуйте еще раз.", show_alert=True)
+
+
+# ========== SPACE HANDLERS ==========
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours <= 0:
+        return f"{minutes}\u043c"
+    return f"{hours}\u0447 {minutes}\u043c"
+
+
+async def build_space_menu(uid: int):
+    access, country_id, station_level = await get_user_space_access(uid)
+    if not access:
+        return None, None, None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT plasma, plutonium, artifacts, tech_data, space_prestige FROM users WHERE id = ?",
+            (uid,)
+        )
+        user = await cursor.fetchone()
+        cursor = await db.execute("SELECT COUNT(1) FROM space_discoveries WHERE user_id = ?", (uid,))
+        discoveries = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(1) FROM space_colonies WHERE owner_user_id = ?", (uid,))
+        colonies = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT COUNT(1) FROM space_expeditions WHERE user_id = ? AND status = 'active'",
+            (uid,)
+        )
+        active = (await cursor.fetchone())[0]
+        techs = await get_user_space_techs(db, uid)
+        max_active = get_max_active_expeditions(station_level, techs)
+
+    text = (
+        f"\U0001F30C \u041a\u043e\u0441\u043c\u043e\u0441\\n\\n"
+        f"\u0421\u0442\u0430\u043d\u0446\u0438\u044f: \u0443\u0440. {station_level}\\n"
+        f"\u042d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u0438: {active}/{max_active}\\n"
+        f"\u041e\u0442\u043a\u0440\u044b\u0442\u0438\u044f: {discoveries}\\n"
+        f"\u041a\u043e\u043b\u043e\u043d\u0438\u0438: {colonies}\\n\\n"
+        f"\u0420\u0435\u0441\u0443\u0440\u0441\u044b:\\n"
+        f"- \u041f\u043b\u0430\u0437\u043c\u0430: {user['plasma']}\\n"
+        f"- \u041f\u043b\u0443\u0442\u043e\u043d\u0438\u0439: {user['plutonium']}\\n"
+        f"- \u0410\u0440\u0442\u0435\u0444\u0430\u043a\u0442\u044b: {user['artifacts']}\\n"
+        f"- \u0422\u0435\u0445\u043d\u043e\u0434\u0430\u043d\u043d\u044b\u0435: {user['tech_data']}\\n"
+        f"\u041f\u0440\u0435\u0441\u0442\u0438\u0436: {user['space_prestige']}"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\U0001F680 \u042d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u0438", callback_data="space_expeditions")],
+        [InlineKeyboardButton(text="\u23F3 \u0410\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u043f\u043e\u043b\u0451\u0442\u044b", callback_data="space_active")],
+        [InlineKeyboardButton(text="\U0001F52D \u041e\u0442\u043a\u0440\u044b\u0442\u0438\u044f", callback_data="space_discoveries")],
+        [InlineKeyboardButton(text="\U0001F3D7 \u041a\u043e\u043b\u043e\u043d\u0438\u0438", callback_data="space_colonies")],
+        [InlineKeyboardButton(text="\U0001F4DA \u0422\u0435\u0445\u043d\u043e\u043b\u043e\u0433\u0438\u0438", callback_data="space_tech")],
+    ])
+    return text, keyboard, country_id
+
+async def show_space_menu_msg(msg: Message):
+    text, reply_markup, _ = await build_space_menu(msg.from_user.id)
+    if not text:
+        await msg.reply("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d \u0431\u0435\u0437 \u043a\u043e\u0441\u043c\u043e\u0441\u0442\u0430\u043d\u0446\u0438\u0438.")
+        return
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+@router.message(F.text.lower().strip() == "\u043a\u043e\u0441\u043c\u043e\u0441")
+async def space_text_cmd(msg: Message):
+    await show_space_menu_msg(msg)
+
+@router.message(F.text.lower().strip() == "\u044d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u0438")
+async def space_expeditions_text_cmd(msg: Message):
+    await space_expeditions_msg(msg)
+
+@router.message(F.text.lower().strip() == "\u043a\u043e\u043b\u043e\u043d\u0438\u0438")
+async def space_colonies_text_cmd(msg: Message):
+    await space_colonies_msg(msg)
+
+@router.message(F.text.lower().strip() == "\u0442\u0435\u0445\u043d\u043e\u043b\u043e\u0433\u0438\u0438")
+async def space_tech_text_cmd(msg: Message):
+    await space_tech_msg(msg)
+
+@router.message(F.text.lower().strip() == "\u043e\u0442\u043a\u0440\u044b\u0442\u0438\u044f")
+async def space_discoveries_text_cmd(msg: Message):
+    await space_discoveries_msg(msg)
+
+@router.callback_query(F.data == "space_menu")
+async def space_menu_cb(cb: CallbackQuery):
+    text, reply_markup, _ = await build_space_menu(cb.from_user.id)
+    if not text:
+        await cb.answer("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d", show_alert=True)
+        return
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+async def space_expeditions_msg(msg: Message):
+    text, reply_markup = await build_space_expeditions_view(msg.from_user.id)
+    if not text:
+        await msg.reply("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d \u0431\u0435\u0437 \u043a\u043e\u0441\u043c\u043e\u0441\u0442\u0430\u043d\u0446\u0438\u0438.")
+        return
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+@router.callback_query(F.data == "space_expeditions")
+async def space_expeditions_cb(cb: CallbackQuery):
+    text, reply_markup = await build_space_expeditions_view(cb.from_user.id)
+    if not text:
+        await cb.answer("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d", show_alert=True)
+        return
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+async def build_space_expeditions_view(uid: int):
+    access, country_id, station_level = await get_user_space_access(uid)
+    if not access:
+        return None, None
+    async with aiosqlite.connect(DB_PATH) as db:
+        techs = await get_user_space_techs(db, uid)
+        max_active = get_max_active_expeditions(station_level, techs)
+        cursor = await db.execute(
+            "SELECT COUNT(1) FROM space_expeditions WHERE user_id = ? AND status = 'active'",
+            (uid,)
+        )
+        active = (await cursor.fetchone())[0]
+
+    text = (
+        f"\U0001F680 \u042d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u0438\\n"
+        f"\u0410\u043a\u0442\u0438\u0432\u043d\u044b\u0435: {active}/{max_active}\\n\\n"
+        f"\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0442\u0438\u043f \u043f\u043e\u043b\u0435\u0442\u0430:\\n"
+        f"- \u0434\u0435\u0448\u0451\u0432\u0430\u044f: 2\u0447\\n"
+        f"- \u0441\u0440\u0435\u0434\u043d\u044f\u044f: 6\u0447\\n"
+        f"- \u044d\u043b\u0438\u0442\u043d\u0430\u044f: 12-24\u0447\\n"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u0414\u0435\u0448\u0451\u0432\u0430\u044f", callback_data="start_space_expedition_cheap")],
+        [InlineKeyboardButton(text="\u0421\u0440\u0435\u0434\u043d\u044f\u044f", callback_data="start_space_expedition_medium")],
+        [InlineKeyboardButton(text="\u042d\u043b\u0438\u0442\u043d\u0430\u044f", callback_data="start_space_expedition_elite")],
+        [InlineKeyboardButton(text="\u23F3 \u0410\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u043f\u043e\u043b\u0451\u0442\u044b", callback_data="space_active")],
+        [InlineKeyboardButton(text="\u2190 \u041d\u0430\u0437\u0430\u0434", callback_data="space_menu")],
+    ])
+    return text, keyboard
+
+@router.callback_query(F.data.startswith("start_space_expedition_"))
+async def start_space_expedition_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    exp_type = cb.data.split("_")[-1]
+    if exp_type not in SPACE_EXPEDITION_TYPES:
+        await cb.answer("\u0422\u0438\u043f \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", show_alert=True)
+        return
+    access, country_id, station_level = await get_user_space_access(uid)
+    if not access:
+        await cb.answer("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d", show_alert=True)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            techs = await get_user_space_techs(db, uid)
+            max_active = get_max_active_expeditions(station_level, techs)
+            cursor = await db.execute(
+                "SELECT COUNT(1) FROM space_expeditions WHERE user_id = ? AND status = 'active'",
+                (uid,)
+            )
+            active = (await cursor.fetchone())[0]
+            if active >= max_active:
+                await db.rollback()
+                await cb.answer("\u041b\u0438\u043c\u0438\u0442 \u044d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u0439", show_alert=True)
+                return
+
+            cfg = SPACE_EXPEDITION_TYPES[exp_type]
+            hours = cfg["min_hours"] if cfg["min_hours"] == cfg["max_hours"] else random.randint(cfg["min_hours"], cfg["max_hours"])
+            now = int(time.time())
+            ends_at = now + hours * 3600
+            await db.execute(
+                "INSERT INTO space_expeditions (user_id, country_id, expedition_type, started_at, ends_at, status) VALUES (?, ?, ?, ?, ?, 'active')",
+                (uid, country_id, exp_type, now, ends_at)
+            )
+            await db.commit()
+        await cb.answer("\u042d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u044f \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0430", show_alert=False)
+        text, reply_markup = await build_space_expeditions_view(uid)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"space expedition start error: {e}")
+        await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430 \u0437\u0430\u043f\u0443\u0441\u043a\u0430", show_alert=True)
+
+async def space_active_msg(msg: Message):
+    text, reply_markup = await build_space_active_view(msg.from_user.id)
+    if not text:
+        await msg.reply("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d")
+        return
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+@router.callback_query(F.data == "space_active")
+async def space_active_cb(cb: CallbackQuery):
+    text, reply_markup = await build_space_active_view(cb.from_user.id)
+    if not text:
+        await cb.answer("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d", show_alert=True)
+        return
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+async def build_space_active_view(uid: int):
+    access, _, _ = await get_user_space_access(uid)
+    if not access:
+        return None, None
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM space_expeditions WHERE user_id = ? ORDER BY id DESC LIMIT 10", (uid,))
+        rows = await cursor.fetchall()
+
+    text = "\u23F3 \u0410\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u043f\u043e\u043b\u0451\u0442\u044b\\n\\n"
+    keyboard = []
+    if not rows:
+        text += "\u041d\u0435\u0442 \u044d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u0439."
+    for exp in rows:
+        exp_type = exp["expedition_type"]
+        status = exp["status"]
+        remain = exp["ends_at"] - now
+        if status == "active" and remain > 0:
+            text += f"ID {exp['id']} - {SPACE_EXPEDITION_TYPES[exp_type]['name']}: \u043e\u0441\u0442\u0430\u043b\u043e\u0441\u044c {format_duration(remain)}\\n"
+        else:
+            text += f"ID {exp['id']} - {SPACE_EXPEDITION_TYPES[exp_type]['name']}: \u0433\u043e\u0442\u043e\u0432\u043e\\n"
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"\u2705 \u0417\u0430\u0431\u0440\u0430\u0442\u044c ID {exp['id']}",
+                    callback_data=f"claim_space_expedition_{exp['id']}"
+                )
+            ])
+
+    keyboard.append([InlineKeyboardButton(text="\u2190 \u041d\u0430\u0437\u0430\u0434", callback_data="space_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+@router.callback_query(F.data.startswith("claim_space_expedition_"))
+async def claim_space_expedition_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    exp_id = int(cb.data.split("_")[-1])
+    now = int(time.time())
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT * FROM space_expeditions WHERE id = ? AND user_id = ?", (exp_id, uid))
+            exp = await cursor.fetchone()
+            if not exp:
+                await db.rollback()
+                await cb.answer("\u042d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u044f \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430", show_alert=True)
+                return
+            if exp["status"] == "active" and exp["ends_at"] > now:
+                await db.rollback()
+                await cb.answer("\u0420\u0430\u043d\u043e \u0437\u0430\u0431\u0438\u0440\u0430\u0442\u044c \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT * FROM space_expedition_results WHERE expedition_id = ?", (exp_id,))
+            result = await cursor.fetchone()
+            if not result:
+                techs = await get_user_space_techs(db, uid)
+                station_level = await get_space_station_level(db, exp["country_id"])
+                outcome_data = resolve_expedition_outcome(exp["expedition_type"], station_level, techs)
+                outcome = outcome_data["outcome"]
+                loot = outcome_data["loot"]
+                discovery = outcome_data["discovery"]
+                discovery_id = None
+                if discovery:
+                    desc = discovery.get("description")
+                    if desc == "unknown":
+                        desc = "\u0421\u0438\u0433\u043c\u0430-\u0430\u043d\u043e\u043c\u0430\u043b\u0438\u044f. \u041e\u0449\u0443\u0449\u0435\u043d\u0438\u0435 \u0443\u0433\u0440\u043e\u0437\u044b."
+                    await db.execute(
+                        "INSERT INTO space_discoveries (user_id, discovery_type, rarity, description, discovered_at, status) VALUES (?, ?, ?, ?, ?, 'new')",
+                        (uid, discovery["type"], discovery["rarity"], desc, now)
+                    )
+                    cursor = await db.execute("SELECT last_insert_rowid()")
+                    discovery_id = (await cursor.fetchone())[0]
+
+                if outcome in ("success", "partial"):
+                    await db.execute(
+                        "UPDATE users SET plasma = plasma + ?, plutonium = plutonium + ?, artifacts = artifacts + ?, tech_data = tech_data + ? WHERE id = ?",
+                        (loot["plasma"], loot["plutonium"], loot["artifacts"], loot["tech_data"], uid)
+                    )
+                    await db.execute(
+                        "UPDATE users SET space_prestige = space_prestige + ? WHERE id = ?",
+                        (2 if outcome == "success" else 1, uid)
+                    )
+                    if discovery_id:
+                        await db.execute("UPDATE users SET space_prestige = space_prestige + 1 WHERE id = ?", (uid,))
+                else:
+                    await db.execute("UPDATE users SET space_prestige = space_prestige + 1 WHERE id = ?", (uid,))
+
+                status = "finished" if outcome in ("success", "partial") else "failed"
+                message = outcome
+                await db.execute("UPDATE space_expeditions SET status = ? WHERE id = ?", (status, exp_id))
+                await db.execute(
+                    "INSERT INTO space_expedition_results (expedition_id, outcome, loot_plasma, loot_plutonium, loot_artifacts, loot_tech, discovery_id, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (exp_id, outcome, loot["plasma"], loot["plutonium"], loot["artifacts"], loot["tech_data"], discovery_id, message, now)
+                )
+                await db.commit()
+                result = {
+                    "outcome": outcome,
+                    "loot_plasma": loot["plasma"],
+                    "loot_plutonium": loot["plutonium"],
+                    "loot_artifacts": loot["artifacts"],
+                    "loot_tech": loot["tech_data"],
+                    "discovery_id": discovery_id
+                }
+            else:
+                await db.commit()
+
+        outcome = result["outcome"] if isinstance(result, dict) else result["outcome"]
+        loot_plasma = result["loot_plasma"] if isinstance(result, dict) else result["loot_plasma"]
+        loot_plutonium = result["loot_plutonium"] if isinstance(result, dict) else result["loot_plutonium"]
+        loot_artifacts = result["loot_artifacts"] if isinstance(result, dict) else result["loot_artifacts"]
+        loot_tech = result["loot_tech"] if isinstance(result, dict) else result["loot_tech"]
+        discovery_id = result["discovery_id"] if isinstance(result, dict) else result["discovery_id"]
+
+        outcome_text = {
+            "success": "\u0423\u0441\u043f\u0435\u0445",
+            "partial": "\u0427\u0430\u0441\u0442\u0438\u0447\u043d\u044b\u0439 \u0443\u0441\u043f\u0435\u0445",
+            "ship_lost": "\u041f\u043e\u0442\u0435\u0440\u044f \u043a\u043e\u0440\u0430\u0431\u043b\u044f",
+            "crew_dead": "\u0413\u0438\u0431\u0435\u043b\u044c \u044d\u043a\u0438\u043f\u0430\u0436\u0430",
+            "threat": "\u041e\u0442\u043a\u0440\u044b\u0442\u0438\u0435 \u0443\u0433\u0440\u043e\u0437\u044b"
+        }.get(outcome, outcome)
+
+        text = (
+            f"\u2705 \u0420\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 \u044d\u043a\u0441\u043f\u0435\u0434\u0438\u0446\u0438\u0438\\n\\n"
+            f"\u0418\u0442\u043e\u0433: {outcome_text}\\n"
+            f"\u041b\u0443\u0442: \u043f\u043b\u0430\u0437\u043c\u0430 +{loot_plasma}, \u043f\u043b\u0443\u0442\u043e\u043d\u0438\u0439 +{loot_plutonium}, \u0430\u0440\u0442\u0435\u0444\u0430\u043a\u0442\u044b +{loot_artifacts}, \u0442\u0435\u0445\u043d\u043e\u0434\u0430\u043d\u043d\u044b\u0435 +{loot_tech}\\n"
+        )
+        if discovery_id:
+            text += f"\u041e\u0442\u043a\u0440\u044b\u0442\u0438\u0435 ID {discovery_id}\\n"
+
+        await cb.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="\u2190 \u041d\u0430\u0437\u0430\u0434", callback_data="space_active")]
+            ])
+        )
+        await cb.answer()
+        await check_and_award_titles(uid)
+    except Exception as e:
+        logger.error(f"claim_space_expedition_cb error: {e}")
+        await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430 \u0432\u044b\u0434\u0430\u0447\u0438", show_alert=True)
+
+async def space_discoveries_msg(msg: Message):
+    text, reply_markup = await build_space_discoveries_view(msg.from_user.id)
+    if not text:
+        await msg.reply("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d")
+        return
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+@router.callback_query(F.data == "space_discoveries")
+async def space_discoveries_cb(cb: CallbackQuery):
+    text, reply_markup = await build_space_discoveries_view(cb.from_user.id)
+    if not text:
+        await cb.answer("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d", show_alert=True)
+        return
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+async def build_space_discoveries_view(uid: int):
+    access, _, _ = await get_user_space_access(uid)
+    if not access:
+        return None, None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM space_discoveries WHERE user_id = ? ORDER BY id DESC LIMIT 10", (uid,))
+        rows = await cursor.fetchall()
+
+    text = "\u2728 \u041e\u0442\u043a\u0440\u044b\u0442\u0438\u044f\\n\\n"
+    keyboard = []
+    if not rows:
+        text += "\u041f\u043e\u043a\u0430 \u043d\u0435\u0442 \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u0439."
+    for d in rows:
+        status = d["status"]
+        text += f"ID {d['id']} - {d['discovery_type']} ({d['rarity']}) [{status}]\\n"
+        keyboard.append([InlineKeyboardButton(text=f"ID {d['id']}", callback_data=f"space_discovery_{d['id']}")])
+
+    keyboard.append([InlineKeyboardButton(text="\u2190 \u041d\u0430\u0437\u0430\u0434", callback_data="space_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+@router.callback_query(F.data.startswith("space_discovery_"))
+async def space_discovery_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    disc_id = int(cb.data.split("_")[-1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM space_discoveries WHERE id = ? AND user_id = ?", (disc_id, uid))
+        d = await cursor.fetchone()
+    if not d:
+        await cb.answer("\u041e\u0442\u043a\u0440\u044b\u0442\u0438\u0435 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e", show_alert=True)
+        return
+
+    text = f"\u2728 ID {d['id']}\\n\\n{d['description']}\\n\\n\u0421\u0442\u0430\u0442\u0443\u0441: {d['status']}"
+    keyboard = []
+    if d["status"] == "new":
+        if d["discovery_type"] == "planet":
+            keyboard.append([InlineKeyboardButton(text="\U0001F50E \u0418\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u0442\u044c", callback_data=f"space_discovery_action_{disc_id}_deep")])
+            keyboard.append([InlineKeyboardButton(text="\U0001F4C4 \u0417\u0430\u0431\u0440\u0430\u0442\u044c \u0434\u0430\u043d\u043d\u044b\u0435", callback_data=f"space_discovery_action_{disc_id}_data")])
+            keyboard.append([InlineKeyboardButton(text="\U0001F6A7 \u041f\u043e\u043f\u044b\u0442\u0430\u0442\u044c\u0441\u044f \u043a\u043e\u043b\u043e\u043d\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u0442\u044c", callback_data=f"space_discovery_action_{disc_id}_colonize")])
+        else:
+            keyboard.append([InlineKeyboardButton(text="\U0001F50E \u0418\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u0442\u044c", callback_data=f"space_discovery_action_{disc_id}_deep")])
+            keyboard.append([InlineKeyboardButton(text="\U0001F4C4 \u0417\u0430\u0431\u0440\u0430\u0442\u044c \u0434\u0430\u043d\u043d\u044b\u0435", callback_data=f"space_discovery_action_{disc_id}_data")])
+
+    keyboard.append([InlineKeyboardButton(text="\u2190 \u041d\u0430\u0437\u0430\u0434", callback_data="space_discoveries")])
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("space_discovery_action_"))
+async def space_discovery_action_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    parts = cb.data.split("_")
+    disc_id = int(parts[3])
+    action = parts[4]
+    now = int(time.time())
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT * FROM space_discoveries WHERE id = ? AND user_id = ?", (disc_id, uid))
+            d = await cursor.fetchone()
+            if not d:
+                await db.rollback()
+                await cb.answer("\u041e\u0442\u043a\u0440\u044b\u0442\u0438\u0435 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e", show_alert=True)
+                return
+            if d["status"] != "new":
+                await db.rollback()
+                await cb.answer("\u0423\u0436\u0435 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u043d\u043e", show_alert=True)
+                return
+
+            message = ""
+            if action == "data":
+                gain = random.randint(1, 3)
+                await db.execute("UPDATE users SET tech_data = tech_data + ? WHERE id = ?", (gain, uid))
+                message = f"\u0414\u0430\u043d\u043d\u044b\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u044b: +{gain}"
+            elif action == "deep":
+                if random.random() < 0.3:
+                    message = "\u0418\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u0435 \u043f\u0440\u043e\u0432\u0430\u043b\u0438\u043b\u043e\u0441\u044c"
+                else:
+                    loot_plasma = random.randint(1, 4)
+                    loot_plutonium = random.randint(0, 2)
+                    loot_artifacts = random.randint(0, 2)
+                    await db.execute(
+                        "UPDATE users SET plasma = plasma + ?, plutonium = plutonium + ?, artifacts = artifacts + ? WHERE id = ?",
+                        (loot_plasma, loot_plutonium, loot_artifacts, uid)
+                    )
+                    message = f"\u0414\u043e\u0431\u044b\u0442\u043e: \u043f\u043b\u0430\u0437\u043c\u0430 +{loot_plasma}, \u043f\u043b\u0443\u0442\u043e\u043d\u0438\u0439 +{loot_plutonium}, \u0430\u0440\u0442\u0435\u0444\u0430\u043a\u0442\u044b +{loot_artifacts}"
+            elif action == "colonize":
+                if d["discovery_type"] != "planet":
+                    await db.rollback()
+                    await cb.answer("\u041d\u0435\u043b\u044c\u0437\u044f \u043a\u043e\u043b\u043e\u043d\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u0442\u044c", show_alert=True)
+                    return
+                cursor = await db.execute("SELECT COUNT(1) FROM space_colonies WHERE owner_user_id = ?", (uid,))
+                count = (await cursor.fetchone())[0]
+                if count >= SPACE_MAX_COLONIES:
+                    await db.rollback()
+                    await cb.answer("\u041b\u0438\u043c\u0438\u0442 \u043a\u043e\u043b\u043e\u043d\u0438\u0439", show_alert=True)
+                    return
+                colony_type = random.choice(list(SPACE_COLONY_TYPES.keys()))
+                stability = random.randint(60, 90)
+                await db.execute(
+                    "INSERT INTO space_colonies (owner_user_id, colony_type, stability, bonus_type, created_at, last_yield) VALUES (?, ?, ?, ?, ?, ?)",
+                    (uid, colony_type, stability, SPACE_COLONY_TYPES[colony_type]["bonus_type"], now, now)
+                )
+                await db.execute("UPDATE users SET space_prestige = space_prestige + 3 WHERE id = ?", (uid,))
+                message = f"\u041a\u043e\u043b\u043e\u043d\u0438\u044f \u043e\u0441\u043d\u043e\u0432\u0430\u043d\u0430: {SPACE_COLONY_TYPES[colony_type]['name']}"
+            else:
+                await db.rollback()
+                await cb.answer("\u041d\u0435\u0432\u0435\u0440\u043d\u043e\u0435 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435", show_alert=True)
+                return
+
+            await db.execute("UPDATE space_discoveries SET status = 'resolved', resolved_at = ? WHERE id = ?", (now, disc_id))
+            await db.commit()
+
+        await cb.answer(message, show_alert=True)
+        await check_and_award_titles(uid)
+        text, reply_markup = await build_space_discoveries_view(uid)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"space_discovery_action_cb error: {e}")
+        await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430", show_alert=True)
+
+async def space_colonies_msg(msg: Message):
+    text, reply_markup = await build_space_colonies_view(msg.from_user.id)
+    if not text:
+        await msg.reply("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d")
+        return
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+@router.callback_query(F.data == "space_colonies")
+async def space_colonies_cb(cb: CallbackQuery):
+    text, reply_markup = await build_space_colonies_view(cb.from_user.id)
+    if not text:
+        await cb.answer("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d", show_alert=True)
+        return
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+async def build_space_colonies_view(uid: int):
+    access, _, _ = await get_user_space_access(uid)
+    if not access:
+        return None, None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM space_colonies WHERE owner_user_id = ? ORDER BY id DESC", (uid,))
+        rows = await cursor.fetchall()
+
+    text = "\U0001F3E0 \u041a\u043e\u043b\u043e\u043d\u0438\u0438\\n\\n"
+    keyboard = []
+    if not rows:
+        text += "\u041d\u0435\u0442 \u043a\u043e\u043b\u043e\u043d\u0438\u0439."
+    for c in rows:
+        name = SPACE_COLONY_TYPES.get(c["colony_type"], {}).get("name", c["colony_type"])
+        text += f"ID {c['id']} - {name}, \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u044c {c['stability']}\\n"
+        keyboard.append([InlineKeyboardButton(text=f"\U0001F4E6 \u0421\u0431\u043e\u0440 ID {c['id']}", callback_data=f"space_colony_collect_{c['id']}")])
+
+    keyboard.append([InlineKeyboardButton(text="\u2190 \u041d\u0430\u0437\u0430\u0434", callback_data="space_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+@router.callback_query(F.data.startswith("space_colony_collect_"))
+async def space_colony_collect_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    colony_id = int(cb.data.split("_")[-1])
+    now = int(time.time())
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT * FROM space_colonies WHERE id = ? AND owner_user_id = ?", (colony_id, uid))
+            col = await cursor.fetchone()
+            if not col:
+                await db.rollback()
+                await cb.answer("\u041a\u043e\u043b\u043e\u043d\u0438\u044f \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430", show_alert=True)
+                return
+            elapsed = max(0, now - (col["last_yield"] or col["created_at"]))
+            hours = min(24, elapsed // 3600)
+            if hours <= 0:
+                await db.rollback()
+                await cb.answer("\u0420\u0430\u043d\u043e \u0441\u043e\u0431\u0438\u0440\u0430\u0442\u044c", show_alert=True)
+                return
+
+            base = SPACE_COLONY_TYPES.get(col["colony_type"])
+            if not base:
+                await db.rollback()
+                await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430 \u043a\u043e\u043b\u043e\u043d\u0438\u0438", show_alert=True)
+                return
+
+            stability_factor = max(0.5, min(1.2, col["stability"] / 100))
+            gain_plasma = int(base["yield_plasma"] * hours * stability_factor)
+            gain_plutonium = int(base["yield_plutonium"] * hours * stability_factor)
+            gain_artifacts = int(base["yield_artifacts"] * hours * stability_factor)
+            gain_tech = int(base["yield_tech"] * hours * stability_factor)
+
+            await db.execute(
+                "UPDATE users SET plasma = plasma + ?, plutonium = plutonium + ?, artifacts = artifacts + ?, tech_data = tech_data + ? WHERE id = ?",
+                (gain_plasma, gain_plutonium, gain_artifacts, gain_tech, uid)
+            )
+            await db.execute("UPDATE space_colonies SET last_yield = ? WHERE id = ?", (now, colony_id))
+
+            if random.random() < 0.05:
+                await db.execute("DELETE FROM space_colonies WHERE id = ?", (colony_id,))
+                message = "\u041a\u043e\u043b\u043e\u043d\u0438\u044f \u043f\u043e\u0442\u0435\u0440\u044f\u043d\u0430 \u0438\u0437-\u0437\u0430 \u043a\u0430\u0442\u0430\u0441\u0442\u0440\u043e\u0444\u044b."
+            else:
+                new_stability = max(0, col["stability"] - random.randint(0, 2))
+                await db.execute("UPDATE space_colonies SET stability = ? WHERE id = ?", (new_stability, colony_id))
+                message = f"\u0421\u043e\u0431\u0440\u0430\u043d\u043e: \u043f\u043b\u0430\u0437\u043c\u0430 +{gain_plasma}, \u043f\u043b\u0443\u0442\u043e\u043d\u0438\u0439 +{gain_plutonium}, \u0430\u0440\u0442\u0435\u0444\u0430\u043a\u0442\u044b +{gain_artifacts}, \u0442\u0435\u0445\u043d\u043e\u0434\u0430\u043d\u043d\u044b\u0435 +{gain_tech}"
+
+            await db.commit()
+
+        await cb.answer(message, show_alert=True)
+        text, reply_markup = await build_space_colonies_view(uid)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"space_colony_collect_cb error: {e}")
+        await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430", show_alert=True)
+
+async def space_tech_msg(msg: Message):
+    text, reply_markup = await build_space_tech_view(msg.from_user.id)
+    if not text:
+        await msg.reply("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d")
+        return
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+@router.callback_query(F.data == "space_tech")
+async def space_tech_cb(cb: CallbackQuery):
+    text, reply_markup = await build_space_tech_view(cb.from_user.id)
+    if not text:
+        await cb.answer("\u041a\u043e\u0441\u043c\u043e\u0441 \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d", show_alert=True)
+        return
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await cb.answer()
+
+async def build_space_tech_view(uid: int):
+    access, _, _ = await get_user_space_access(uid)
+    if not access:
+        return None, None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT plasma, plutonium FROM users WHERE id = ?", (uid,))
+        user = await cursor.fetchone()
+        techs = await get_user_space_techs(db, uid)
+
+    text = "\U0001F4D6 \u0422\u0435\u0445\u043d\u043e\u043b\u043e\u0433\u0438\u0438\\n\\n"
+    text += f"\u0420\u0435\u0441\u0443\u0440\u0441\u044b: \u043f\u043b\u0430\u0437\u043c\u0430 {user['plasma']}, \u043f\u043b\u0443\u0442\u043e\u043d\u0438\u0439 {user['plutonium']}\\n\\n"
+    keyboard = []
+    for tech in SPACE_TECH_CONFIG:
+        status = "\u2705" if tech["tech_code"] in techs else "\u274C"
+        text += f"{status} {tech['name']} - \u0446\u0435\u043d\u0430 {tech['cost_plasma']}\u043f + {tech['cost_plutonium']}\u043f\\n"
+        if tech["tech_code"] not in techs:
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"\u0418\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u0442\u044c {tech['name']}",
+                    callback_data=f"research_space_tech_{tech['tech_code']}"
+                )
+            ])
+
+    keyboard.append([InlineKeyboardButton(text="\u2190 \u041d\u0430\u0437\u0430\u0434", callback_data="space_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+@router.callback_query(F.data.startswith("research_space_tech_"))
+async def research_space_tech_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    tech_code = cb.data.split("_")[-1]
+    tech = next((t for t in SPACE_TECH_CONFIG if t["tech_code"] == tech_code), None)
+    if not tech:
+        await cb.answer("\u0422\u0435\u0445\u043d\u043e\u043b\u043e\u0433\u0438\u044f \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430", show_alert=True)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT researched FROM user_space_tech WHERE user_id = ? AND tech_code = ?",
+                (uid, tech_code)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                await cb.answer("\u0423\u0436\u0435 \u0438\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u043e", show_alert=True)
+                return
+
+            cursor = await db.execute("SELECT plasma, plutonium FROM users WHERE id = ?", (uid,))
+            user = await cursor.fetchone()
+            if user["plasma"] < tech["cost_plasma"] or user["plutonium"] < tech["cost_plutonium"]:
+                await db.rollback()
+                await cb.answer("\u041d\u0435\u0445\u0432\u0430\u0442\u0430\u0435\u0442 \u0440\u0435\u0441\u0443\u0440\u0441\u043e\u0432", show_alert=True)
+                return
+
+            await db.execute(
+                "UPDATE users SET plasma = plasma - ?, plutonium = plutonium - ? WHERE id = ?",
+                (tech["cost_plasma"], tech["cost_plutonium"], uid)
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO user_space_tech (user_id, tech_code, researched) VALUES (?, ?, 1)",
+                (uid, tech_code)
+            )
+            await db.commit()
+
+        await cb.answer("\u0422\u0435\u0445\u043d\u043e\u043b\u043e\u0433\u0438\u044f \u0438\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0430", show_alert=True)
+        text, reply_markup = await build_space_tech_view(uid)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"research_space_tech_cb error: {e}")
+        await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430", show_alert=True)
 
 if __name__ == "__main__":
+    async def main():
+        # 1. Укажи токен (или возьми из переменной, если она есть выше, например API_TOKEN)
+        # Если токен просто в строке, вставь его в кавычки ниже
+        TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA" 
+        
+        # 2. Инициализируем бота и диспетчер
+        bot = Bot(token=TOKEN)
+        dp = Dispatcher()
+        
+        # ВАЖНО: Если у тебя в коде используются роутеры (router), подключи их тут:
+        # dp.include_routers(router1, router2...)
+
+        os.environ['DB_PATH'] = DB_PATH
+        
+        # Инициализация БД
+        try:
+            await db.init_db()
+            print(f"✅ База данных инициализирована: {DB_PATH}")
+        except Exception as e:
+            print(f"❌ Ошибка инициализации БД: {e}")
+            return
+        
+        # Запуск бота
+        print("🚀 Бот запускается...")
+        
+        # Удаляем старые апдейты
+        await bot.delete_webhook(drop_pending_updates=True)
+        
+        # Поехали
+        await dp.start_polling(bot)
+    
+    # Запуск
     asyncio.run(main())
