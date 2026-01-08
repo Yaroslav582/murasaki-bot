@@ -13134,12 +13134,13 @@ async def view_clan_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("clan_delete_"))
 async def clan_delete_cb(cb: CallbackQuery):
-    parts = cb.data.split("_")
-    if len(parts) < 3:
-        await cb.answer("Ошибка клана.", show_alert=True)
-        return
-    clan_id = int(parts[2])
-    uid = cb.from_user.id
+    try:
+        parts = cb.data.split("_")
+        if len(parts) < 3:
+            await cb.answer("Ошибка клана.", show_alert=True)
+            return
+        clan_id = int(parts[2])
+        uid = cb.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT owner_user_id FROM clans WHERE id = ?", (clan_id,))
@@ -13151,16 +13152,14 @@ async def clan_delete_cb(cb: CallbackQuery):
             await cb.answer("Только владелец может удалить клан.", show_alert=True)
             return
 
-    text = "⚠️ <b>Удалить клан?</b>\n\nЭто действие необратимо."
-    keyboard = [
-            keyboard.append([InlineKeyboardButton(
-                text="🗑️ Удалить клан",
-                callback_data=f"clan_delete_{clan_id}"
-            )])
-        [InlineKeyboardButton(text="🔙 Отмена", callback_data=f"view_clan_{clan_id}")],
-    ]
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-    await cb.answer()
+text = "⚠️ <b>Удалить клан?</b>\n\nЭто действие необратимо."
+keyboard = [
+    [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"clan_delete_confirm_{clan_id}")],
+    [InlineKeyboardButton(text="🔙 Отмена", callback_data=f"view_clan_{clan_id}")],
+]
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        await cb.answer()
+
 
 @router.callback_query(F.data.startswith("clan_delete_confirm_"))
 async def clan_delete_confirm_cb(cb: CallbackQuery):
