@@ -114,7 +114,7 @@ HELP_COMMANDS = {
         ("выбор страны", "выбрать стартовую страну"),
     ],
     "Заработок": [
-        ("бонус", "ежедневный бонус (серия 30 дней)"),
+        ("бонус", "бонус по кд"),
         ("работа", "активный заработок"),
         ("собрать доход", "доход со страны"),
     ],
@@ -823,7 +823,7 @@ async def test_ref_cmd(msg: Message):
     text = (
         f"\U0001F3F0 ????? ????????? ??????\n\n"
         f"??????, {username}!\n\n"
-        f"\U0001F30D ?????? ?????? ????? ?????????? ??????, ??????? ???????? ?? ???? ????????!\n\n"
+        f"\U0001F30D ?????? ?????? ????? ????? ?? ???, ??????? ???????? ?? ???? ????????!\n\n"
         "???????? ??????, ??????? ?????? ????? ????? ? ?????????? ????:\n"
     )
     await msg.reply(text, parse_mode="HTML")
@@ -1469,16 +1469,6 @@ INVESTMENTS = {
     }
 }
 
-# ========== ЕЖЕДНЕВНАЯ НАГРАДА ==========
-DAILY_REWARDS = {
-    1: 50_000_000,    # День 1: 50М
-    2: 100_000_000,   # День 2: 100М
-    3: 150_000_000,   # День 3: 150М
-    4: 250_000_000,   # День 4: 250М
-    5: 500_000_000,   # День 5: 500М
-    6: 750_000_000,   # День 6: 750М
-    7: 1_000_000_000, # День 7: 1Б
-}
 
 # ========== БЛЭКДЖЕК ==========
 bj_games = {}
@@ -4597,42 +4587,10 @@ def get_casino_limits(reputation: int):
 async def check_daily_wager_limit(uid: int, bet: int):
     """Check daily wager limits and max bet"""
     try:
-        now = int(time.time())
-        today_start = now - (now % 86400)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT balance, reputation, total_wagered_today, wagered_reset_ts FROM users WHERE id = ?",
-                (uid,)
-            )
-            row = await cursor.fetchone()
-            if not row:
-                return False, "User not found"
-
-            balance, reputation, total_wagered, reset_ts = row
-            max_bet_limit, daily_limit = get_casino_limits(reputation or 0)
-            max_bet = min(int(balance * 0.05), max_bet_limit)
-
-            if bet > max_bet:
-                return False, f"? ???????????? ??????: {max_bet:,}"
-
-            reset_ts = reset_ts or 0
-            if reset_ts < today_start:
-                await db.execute(
-                    "UPDATE users SET total_wagered_today = 0, wagered_reset_ts = ? WHERE id = ?",
-                    (today_start, uid)
-                )
-                total_wagered = 0
-                await db.commit()
-
-            if total_wagered + bet > daily_limit:
-                remaining = daily_limit - total_wagered
-                return False, f"? ??????? ????? ??????. ????????: {remaining:,}"
-
-            return True, None
+        return True, None
     except Exception as e:
         logger.error(f"check_daily_wager_limit error: {e}")
-        return False, "?????? ???????? ??????"
+        return True, None
 
 
 async def update_daily_wager(uid: int, bet: int):
@@ -4718,74 +4676,6 @@ async def give_start_bonus(uid: int):
     except Exception as e:
         logger.error(f"Ошибка выдачи стартового бонуса: {e}")
         return False, f"Ошибка: {e}", 0
-    
-async def claim_daily_reward(uid: int):
-    """Получить ежедневную награду"""
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT last_daily_claim, daily_streak FROM users WHERE id = ?", (uid,))
-            row = await cursor.fetchone()
-            
-            current_time = int(time.time())
-            
-            if not row or row['last_daily_claim'] is None:
-                # Первая награда
-                streak = 1
-                reward = DAILY_REWARDS.get(1, 50_000_000)
-                
-                await db.execute("""
-                    UPDATE users 
-                    SET balance = balance + ?, 
-                        last_daily_claim = ?,
-                        daily_streak = ?
-                    WHERE id = ?
-                """, (reward, current_time, streak, uid))
-                
-                await db.commit()
-                return True, reward, streak, "Первый день!"
-                
-            else:
-                last_claim = row['last_daily_claim']
-                streak = row['daily_streak'] or 1
-                
-                # Проверяем, прошло ли больше 24 часов
-                hours_passed = (current_time - last_claim) / 3600
-                
-                if hours_passed >= 24:
-                    # Можно забрать награду
-                    if hours_passed >= 48:
-                        # Пропущен день - сбрасываем серию
-                        streak = 1
-                    else:
-                        # Продолжаем серию
-                        streak += 1
-                        if streak > 7:
-                            streak = 7  # Максимум 7 дней
-                    
-                    reward = DAILY_REWARDS.get(streak, 50_000_000)
-                    
-                    await db.execute("""
-                        UPDATE users 
-                        SET balance = balance + ?, 
-                            last_daily_claim = ?,
-                            daily_streak = ?
-                        WHERE id = ?
-                    """, (reward, current_time, streak, uid))
-                    
-                    await db.commit()
-                    return True, reward, streak, "Продолжаем серию!"
-                else:
-                    # Еще не прошло 24 часа
-                    next_claim = last_claim + 86400
-                    remaining = next_claim - current_time
-                    return False, remaining, streak, "Еще рано!"
-                    
-    except Exception as e:
-        logger.error(f"Ошибка claim_daily_reward: {e}")
-        return False, 0, 0, f"Ошибка: {e}"
-
-
 async def handle_all_commands(msg: Message):
     """Обработчик всех команд - и с / и без /"""
     text = msg.text.strip()
@@ -4878,7 +4768,7 @@ async def show_country_selection(msg: Message):
     username = msg.from_user.username or msg.from_user.first_name
     text, kb = await build_start_country_selection(uid, username)
     if not text:
-        await msg.answer("??? ????????? ?????? ??? ??????. ?????????? ?????.")
+        await msg.answer("??? ????????? ?????? ??? ??????. ????? ?? ??.")
         return
     await msg.answer(text, parse_mode="HTML", reply_markup=kb)
 
@@ -7196,50 +7086,7 @@ async def work_text_cmd(msg: Message):
 @router.message(F.text.lower().in_(["ежедневная", "ежедневка", "daily", "дэйли"]))
 @router.message(Command("daily", "ежедневная"))
 async def daily_reward_cmd(msg: Message):
-    """Получить ежедневную награду"""
-    success, amount, streak, message = await claim_daily_reward(msg.from_user.id)
-    
-    if success:
-        user = await get_user(msg.from_user.id)
-        
-        text = f"""
-🎁 <b>ЕЖЕДНЕВНАЯ НАГРАДА #{streak}</b>
-
-💰 <b>Получено:</b> {format_money(amount)}
-📊 <b>Серия:</b> {streak}/7 дней
-💵 <b>Новый баланс:</b> {format_money(user['balance'])}
-📝 <b>Статус:</b> {message}
-
-📅 <b>Следующая награда через 24 часа</b>
-🎯 <b>Завтра:</b> {format_money(DAILY_REWARDS.get(min(streak + 1, 7), 50_000_000))}
-"""
-        
-        # Показываем прогресс серии
-        progress_bar = ""
-        for i in range(1, 8):
-            if i <= streak:
-                progress_bar += "🟢"
-            else:
-                progress_bar += "⚫"
-        
-        text += f"\n{progress_bar} {streak}/7"
-        
-        await msg.reply(text, parse_mode="HTML")
-    else:
-        if amount > 0:  # amount содержит оставшееся время
-            hours = int(amount // 3600)
-            minutes = int((amount % 3600) // 60)
-            
-            await msg.reply(
-                f"⏳ <b>Еще рано!</b>\n\n"
-                f"📊 <b>Текущая серия:</b> {streak}/7 дней\n"
-                f"⏰ <b>До следующей награды:</b> {hours}ч {minutes}м\n"
-                f"💡 {message}",
-                parse_mode="HTML"
-            )
-        else:
-            await msg.reply(f"❌ {message}")
-
+    await msg.reply("Ежедневный бонус отключен.", parse_mode="HTML")
 @router.message(F.text.lower().startswith(("кд", "cd", "кулдаун")))
 async def cd_text_cmd(msg: Message):
     await check_bonus_cd(msg)
@@ -7775,9 +7622,7 @@ async def get_bonus_cb(cb: CallbackQuery):
 
 @router.callback_query(F.data == "get_daily")
 async def get_daily_callback(cb: CallbackQuery):
-    await daily_reward_cmd(cb.message)
-    await cb.answer()
-
+    await cb.answer("Ежедневный бонус отключен.", show_alert=True)
 @router.callback_query(F.data == "play_crash")
 async def play_crash_callback(cb: CallbackQuery):
     """Обработка нажатия на кнопку Краш"""
@@ -8988,6 +8833,63 @@ async def collect_income_cmd(msg: Message):
         response += "\n\n" + result['event_message']
 
     await msg.answer(response)
+
+@router.message(F.text.lower().startswith("внести в казну"))
+async def deposit_treasury_cmd(msg: Message):
+    uid = msg.from_user.id
+    parts = msg.text.split()
+    if len(parts) < 4:
+        await msg.reply(
+            "❌ Используйте: <code>внести в казну [сумма]</code>\n"
+            "Пример: <code>внести в казну 1к</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    amount = parse_amount(parts[3])
+    if amount <= 0:
+        await msg.reply("❌ Неверная сумма.", parse_mode="HTML")
+        return
+
+    country_id = await get_user_country_id_simple(uid)
+    if not country_id:
+        await msg.answer(_missing_country_message())
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT owner_user_id, treasury FROM countries WHERE id = ?", (country_id,))
+            row = await cursor.fetchone()
+            if not row or row[0] != uid:
+                await db.rollback()
+                await msg.reply("❌ Вы не владелец этой страны.", parse_mode="HTML")
+                return
+
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            user_row = await cursor.fetchone()
+            balance = int(user_row[0] or 0) if user_row else 0
+            if balance < amount:
+                await db.rollback()
+                await msg.reply(f"❌ Недостаточно средств. Баланс: {format_money(balance)}", parse_mode="HTML")
+                return
+
+            new_balance = balance - amount
+            new_treasury = int(row[1] or 0) + amount
+
+            await db.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, uid))
+            await db.execute("UPDATE countries SET treasury = ? WHERE id = ?", (new_treasury, country_id))
+            await db.commit()
+
+        await msg.reply(
+            f"✅ Внесено в казну: {format_money(amount)}\n"
+            f"💰 Казна: {format_money(new_treasury)}\n"
+            f"💳 Баланс: {format_money(new_balance)}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"deposit_treasury_cmd error: {e}")
+        await msg.reply("❌ Ошибка пополнения казны.", parse_mode="HTML")
 @router.message(F.text.lower() == "улучшения")
 async def improvements_cmd(msg: Message):
     uid = msg.from_user.id
@@ -11238,7 +11140,7 @@ async def build_countries_view():
 
         keyboard.append([InlineKeyboardButton(text=f"🏳️ {country['name']}", callback_data=f"view_country_{country['id']}")])
         if len(text) > max_len:
-            text += "?\n\n?? <i>?????? ??????, ??????????? ?????? ??? ?????? ??????.</i>\n"
+            text += "?\n\n?? <i>?????? ??????, ?????? ?? ??? ??? ?????? ??????.</i>\n"
             break
 
     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
@@ -11343,6 +11245,10 @@ async def build_clan_view(clan_id: int, uid: int):
             keyboard.append([InlineKeyboardButton(
                 text="📨 Заявки",
                 callback_data=f"clan_requests_{clan_id}"
+            )])
+            keyboard.append([InlineKeyboardButton(
+                text="🗑️ Удалить клан",
+                callback_data=f"clan_delete_{clan_id}"
             )])
     else:
         if my_clan_id:
@@ -12588,6 +12494,7 @@ async def build_country_view(country_id: int, uid: int):
         keyboard = []
         if country['owner_user_id'] == uid:
             keyboard.append([InlineKeyboardButton(text="💰 Собрать доход", callback_data=f"collect_country_income_{country_id}")])
+            keyboard.append([InlineKeyboardButton(text="💰 Внести в казну", callback_data="treasury_deposit_help")])
             keyboard.append([InlineKeyboardButton(text="🏗️ Улучшить", callback_data=f"upgrade_country_{country_id}")])
             keyboard.append([InlineKeyboardButton(text="💸 Налоги", callback_data=f"tax_country_{country_id}")])
         elif not country['owner_user_id']:
@@ -12639,6 +12546,15 @@ async def show_my_country_cb(cb: CallbackQuery):
         logger.error(f"Ошибка show_my_country_cb: {e}")
         await cb.answer("❌ Ошибка загрузки страны", show_alert=True)
 
+
+@router.callback_query(F.data == "treasury_deposit_help")
+async def treasury_deposit_help_cb(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(
+        "💰 Внести в казну: <code>внести в казну [сумма]</code>\n"
+        "Пример: <code>внести в казну 1к</code>",
+        parse_mode="HTML"
+    )
 @router.callback_query(F.data.startswith("buy_country_"))
 async def buy_country_cb(cb: CallbackQuery):
     """Купить страну"""
@@ -13215,6 +13131,79 @@ async def view_clan_cb(cb: CallbackQuery):
     await cb.answer()
 
 
+
+@router.callback_query(F.data.startswith("clan_delete_"))
+async def clan_delete_cb(cb: CallbackQuery):
+    parts = cb.data.split("_")
+    if len(parts) < 3:
+        await cb.answer("Ошибка клана.", show_alert=True)
+        return
+    clan_id = int(parts[2])
+    uid = cb.from_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT owner_user_id FROM clans WHERE id = ?", (clan_id,))
+        row = await cursor.fetchone()
+        if not row:
+            await cb.answer("Клан не найден.", show_alert=True)
+            return
+        if row[0] != uid:
+            await cb.answer("Только владелец может удалить клан.", show_alert=True)
+            return
+
+    text = "⚠️ <b>Удалить клан?</b>\n\nЭто действие необратимо."
+    keyboard = [
+            keyboard.append([InlineKeyboardButton(
+                text="🗑️ Удалить клан",
+                callback_data=f"clan_delete_{clan_id}"
+            )])
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data=f"view_clan_{clan_id}")],
+    ]
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("clan_delete_confirm_"))
+async def clan_delete_confirm_cb(cb: CallbackQuery):
+    parts = cb.data.split("_")
+    if len(parts) < 4:
+        await cb.answer("Ошибка клана.", show_alert=True)
+        return
+    clan_id = int(parts[3])
+    uid = cb.from_user.id
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT owner_user_id FROM clans WHERE id = ?", (clan_id,))
+            row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                await cb.answer("Клан не найден.", show_alert=True)
+                return
+            if row[0] != uid:
+                await db.rollback()
+                await cb.answer("Только владелец может удалить клан.", show_alert=True)
+                return
+
+            for table in (
+                "clan_join_requests",
+                "clan_members",
+                "clan_logs",
+                "clan_boss_hits",
+                "clan_boss_rewards_claimed",
+                "clan_bosses",
+            ):
+                await db.execute(f"DELETE FROM {table} WHERE clan_id = ?", (clan_id,))
+
+            await db.execute("DELETE FROM clans WHERE id = ?", (clan_id,))
+            await db.commit()
+
+        text, reply_markup = await build_clans_view()
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await cb.answer("Клан удален.")
+    except Exception as e:
+        logger.error(f"clan_delete_confirm_cb error: {e}")
+        await cb.answer("Ошибка удаления клана.", show_alert=True)
 @router.callback_query(F.data.startswith("join_clan_"))
 async def join_clan_cb(cb: CallbackQuery):
     uid = cb.from_user.id
