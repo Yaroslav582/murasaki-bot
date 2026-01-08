@@ -13137,35 +13137,38 @@ async def clan_delete_cb(cb: CallbackQuery):
     try:
         parts = cb.data.split("_")
         if len(parts) < 3:
-            await cb.answer("Ошибка клана.", show_alert=True)
+            await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430 \u043a\u043b\u0430\u043d\u0430.", show_alert=True)
             return
         clan_id = int(parts[2])
         uid = cb.from_user.id
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT owner_user_id FROM clans WHERE id = ?", (clan_id,))
-        row = await cursor.fetchone()
-        if not row:
-            await cb.answer("Клан не найден.", show_alert=True)
-            return
-        if row[0] != uid:
-            await cb.answer("Только владелец может удалить клан.", show_alert=True)
-            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT owner_user_id FROM clans WHERE id = ?", (clan_id,))
+            row = await cursor.fetchone()
+            if not row:
+                await cb.answer("\u041a\u043b\u0430\u043d \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d.", show_alert=True)
+                return
+            if row[0] != uid:
+                await cb.answer("\u0422\u043e\u043b\u044c\u043a\u043e \u0432\u043b\u0430\u0434\u0435\u043b\u0435\u0446 \u043c\u043e\u0436\u0435\u0442 \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u0430\u043d.", show_alert=True)
+                return
 
-text = "⚠️ <b>Удалить клан?</b>\n\nЭто действие необратимо."
-keyboard = [
-    [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"clan_delete_confirm_{clan_id}")],
-    [InlineKeyboardButton(text="🔙 Отмена", callback_data=f"view_clan_{clan_id}")],
-]
+        text = "\u26a0\ufe0f <b>\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u0430\u043d?</b>\n\n\u042d\u0442\u043e \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043d\u0435\u043e\u0431\u0440\u0430\u0442\u0438\u043c\u043e."
+        keyboard = [
+            [InlineKeyboardButton(text="\u2705 \u0414\u0430, \u0443\u0434\u0430\u043b\u0438\u0442\u044c", callback_data=f"clan_delete_confirm_{clan_id}")],
+            [InlineKeyboardButton(text="\ud83d\udd19 \u041e\u0442\u043c\u0435\u043d\u0430", callback_data=f"view_clan_{clan_id}")],
+        ]
         await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
         await cb.answer()
+    except Exception as e:
+        logger.error(f"clan_delete_cb error: {e}")
+        await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430 \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u044f \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u044f.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("clan_delete_confirm_"))
 async def clan_delete_confirm_cb(cb: CallbackQuery):
     parts = cb.data.split("_")
     if len(parts) < 4:
-        await cb.answer("Ошибка клана.", show_alert=True)
+        await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430 \u043a\u043b\u0430\u043d\u0430.", show_alert=True)
         return
     clan_id = int(parts[3])
     uid = cb.from_user.id
@@ -13177,11 +13180,11 @@ async def clan_delete_confirm_cb(cb: CallbackQuery):
             row = await cursor.fetchone()
             if not row:
                 await db.rollback()
-                await cb.answer("Клан не найден.", show_alert=True)
+                await cb.answer("\u041a\u043b\u0430\u043d \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d.", show_alert=True)
                 return
             if row[0] != uid:
                 await db.rollback()
-                await cb.answer("Только владелец может удалить клан.", show_alert=True)
+                await cb.answer("\u0422\u043e\u043b\u044c\u043a\u043e \u0432\u043b\u0430\u0434\u0435\u043b\u0435\u0446 \u043c\u043e\u0436\u0435\u0442 \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u0430\u043d.", show_alert=True)
                 return
 
             for table in (
@@ -13199,109 +13202,10 @@ async def clan_delete_confirm_cb(cb: CallbackQuery):
 
         text, reply_markup = await build_clans_view()
         await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
-        await cb.answer("Клан удален.")
+        await cb.answer("\u041a\u043b\u0430\u043d \u0443\u0434\u0430\u043b\u0435\u043d.")
     except Exception as e:
         logger.error(f"clan_delete_confirm_cb error: {e}")
-        await cb.answer("Ошибка удаления клана.", show_alert=True)
-@router.callback_query(F.data.startswith("join_clan_"))
-async def join_clan_cb(cb: CallbackQuery):
-    uid = cb.from_user.id
-    try:
-        clan_id = int(cb.data.split("_")[2])
-    except Exception:
-        await cb.answer("Ошибка клана.", show_alert=True)
-        return
-
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute("SELECT is_open FROM clans WHERE id = ?", (clan_id,))
-            row = await cursor.fetchone()
-            if not row:
-                await db.rollback()
-                await cb.answer("Клан не найден.", show_alert=True)
-                return
-            if int(row[0] or 0) != 1:
-                await db.rollback()
-                await cb.answer("Клан закрыт.", show_alert=True)
-                return
-
-            cursor = await db.execute("SELECT 1 FROM clan_members WHERE user_id = ?", (uid,))
-            if await cursor.fetchone():
-                await db.rollback()
-                await cb.answer("Вы уже в клане.", show_alert=True)
-                return
-
-            now = int(time.time())
-            await db.execute(
-                "INSERT INTO clan_members (clan_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)",
-                (clan_id, uid, now)
-            )
-            await db.execute(
-                "DELETE FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
-                (clan_id, uid)
-            )
-            await db.commit()
-
-        text, reply_markup = await build_clan_view(clan_id, uid)
-        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
-        await cb.answer("Вы вступили в клан!")
-    except Exception as e:
-        logger.error(f"join_clan_cb error: {e}")
-        await cb.answer("Ошибка вступления.", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("request_clan_"))
-async def request_clan_cb(cb: CallbackQuery):
-    uid = cb.from_user.id
-    try:
-        clan_id = int(cb.data.split("_")[2])
-    except Exception:
-        await cb.answer("Ошибка клана.", show_alert=True)
-        return
-
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute("SELECT is_open FROM clans WHERE id = ?", (clan_id,))
-            row = await cursor.fetchone()
-            if not row:
-                await db.rollback()
-                await cb.answer("Клан не найден.", show_alert=True)
-                return
-            if int(row[0] or 0) == 1:
-                await db.rollback()
-                await cb.answer("Клан открыт — можно вступить сразу.", show_alert=True)
-                return
-
-            cursor = await db.execute("SELECT 1 FROM clan_members WHERE user_id = ?", (uid,))
-            if await cursor.fetchone():
-                await db.rollback()
-                await cb.answer("Вы уже в клане.", show_alert=True)
-                return
-
-            cursor = await db.execute(
-                "SELECT 1 FROM clan_join_requests WHERE clan_id = ? AND user_id = ?",
-                (clan_id, uid)
-            )
-            if await cursor.fetchone():
-                await db.rollback()
-                await cb.answer("Заявка уже отправлена.", show_alert=True)
-                return
-
-            await db.execute(
-                "INSERT INTO clan_join_requests (clan_id, user_id, created_at) VALUES (?, ?, ?)",
-                (clan_id, uid, int(time.time()))
-            )
-            await db.commit()
-
-        text, reply_markup = await build_clan_view(clan_id, uid)
-        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
-        await cb.answer("Заявка отправлена!")
-    except Exception as e:
-        logger.error(f"request_clan_cb error: {e}")
-        await cb.answer("Ошибка заявки.", show_alert=True)
-
+        await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u044f \u043a\u043b\u0430\u043d\u0430.", show_alert=True)
 
 @router.callback_query(F.data.startswith("clan_toggle_"))
 async def clan_toggle_cb(cb: CallbackQuery):
