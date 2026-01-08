@@ -14445,36 +14445,4 @@ async def research_space_tech_cb(cb: CallbackQuery):
         await cb.answer("\u041e\u0448\u0438\u0431\u043a\u0430", show_alert=True)
 
 if __name__ == "__main__":
-    async def main():
-        # 1. Укажи токен (или возьми из переменной, если она есть выше, например API_TOKEN)
-        # Если токен просто в строке, вставь его в кавычки ниже
-        TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA" 
-        
-        # 2. Инициализируем бота и диспетчер
-        bot = Bot(token=TOKEN)
-        dp = Dispatcher()
-        
-        # ВАЖНО: Если у тебя в коде используются роутеры (router), подключи их тут:
-        # dp.include_routers(router1, router2...)
-
-        os.environ['DB_PATH'] = DB_PATH
-        
-        # Инициализация БД
-        try:
-            await db.init_db()
-            print(f"✅ База данных инициализирована: {DB_PATH}")
-        except Exception as e:
-            print(f"❌ Ошибка инициализации БД: {e}")
-            return
-        
-        # Запуск бота
-        print("🚀 Бот запускается...")
-        
-        # Удаляем старые апдейты
-        await bot.delete_webhook(drop_pending_updates=True)
-        
-        # Поехали
-        await dp.start_polling(bot)
-    
-    # Запуск
     asyncio.run(main())
