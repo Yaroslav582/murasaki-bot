@@ -965,7 +965,7 @@ async def mining_dig_cmd(msg: Message):
     ore = ORE_CONFIG[ore_key]
     ore_field = f"ore_{ore_key}"
     max_qty = min(15, 3 + pickaxe_level * 3)
-    qty = random.randint(1, max_qty)
+    qty = scale_mining_qty(random.randint(1, max_qty))
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         await db.execute(
@@ -993,7 +993,24 @@ BOSS_LIFETIME = 24 * 60 * 60  # 24 часа жизни босса
 ORE_MINE_COOLDOWN = 120  # 2 минуты между копанием
 FISHING_COOLDOWN = 5  # 5 секунд между попытками рыбалки
 TAXI_COOLDOWN = 300  # 5 ????? ????? ?????????
-COUNTRY_INCOME_MULTIPLIER = 2
+INCOME_MULTIPLIER = 0.2
+PRICE_MULTIPLIER = 1.5
+COUNTRY_INCOME_MULTIPLIER = 2 * INCOME_MULTIPLIER
+
+def scale_income(value: int) -> int:
+    if not value or value <= 0:
+        return 0
+    return max(1, int(round(value * INCOME_MULTIPLIER)))
+
+def scale_price(value: int) -> int:
+    if not value or value <= 0:
+        return 0
+    return max(1, int(round(value * PRICE_MULTIPLIER)))
+
+def scale_mining_qty(qty: int) -> int:
+    if qty <= 0:
+        return 0
+    return max(1, int(round(qty * INCOME_MULTIPLIER)))
 TAXI_PARK_MAX_LEVEL = 10
 TAXI_PARK_UPGRADE_COSTS = [
     50_000_000, 120_000_000, 250_000_000, 500_000_000, 1_000_000_000,
@@ -1720,7 +1737,7 @@ class BitcoinMining:
     def calculate_btc_per_hour(hashrate: float) -> float:
         """Вычисляет сколько BTC добывается в час"""
         # 10 миллионов MH/s = 0.04 BTC/час
-        return (hashrate / 10_000_000) * 0.04 * 5.0
+        return (hashrate / 10_000_000) * 0.04 * 5.0 * INCOME_MULTIPLIER
     @staticmethod
     def get_bitcoin_price() -> float:
         """Текущая цена биткоина в $"""
@@ -1737,7 +1754,7 @@ class BitcoinMining:
             4: 400_000_000,    # 400М (в 5 раз дороже уровня 3)
             5: 2_400_000_000   # 2.4Б (в 6 раз дороже уровня 4)
         }
-        return base_prices.get(gpu_level, 7_200_000)
+        return scale_price(base_prices.get(gpu_level, 7_200_000))
     # ========== КЛАСС ДЛЯ УПРАВЛЕНИЯ ИГРОЙ КРАШ ==========
 class CrashGameManager:
     @staticmethod
@@ -2084,6 +2101,52 @@ INVESTMENTS = {
     }
 }
 # ========== БЛЭКДЖЕК ==========
+def apply_economy_scaling():
+    global TAXI_PARK_UPGRADE_COSTS
+    for data in BUSINESS_DEFS.values():
+        data["base_cost"] = scale_price(data.get("base_cost", 0))
+    for data in LEGACY_BUSINESS_DEFS.values():
+        data["price"] = scale_price(data.get("price", 0))
+    for tech in SPACE_TECH_CONFIG:
+        tech["cost_plasma"] = scale_price(tech.get("cost_plasma", 0))
+        tech["cost_plutonium"] = scale_price(tech.get("cost_plutonium", 0))
+    for data in BUILDING_CONFIG.values():
+        data["base_cost"] = scale_price(data.get("base_cost", 0))
+    for data in ITEM_CONFIG.values():
+        data["price_money"] = scale_price(data.get("price_money", 0))
+        data["price_plutonium"] = scale_price(data.get("price_plutonium", 0))
+        data["price_plasma"] = scale_price(data.get("price_plasma", 0))
+    TAXI_PARK_UPGRADE_COSTS = [scale_price(cost) for cost in TAXI_PARK_UPGRADE_COSTS]
+    for car in TAXI_CAR_CONFIG:
+        car["price"] = scale_price(car.get("price", 0))
+        car["work_min"] = scale_income(car.get("work_min", 0))
+        car["work_max"] = scale_income(car.get("work_max", 0))
+        car["park_min"] = scale_income(car.get("park_min", 0))
+        car["park_max"] = scale_income(car.get("park_max", 0))
+    for pickaxe in PICKAXE_CONFIG:
+        pickaxe["price"] = scale_price(pickaxe.get("price", 0))
+    for boat in FISHING_BOATS:
+        boat["price"] = scale_price(boat.get("price", 0))
+    for rod in FISHING_RODS:
+        rod["price"] = scale_price(rod.get("price", 0))
+    for tackle in FISHING_TACKLE:
+        tackle["price"] = scale_price(tackle.get("price", 0))
+    for planet in PLANETS.values():
+        planet["price_dollars"] = scale_price(planet.get("price_dollars", 0))
+        planet["price_plasma"] = scale_price(planet.get("price_plasma", 0))
+        planet["plasma_per_hour"] = scale_income(planet.get("plasma_per_hour", 0))
+    for reward in BOSS_REWARD_CONFIG.values():
+        reward["money"] = scale_income(reward.get("money", 0))
+        reward["plasma"] = scale_income(reward.get("plasma", 0))
+    for colony in SPACE_COLONY_TYPES.values():
+        colony["yield_plasma"] = scale_income(colony.get("yield_plasma", 0))
+        colony["yield_plutonium"] = scale_income(colony.get("yield_plutonium", 0))
+        colony["yield_artifacts"] = scale_income(colony.get("yield_artifacts", 0))
+        colony["yield_tech"] = scale_income(colony.get("yield_tech", 0))
+    for inv in INVESTMENTS.values():
+        inv["profit_multiplier"] = inv.get("profit_multiplier", 0) * INCOME_MULTIPLIER
+
+apply_economy_scaling()
 bj_games = {}
 CARD_VALUES = {"2":2, "3":3, "4":4, "5":5, "6":6, "7":7, "8":8, "9":9,
                "10":10, "J":10, "Q":10, "K":10, "A":11}
@@ -2359,6 +2422,8 @@ def resolve_expedition_outcome(expedition_type: str, station_level: int, techs: 
         for key, rng in cfg['loot'].items():
             amount = random.randint(rng[0], rng[1])
             loot[key] = int(amount * scale * ai_bonus)
+        for key in loot:
+            loot[key] = scale_income(loot[key])
     discovery = None
     if outcome in ('success', 'partial'):
         chance = cfg['discovery_chance']
@@ -4179,7 +4244,7 @@ async def process_referral(new_user_id: int, referral_code: str, bot: Bot = None
             cursor = await db.execute("SELECT 1 FROM referral_progress WHERE referred_id = ?", (new_user_id,))
             if await cursor.fetchone():
                 return False, 0, None
-            reward_total = random.randint(1_000_000, 5_000_000)
+            reward_total = scale_income(random.randint(1_000_000, 5_000_000))
             rep_total = random.randint(10, 30)
             immediate_reward = int(reward_total * 0.2)
             immediate_rep = max(1, int(rep_total * 0.2)) if rep_total > 0 else 0
@@ -8533,7 +8598,7 @@ async def create_clan_name(msg: Message):
     if len(name) < 3 or len(name) > 20:
         await msg.reply("❌ Название клана должно быть 3-20 символов")
         return
-    price = 1000000  # 1M
+    price = scale_price(1_000_000)  # 1M
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -8588,7 +8653,7 @@ async def create_clan_name_from_prompt(msg: Message):
     if len(name) < 3 or len(name) > 20:
         await msg.reply("Название клана должно быть 3-20 символов.")
         return
-    price = 1_000_000
+    price = scale_price(1_000_000)
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -10662,8 +10727,8 @@ async def award_boss_rewards(boss_id: int):
             for participant in all_participants:
                 uid = participant['user_id']
                 damage = participant['damage']
-                money_reward = min(50000, damage * 5) * reward_multiplier
-                await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (int(money_reward), uid))
+                money_reward = scale_income(int(min(50000, damage * 5) * reward_multiplier))
+                await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (money_reward, uid))
                 await db.execute("UPDATE users SET weapons_shop_unlocked = 1 WHERE id = ?", (uid,))
             # Дополнительные награды топ-3
             rewards = [
@@ -10678,8 +10743,11 @@ async def award_boss_rewards(boss_id: int):
                     money *= reward_multiplier
                     plut *= reward_multiplier
                     plasma *= reward_multiplier
+                    money = scale_income(int(money))
+                    plut = scale_income(int(plut))
+                    plasma = scale_income(int(plasma))
                     await db.execute("UPDATE users SET balance = balance + ?, plasma = plasma + ? WHERE id = ?",
-                                   (int(money), int(plasma), uid))
+                                   (money, plasma, uid))
                     # Плазма не добавлена, но предположим есть поле для плазмы
             await db.commit()
             logger.info(f"Выданы награды за босса {boss_id}: {len(all_participants)} участников")
@@ -11577,7 +11645,7 @@ async def buy_country_cb(cb: CallbackQuery):
     """Купить страну"""
     country_id = int(cb.data.split("_")[2])
     uid = cb.from_user.id
-    price = 5000000  # 5M
+    price = scale_price(5_000_000)  # 5M
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -11719,8 +11787,8 @@ async def build_country_businesses_view(country_id: int, uid: int):
         for code, bdef in BUSINESS_DEFS.items():
             level = businesses.get(code, 0)
             display_level = max(1, level)
-            min_day = int(bdef.get('income_min_day', 0)) * display_level
-            max_day = int(bdef.get('income_max_day', 0)) * display_level
+            min_day = int(int(bdef.get('income_min_day', 0)) * display_level * COUNTRY_INCOME_MULTIPLIER)
+            max_day = int(int(bdef.get('income_max_day', 0)) * display_level * COUNTRY_INCOME_MULTIPLIER)
             income_text = f"{format_money(min_day)}-{format_money(max_day)}/????" if max_day > 0 else "?"
             max_level = bdef["max_level"]
             if level >= max_level:
@@ -12631,7 +12699,7 @@ async def claim_boss_rewards_cb(cb: CallbackQuery):
                 return
             tier = boss["tier"]
             reward = BOSS_REWARD_CONFIG.get(tier, {"money": 0, "plasma": 0, "unique_chance": 0})
-            participation_money = min(50_000, hit["damage"] * 5) * BOSS_REWARD_MULTIPLIER
+            participation_money = scale_income(int(min(50_000, hit["damage"] * 5) * BOSS_REWARD_MULTIPLIER))
             total_money = participation_money + reward["money"] * BOSS_REWARD_MULTIPLIER
             plasma_reward = reward["plasma"] * BOSS_REWARD_MULTIPLIER
             await db.execute("""
@@ -13083,16 +13151,16 @@ async def space_discovery_action_cb(cb: CallbackQuery):
                 return
             message = ""
             if action == "data":
-                gain = random.randint(1, 3)
+                gain = scale_income(random.randint(1, 3))
                 await db.execute("UPDATE users SET tech_data = tech_data + ? WHERE id = ?", (gain, uid))
                 message = f"\u0414\u0430\u043d\u043d\u044b\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u044b: +{gain}"
             elif action == "deep":
                 if random.random() < 0.3:
                     message = "\u0418\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u0435 \u043f\u0440\u043e\u0432\u0430\u043b\u0438\u043b\u043e\u0441\u044c"
                 else:
-                    loot_plasma = random.randint(1, 4)
-                    loot_plutonium = random.randint(0, 2)
-                    loot_artifacts = random.randint(0, 2)
+                    loot_plasma = scale_income(random.randint(1, 4))
+                    loot_plutonium = scale_income(random.randint(0, 2))
+                    loot_artifacts = scale_income(random.randint(0, 2))
                     await db.execute(
                         "UPDATE users SET plasma = plasma + ?, plutonium = plutonium + ?, artifacts = artifacts + ? WHERE id = ?",
                         (loot_plasma, loot_plutonium, loot_artifacts, uid)
@@ -13412,7 +13480,7 @@ async def mine_dig_cb(cb: CallbackQuery):
     ore = ORE_CONFIG[ore_key]
     ore_field = f"ore_{ore_key}"
     max_qty = min(15, 3 + pickaxe_level * 3)
-    qty = random.randint(1, max_qty)
+    qty = scale_mining_qty(random.randint(1, max_qty))
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         await db.execute(
@@ -13566,7 +13634,8 @@ def get_fishing_catch_count(rod_level: int) -> int:
     for i in range(1, 5):
         weights[i] += bonus * 2
     weights[0] = max(10, weights[0] - bonus * 4)
-    return random.choices([1, 2, 3, 4, 5], weights=weights, k=1)[0]
+    count = random.choices([1, 2, 3, 4, 5], weights=weights, k=1)[0]
+    return max(1, int(round(count * INCOME_MULTIPLIER)))
 def format_short_seconds(seconds: int) -> str:
     if seconds <= 0:
         return "0 сек."
