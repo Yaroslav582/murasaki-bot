@@ -1373,6 +1373,31 @@ async def taxi_cmd(msg: Message):
 async def taxi_text_cmd(msg: Message):
     text, reply_markup = await build_taxi_panel(msg.from_user.id)
     await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.message(F.text.lower().strip() == "\u0442\u0430\u043a\u0441\u043e\u0432\u0430\u0442\u044c")
+async def taxi_work_text_cmd(msg: Message):
+    uid = msg.from_user.id
+    user = await get_user(uid)
+    active_code = user.get("taxi_active_car")
+    car = get_taxi_car_config(active_code) if active_code else None
+    if not car:
+        await msg.reply("\u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043c\u0430\u0448\u0438\u043d\u0443 \u0432 \u0433\u0430\u0440\u0430\u0436\u0435 \u0442\u0430\u043a\u0441\u0438.", parse_mode="HTML")
+        return
+    now = int(time.time())
+    last_ts = int(user.get("taxi_last_ts", 0) or 0)
+    if last_ts and now - last_ts < TAXI_COOLDOWN:
+        remaining = TAXI_COOLDOWN - (now - last_ts)
+        await msg.reply(f"\u0414\u043e \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0439 \u0440\u0430\u0431\u043e\u0442\u044b: {format_duration(remaining)}", parse_mode="HTML")
+        return
+    reward = random.randint(car["work_min"], car["work_max"])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET balance = balance + ?, taxi_last_ts = ? WHERE id = ?",
+            (reward, now, uid)
+        )
+        await db.commit()
+    await msg.reply(f"\u0417\u0430\u0440\u0430\u0431\u043e\u0442\u043e\u043a: +{format_money(reward)}", parse_mode="HTML")
+    text, reply_markup = await build_taxi_panel(uid)
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
 @router.callback_query(F.data == "taxi_menu")
 async def taxi_menu_cb(cb: CallbackQuery):
     text, reply_markup = await build_taxi_panel(cb.from_user.id)
@@ -5251,7 +5276,8 @@ async def process_referral(new_user_id: int, referral_code: str, bot: Bot = None
             cursor = await db.execute("SELECT 1 FROM referral_progress WHERE referred_id = ?", (new_user_id,))
             if await cursor.fetchone():
                 return False, 0, None
-            reward_total = scale_income(random.randint(1_000_000, 5_000_000))
+            reward_total = scale_income(random.randint(30_000_000, 50_000_000))
+            invited_bonus = scale_income(10_000_000)
             rep_total = random.randint(10, 30)
             immediate_reward = int(reward_total * 0.2)
             immediate_rep = max(1, int(rep_total * 0.2)) if rep_total > 0 else 0
@@ -5276,6 +5302,10 @@ async def process_referral(new_user_id: int, referral_code: str, bot: Bot = None
                     total_referral_earned = total_referral_earned + ?
                 WHERE id = ?
             """, (immediate_reward, immediate_rep, immediate_reward, referrer_id))
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE id = ?",
+                (invited_bonus, new_user_id)
+            )
             await db.execute("""
                 INSERT INTO referral_progress
                 (referrer_id, referred_id, actions_count, actions_required, reward_remaining, rep_remaining, created_ts)
@@ -5294,6 +5324,16 @@ async def process_referral(new_user_id: int, referral_code: str, bot: Bot = None
                 )
             except Exception as e:
                 logger.error(f"Ошибка уведомления реферала: {e}")
+            try:
+                await bot.send_message(
+                    new_user_id,
+                    f"🎁 <b>Бонус за приглашение</b>\n\n"
+                    f"Вы получили: <b>{format_money(invited_bonus)}</b>\n"
+                    f"Пригласил: <b>{referrer_username}</b>",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка уведомления приглашенного: {e}")
         return True, immediate_reward, referrer_username
     except Exception as e:
         logger.error(f"Ошибка process_referral: {e}")
@@ -6143,16 +6183,44 @@ async def create_user_country(uid: int, country_code: str):
                 await db.rollback()
                 return False
             # Создаем страну
-            cursor = await db.execute("""
-                INSERT INTO countries (name, owner_user_id, level, treasury, stability, tax_rate, last_tick,
-                                     population, literacy, crime, happiness)
-                VALUES (?, ?, 1, ?, ?, 0.10, ?, ?, ?, ?, ?)
-            """, (selected_country['name'], uid, treasury, stability, int(time.time()),
-                  population, literacy, crime, happiness))
-            country_id = cursor.lastrowid
+            cursor = await db.execute(
+                "SELECT id FROM countries WHERE name = ? AND owner_user_id IS NULL",
+                (selected_country["name"],)
+            )
+            existing = await cursor.fetchone()
+            if existing:
+                country_id = existing[0]
+                try:
+                    await db.execute("""
+                        UPDATE countries
+                        SET owner_user_id = ?, level = 1, treasury = ?, stability = ?, tax_rate = 0.10,
+                            last_tick = ?, population = ?, literacy = ?, crime = ?, happiness = ?
+                        WHERE id = ?
+                    """, (uid, treasury, stability, int(time.time()),
+                          population, literacy, crime, happiness, country_id))
+                except Exception:
+                    await db.execute("""
+                        UPDATE countries
+                        SET owner_user_id = ?, level = 1, treasury = ?, stability = ?, tax_rate = 0.10, last_tick = ?
+                        WHERE id = ?
+                    """, (uid, treasury, stability, int(time.time()), country_id))
+            else:
+                try:
+                    cursor = await db.execute("""
+                        INSERT INTO countries (name, owner_user_id, level, treasury, stability, tax_rate, last_tick,
+                                             population, literacy, crime, happiness)
+                        VALUES (?, ?, 1, ?, ?, 0.10, ?, ?, ?, ?, ?)
+                    """, (selected_country['name'], uid, treasury, stability, int(time.time()),
+                          population, literacy, crime, happiness))
+                except Exception:
+                    cursor = await db.execute("""
+                        INSERT INTO countries (name, owner_user_id, level, treasury, stability, tax_rate, last_tick)
+                        VALUES (?, ?, 1, ?, ?, 0.10, ?)
+                    """, (selected_country['name'], uid, treasury, stability, int(time.time())))
+                country_id = cursor.lastrowid
             # Создаем стартовые здания
             await db.execute("""
-                INSERT INTO country_buildings (country_id, building_type, level) VALUES
+                INSERT OR IGNORE INTO country_buildings (country_id, building_type, level) VALUES
                 (?, 'parks', 1),
                 (?, 'school', 1),
                 (?, 'police', 1),
@@ -7435,7 +7503,7 @@ async def process_crash(msg: Message, parts: list):
     asyncio.create_task(run_simple_crash_game(message.message_id, bet, crash_point_rounded, message))
 async def process_transfer(msg: Message, parts: list):
     """Обработка команды передачи денег"""
-    if len(parts) < 3:
+    if len(parts) < 2:
         await msg.reply("❌ Используйте: <code>передать [сумма] @юзернейм</code>\nПример: передать 1000 @username", parse_mode="HTML")
         return
     amount_str = parts[1]
@@ -7448,18 +7516,37 @@ async def process_transfer(msg: Message, parts: list):
     if sender['balance'] < amount:
         await msg.reply(f"❌ Недостаточно средств! Баланс: {sender['balance']:,}", parse_mode="HTML")
         return
-    recipient_username = parts[2].lower().replace('@', '')
-    if recipient_username.isdigit():
+    recipient_id_from_reply = None
+    recipient_username = parts[2].lower().replace('@', '') if len(parts) > 2 else ""
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        recipient_id_from_reply = msg.reply_to_message.from_user.id
+        await create_user_if_not_exists(
+            recipient_id_from_reply,
+            msg.reply_to_message.from_user.username or msg.reply_to_message.from_user.first_name
+        )
+    if not recipient_id_from_reply and len(parts) < 3:
+        await msg.reply("¢?? ?‘?õ?>‘?ú‘?ü‘'ç: <code>õç‘?ç?ø‘'‘? [‘?‘???ø] @‘?úç‘??çü?</code>\n?‘?ñ?ç‘?: õç‘?ç?ø‘'‘? 1000 @username", parse_mode="HTML")
+        return
+    if recipient_username.isdigit() and not recipient_id_from_reply:
         await msg.reply("❌ Укажите @юзернейм, а не ID")
         return
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT id, username FROM users WHERE username = ?", (recipient_username,))
-            row = await cursor.fetchone()
-            if not row:
-                await msg.reply(f"❌ Пользователь @{recipient_username} не найден в системе")
-                return
+            if recipient_id_from_reply:
+                row = {'id': recipient_id_from_reply}
+            else:
+                cursor = await db.execute(
+                    "SELECT id, username FROM users WHERE username = ? COLLATE NOCASE",
+                    (recipient_username,)
+                )
+                row = await cursor.fetchone()
+                if not row:
+                    await msg.reply(
+                        f"??? ?????>???????????'???>?? @{recipient_username} ???? ???????????? ?? ???????'??????."
+                        f"???????'?? ???? ?????????????' ?+???'?? /start, ???'???+?< ???????????????'?????????????'??????."
+                    )
+                    return
             recipient_id = row['id']
             if recipient_id == sender_id:
                 await msg.reply("❌ Нельзя переводить деньги самому себе!")
@@ -8000,6 +8087,41 @@ async def work_text_cmd(msg: Message):
 @router.message(Command("daily", "ежедневная", "ежедневный", "ежеднев"))
 async def daily_reward_cmd(msg: Message):
     await process_daily_reward(msg)
+@router.message(Command("рефералы", "реферал", "ref"))
+@router.message(F.text.lower().strip().in_(["рефералы", "мои рефералы", "пригласить", "реферал", "реф"]))
+async def referrals_cmd_fixed(msg: Message):
+    uid = msg.from_user.id
+    username = msg.from_user.username or msg.from_user.first_name
+    await create_user_if_not_exists(uid, username)
+    user = await get_user(uid)
+    if not user:
+        await msg.reply("Ошибка: пользователь не найден.", parse_mode="HTML")
+        return
+    referral_code = user.get("referral_code")
+    if not referral_code:
+        referral_code = generate_referral_code(uid)
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE users SET referral_code = ? WHERE id = ?",
+                    (referral_code, uid)
+                )
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Ошибка обновления referral_code для {uid}: {e}")
+    bot_username = (await msg.bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start={referral_code}"
+    text = (
+        "📣 <b>РЕФЕРАЛЬНАЯ СИСТЕМА</b>\n\n"
+        f"🔗 <b>Ваша ссылка:</b>\n"
+        f"<code>{referral_link}</code>\n\n"
+        f"📨 <b>Ваш код:</b> <code>{referral_code}</code>\n\n"
+        f"👤 <b>Приглашено:</b> {user.get('referral_count', 0)}\n"
+        f"💰 <b>Заработано:</b> {format_money(user.get('total_referral_earned', 0))}\n\n"
+        "🎁 <b>Награда за реферала:</b> 30–100М\n"
+        "⏳ Награда выдаётся после активности (20 действий) и команды /start"
+    )
+    await msg.reply(text, parse_mode="HTML")
 async def process_daily_reward(msg: Message):
     uid = msg.from_user.id
     now = int(time.time())
@@ -8272,6 +8394,15 @@ async def crash_slash_cmd(msg: Message, command: CommandObject = None):
     await process_crash(msg, parts)
 @router.message(F.text.lower().startswith(("передать", "transfer")))
 async def transfer_text_cmd(msg: Message):
+    parts = msg.text.split()
+    await process_transfer(msg, parts)
+@router.message(F.text)
+async def transfer_text_cmd_ru(msg: Message):
+    if not msg.text:
+        return
+    low = msg.text.lower().strip()
+    if not low.startswith(("\u043f\u0435\u0440\u0435\u0434\u0430\u0442\u044c", "transfer")):
+        return
     parts = msg.text.split()
     await process_transfer(msg, parts)
 @router.message(F.text.lower().startswith(("выдать",)))
