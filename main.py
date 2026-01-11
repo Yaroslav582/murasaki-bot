@@ -4,6 +4,7 @@ import random
 import time
 import logging
 import hashlib
+import html
 import math
 import re
 import secrets
@@ -986,6 +987,11 @@ async def planets_cmd(msg: Message):
 WORK_COOLDOWN = 300  # 5 минут
 BONUS_COOLDOWN = 3600  # 1 час
 REFERRAL_ACTIONS_REQUIRED = 20
+DAILY_REWARDS_M = [
+    10, 15, 20, 25, 30, 35, 50, 80, 100, 120, 150
+]
+while len(DAILY_REWARDS_M) < 30:
+    DAILY_REWARDS_M.append(DAILY_REWARDS_M[-1] + 30)
 # ⬇ ДОБАВИТЬ НОВЫЕ КОНСТАНТЫ:
 GAMES_COOLDOWN = 5  # 5 секунд для всех азартных игр
 BOSS_COOLDOWN = 300  # 5 минут для атаки босса
@@ -993,14 +999,21 @@ BOSS_LIFETIME = 24 * 60 * 60  # 24 часа жизни босса
 ORE_MINE_COOLDOWN = 120  # 2 минуты между копанием
 FISHING_COOLDOWN = 5  # 5 секунд между попытками рыбалки
 TAXI_COOLDOWN = 300  # 5 ????? ????? ?????????
-INCOME_MULTIPLIER = 0.2
-PRICE_MULTIPLIER = 1.5
+INCOME_MULTIPLIER = 1.0
+PRICE_MULTIPLIER = 0.8
 COUNTRY_INCOME_MULTIPLIER = 2 * INCOME_MULTIPLIER
 
 def scale_income(value: int) -> int:
     if not value or value <= 0:
         return 0
     return max(1, int(round(value * INCOME_MULTIPLIER)))
+
+def get_daily_reward_amount(streak: int) -> int:
+    if streak <= 0:
+        streak = 1
+    idx = min(30, streak) - 1
+    base = DAILY_REWARDS_M[idx] * 1_000_000
+    return scale_income(base)
 
 def scale_price(value: int) -> int:
     if not value or value <= 0:
@@ -1032,6 +1045,85 @@ TAXI_CAR_CONFIG = [
     {"code": "mercedes_s", "name": "Mercedes S", "price": 900_000_000, "work_min": 54_000_000, "work_max": 90_000_000, "park_min": 720_000_000, "park_max": 1_200_000_000},
     {"code": "bentley_flying_spur", "name": "Bentley Flying Spur", "price": 1_300_000_000, "work_min": 78_000_000, "work_max": 130_000_000, "park_min": 1_040_000_000, "park_max": 1_733_200_000},
     {"code": "rolls_royce_phantom", "name": "Rolls-Royce Phantom", "price": 2_000_000_000, "work_min": 120_000_000, "work_max": 200_000_000, "park_min": 1_600_000_000, "park_max": 2_666_800_000},
+]
+TRANSPORT_CREATE_COST = 25_000_000_000
+TRANSPORT_ORDER_DURATION = 3 * 3600
+TRANSPORT_OFFICES = [
+    {"code": "roadside", "name": "Склад у трассы", "price": 5_000_000_000, "income_mult": 1.00, "risk_add": 0},
+    {"code": "city", "name": "Городской офис", "price": 10_000_000_000, "income_mult": 1.15, "risk_add": 3},
+    {"code": "regional", "name": "Региональный офис", "price": 20_000_000_000, "income_mult": 1.30, "risk_add": 6},
+    {"code": "national", "name": "Национальный офис", "price": 40_000_000_000, "income_mult": 1.50, "risk_add": 10},
+    {"code": "global", "name": "Международный штаб", "price": 80_000_000_000, "income_mult": 1.70, "risk_add": 15},
+]
+TRANSPORT_TRUCKS = [
+    {"code": "gazelle", "name": "Газель NEXT", "price": 2_500_000_000, "income_mult": 0.60},
+    {"code": "iveco", "name": "Iveco Stralis", "price": 5_000_000_000, "income_mult": 0.75},
+    {"code": "scania_p", "name": "Scania P-series", "price": 8_000_000_000, "income_mult": 0.90},
+    {"code": "volvo_fh", "name": "Volvo FH", "price": 12_000_000_000, "income_mult": 1.05},
+    {"code": "man_tgx", "name": "MAN TGX", "price": 18_000_000_000, "income_mult": 1.15},
+    {"code": "daf_xf", "name": "DAF XF", "price": 26_000_000_000, "income_mult": 1.25},
+    {"code": "mercedes_actros", "name": "Mercedes Actros", "price": 36_000_000_000, "income_mult": 1.35},
+    {"code": "scania_s", "name": "Scania S-series", "price": 50_000_000_000, "income_mult": 1.50},
+    {"code": "volvo_fh16", "name": "Volvo FH16", "price": 70_000_000_000, "income_mult": 1.65},
+    {"code": "kenworth_w900", "name": "Kenworth W900", "price": 100_000_000_000, "income_mult": 1.80},
+]
+TRANSPORT_CARGO = [
+    {"code": "vegetables", "name": "Овощи", "base_income": 600_000_000, "base_risk": 2},
+    {"code": "metal", "name": "Металл", "base_income": 900_000_000, "base_risk": 4},
+    {"code": "weapons", "name": "Оружие", "base_income": 1_200_000_000, "base_risk": 9},
+    {"code": "food", "name": "Продукты", "base_income": 700_000_000, "base_risk": 3},
+    {"code": "diamonds", "name": "Алмазы", "base_income": 1_400_000_000, "base_risk": 7},
+    {"code": "contraband", "name": "Контрабанда", "base_income": 1_600_000_000, "base_risk": 12},
+    {"code": "construction", "name": "Стройматериалы", "base_income": 850_000_000, "base_risk": 4},
+]
+CONSTRUCTION_CREATE_COST = 50_000_000_000
+CONSTRUCTION_RESOURCE_PRICES = {
+    "workers": 50_000_000,
+    "materials": 20_000_000,
+    "land": 2_000_000_000
+}
+CONSTRUCTION_OFFICES = [
+    {"level": 1, "name": "Проектный участок", "price": 10_000_000_000, "income_mult": 1.00, "risk_add": 0},
+    {"level": 2, "name": "Городской отдел", "price": 20_000_000_000, "income_mult": 1.10, "risk_add": 2},
+    {"level": 3, "name": "Региональный штаб", "price": 35_000_000_000, "income_mult": 1.20, "risk_add": 4},
+    {"level": 4, "name": "Проектный центр", "price": 55_000_000_000, "income_mult": 1.30, "risk_add": 6},
+    {"level": 5, "name": "Национальный офис", "price": 80_000_000_000, "income_mult": 1.40, "risk_add": 8},
+    {"level": 6, "name": "Инфраструктурный блок", "price": 110_000_000_000, "income_mult": 1.55, "risk_add": 10},
+    {"level": 7, "name": "Девелоперский узел", "price": 150_000_000_000, "income_mult": 1.70, "risk_add": 12},
+    {"level": 8, "name": "Инвестиционный офис", "price": 200_000_000_000, "income_mult": 1.85, "risk_add": 14},
+    {"level": 9, "name": "Международная дирекция", "price": 260_000_000_000, "income_mult": 2.00, "risk_add": 16},
+    {"level": 10, "name": "Глобальный холдинг", "price": 330_000_000_000, "income_mult": 2.20, "risk_add": 18},
+]
+CONSTRUCTION_PROJECTS = [
+    {"code": "garage", "name": "Гаражный комплекс", "min_level": 1, "workers": 40, "materials": 120, "land": 1, "base_income": 2_000_000_000, "duration": 2 * 3600, "base_risk": 3},
+    {"code": "warehouse", "name": "Складской ангар", "min_level": 1, "workers": 55, "materials": 160, "land": 1, "base_income": 2_600_000_000, "duration": 3 * 3600, "base_risk": 4},
+    {"code": "small_shop", "name": "Торговый павильон", "min_level": 1, "workers": 60, "materials": 180, "land": 1, "base_income": 3_000_000_000, "duration": 3 * 3600, "base_risk": 4},
+    {"code": "gas_station", "name": "АЗС у трассы", "min_level": 1, "workers": 70, "materials": 210, "land": 1, "base_income": 3_400_000_000, "duration": 4 * 3600, "base_risk": 5},
+    {"code": "cafe", "name": "Кафе у дороги", "min_level": 1, "workers": 75, "materials": 230, "land": 1, "base_income": 3_800_000_000, "duration": 4 * 3600, "base_risk": 5},
+    {"code": "auto_service", "name": "Автосервис", "min_level": 2, "workers": 90, "materials": 260, "land": 1, "base_income": 4_500_000_000, "duration": 5 * 3600, "base_risk": 6},
+    {"code": "mini_hotel", "name": "Мини-отель", "min_level": 2, "workers": 100, "materials": 300, "land": 1, "base_income": 5_200_000_000, "duration": 5 * 3600, "base_risk": 6},
+    {"code": "small_office", "name": "Небольшой офис", "min_level": 2, "workers": 110, "materials": 320, "land": 1, "base_income": 5_800_000_000, "duration": 6 * 3600, "base_risk": 7},
+    {"code": "apartment_3f", "name": "Жилой дом (3 этажа)", "min_level": 2, "workers": 120, "materials": 350, "land": 1, "base_income": 6_400_000_000, "duration": 6 * 3600, "base_risk": 7},
+    {"code": "fitness", "name": "Фитнес-центр", "min_level": 2, "workers": 130, "materials": 380, "land": 1, "base_income": 7_200_000_000, "duration": 6 * 3600, "base_risk": 8},
+    {"code": "mall_small", "name": "ТЦ (малый)", "min_level": 3, "workers": 150, "materials": 450, "land": 2, "base_income": 8_000_000_000, "duration": 7 * 3600, "base_risk": 8},
+    {"code": "office_center", "name": "Офисный центр", "min_level": 3, "workers": 170, "materials": 500, "land": 2, "base_income": 9_200_000_000, "duration": 7 * 3600, "base_risk": 9},
+    {"code": "hospital_small", "name": "Частная клиника", "min_level": 3, "workers": 190, "materials": 560, "land": 2, "base_income": 10_500_000_000, "duration": 8 * 3600, "base_risk": 9},
+    {"code": "business_center", "name": "Бизнес-центр", "min_level": 3, "workers": 210, "materials": 620, "land": 2, "base_income": 12_000_000_000, "duration": 8 * 3600, "base_risk": 10},
+    {"code": "bridge_small", "name": "Малый мост", "min_level": 3, "workers": 220, "materials": 700, "land": 2, "base_income": 13_200_000_000, "duration": 9 * 3600, "base_risk": 11},
+    {"code": "residential_8f", "name": "ЖК (8 этажей)", "min_level": 4, "workers": 240, "materials": 780, "land": 2, "base_income": 14_800_000_000, "duration": 9 * 3600, "base_risk": 11},
+    {"code": "logistics_center", "name": "Логистический центр", "min_level": 4, "workers": 260, "materials": 820, "land": 2, "base_income": 16_000_000_000, "duration": 10 * 3600, "base_risk": 12},
+    {"code": "water_treatment", "name": "Очистные сооружения", "min_level": 4, "workers": 280, "materials": 900, "land": 2, "base_income": 17_500_000_000, "duration": 10 * 3600, "base_risk": 12},
+    {"code": "school", "name": "Школа", "min_level": 4, "workers": 300, "materials": 950, "land": 2, "base_income": 18_500_000_000, "duration": 11 * 3600, "base_risk": 13},
+    {"code": "stadium_small", "name": "Стадион (малый)", "min_level": 5, "workers": 330, "materials": 1_050, "land": 3, "base_income": 20_000_000_000, "duration": 12 * 3600, "base_risk": 14},
+    {"code": "hospital_large", "name": "Городская больница", "min_level": 5, "workers": 360, "materials": 1_150, "land": 3, "base_income": 22_000_000_000, "duration": 12 * 3600, "base_risk": 14},
+    {"code": "residential_16f", "name": "ЖК (16 этажей)", "min_level": 5, "workers": 380, "materials": 1_250, "land": 3, "base_income": 24_000_000_000, "duration": 13 * 3600, "base_risk": 15},
+    {"code": "airport_terminal", "name": "Терминал аэропорта", "min_level": 6, "workers": 420, "materials": 1_400, "land": 4, "base_income": 27_000_000_000, "duration": 14 * 3600, "base_risk": 16},
+    {"code": "power_plant", "name": "ТЭС/ГЭС", "min_level": 6, "workers": 450, "materials": 1_550, "land": 4, "base_income": 30_000_000_000, "duration": 14 * 3600, "base_risk": 17},
+    {"code": "metro_station", "name": "Станция метро", "min_level": 7, "workers": 480, "materials": 1_700, "land": 4, "base_income": 33_000_000_000, "duration": 15 * 3600, "base_risk": 18},
+    {"code": "bridge_large", "name": "Крупный мост", "min_level": 7, "workers": 520, "materials": 1_850, "land": 4, "base_income": 36_000_000_000, "duration": 16 * 3600, "base_risk": 19},
+    {"code": "stadium_large", "name": "Стадион (большой)", "min_level": 8, "workers": 560, "materials": 2_100, "land": 5, "base_income": 40_000_000_000, "duration": 18 * 3600, "base_risk": 20},
+    {"code": "skyscraper", "name": "Небоскреб", "min_level": 9, "workers": 620, "materials": 2_400, "land": 5, "base_income": 45_000_000_000, "duration": 20 * 3600, "base_risk": 22},
+    {"code": "spaceport", "name": "Космопорт", "min_level": 10, "workers": 700, "materials": 2_800, "land": 6, "base_income": 52_000_000_000, "duration": 24 * 3600, "base_risk": 25},
 ]
 FISHING_EXP_PER_LEVEL = 100
 FISHING_EXP_BASE = 5
@@ -1519,6 +1611,849 @@ async def taxi_park_upgrade_cb(cb: CallbackQuery):
         await db.commit()
     await cb.answer(f"Таксопарк улучшен до уровня {level + 1}.", show_alert=True)
     text, reply_markup = await build_taxi_park_view(uid)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+def get_transport_office_config(code: str):
+    for office in TRANSPORT_OFFICES:
+        if office["code"] == code:
+            return office
+    return None
+def get_transport_truck_config(code: str):
+    for truck in TRANSPORT_TRUCKS:
+        if truck["code"] == code:
+            return truck
+    return None
+def get_transport_cargo_config(code: str):
+    for cargo in TRANSPORT_CARGO:
+        if cargo["code"] == code:
+            return cargo
+    return None
+async def _get_transport_company(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, name, office_code, active_truck_code FROM transport_companies WHERE owner_user_id = ?",
+            (uid,)
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "office_code": row["office_code"],
+        "active_truck_code": row["active_truck_code"],
+    }
+async def _get_transport_trucks(db: aiosqlite.Connection, company_id: int) -> dict:
+    cursor = await db.execute(
+        "SELECT truck_code, count FROM transport_trucks WHERE company_id = ?",
+        (company_id,)
+    )
+    rows = await cursor.fetchall()
+    return {row[0]: int(row[1] or 0) for row in rows}
+async def _get_transport_order(db: aiosqlite.Connection, company_id: int):
+    cursor = await db.execute(
+        "SELECT cargo_code, income, risk, started_at, ends_at FROM transport_orders WHERE company_id = ?",
+        (company_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "cargo_code": row[0],
+        "income": int(row[1] or 0),
+        "risk": int(row[2] or 0),
+        "started_at": int(row[3] or 0),
+        "ends_at": int(row[4] or 0),
+    }
+def _calc_transport_order(cargo: dict, office: dict, truck: dict):
+    office_mult = office["income_mult"] if office else 1.0
+    truck_mult = truck["income_mult"] if truck else 1.0
+    income = int(cargo["base_income"] * office_mult * truck_mult)
+    risk = int(cargo["base_risk"] + (office["risk_add"] if office else 0))
+    return max(1, income), min(95, max(0, risk))
+async def build_transport_menu(uid: int):
+    company = await _get_transport_company(uid)
+    if not company:
+        text = "🚛 <b>Транспортная компания</b>\n\n"
+        text += "У вас нет транспортной компании.\n"
+        text += f"Стоимость создания: <b>{format_money(TRANSPORT_CREATE_COST)}</b>\n"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Создать ТК", callback_data="tc_create")],
+            [InlineKeyboardButton(text="Назад", callback_data="back_to_menu")]
+        ])
+        return text, keyboard
+    async with aiosqlite.connect(DB_PATH) as db:
+        trucks = await _get_transport_trucks(db, company["id"])
+        order = await _get_transport_order(db, company["id"])
+    total_trucks = sum(trucks.values())
+    office = get_transport_office_config(company["office_code"])
+    office_name = office["name"] if office else "Не выбран"
+    active_truck = get_transport_truck_config(company["active_truck_code"])
+    active_truck_name = active_truck["name"] if active_truck else "Не выбрана"
+    text = "🚛 <b>Транспортная компания</b>\n\n"
+    text += f"Название: <b>{html.escape(company['name'])}</b>\n"
+    text += f"Офис: <b>{office_name}</b>\n"
+    text += f"Активная фура: <b>{active_truck_name}</b>\n"
+    text += f"Фур в гараже: <b>{total_trucks}</b>\n"
+    if order:
+        cargo = get_transport_cargo_config(order["cargo_code"])
+        cargo_name = cargo["name"] if cargo else order["cargo_code"]
+        remaining = max(0, order["ends_at"] - int(time.time()))
+        text += "\nАктивный заказ:\n"
+        text += f"• Груз: <b>{cargo_name}</b>\n"
+        text += f"• Доход: <b>{format_money(order['income'])}</b>\n"
+        text += f"• Риск: <b>{order['risk']}%</b>\n"
+        if remaining > 0:
+            text += f"• До завершения: {format_duration(remaining)}\n"
+        else:
+            text += "• Готов к завершению\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Офисы", callback_data="tc_offices"),
+            InlineKeyboardButton(text="Фуры", callback_data="tc_trucks")
+        ],
+        [InlineKeyboardButton(text="Заказы", callback_data="tc_orders")],
+        [InlineKeyboardButton(text="Назад", callback_data="back_to_menu")]
+    ])
+    return text, keyboard
+async def build_transport_offices(uid: int):
+    company = await _get_transport_company(uid)
+    if not company:
+        return await build_transport_menu(uid)
+    office_code = company["office_code"]
+    text = "🏢 <b>Офисы транспортной компании</b>\n\n"
+    offices = sorted(TRANSPORT_OFFICES, key=lambda o: o["price"], reverse=True)
+    for office in offices:
+        bonus = int(round((office["income_mult"] - 1) * 100))
+        current = " (выбран)" if office["code"] == office_code else ""
+        text += (
+            f"{office['name']} - {format_money(office['price'])} "
+            f"(+{bonus}% доход, +{office['risk_add']}% риск){current}\n"
+        )
+    keyboard = []
+    for office in offices:
+        if office["code"] == office_code:
+            continue
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"Купить {office['name']} за {format_money(office['price'])}",
+                callback_data=f"tc_buy_office_{office['code']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="Назад", callback_data="tc_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+async def build_transport_trucks(uid: int):
+    company = await _get_transport_company(uid)
+    if not company:
+        return await build_transport_menu(uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        trucks_owned = await _get_transport_trucks(db, company["id"])
+    text = "🚛 <b>Фуры транспортной компании</b>\n\n"
+    for truck in TRANSPORT_TRUCKS:
+        count = trucks_owned.get(truck["code"], 0)
+        suffix = f" (в гараже: {count})" if count > 0 else ""
+        text += f"{truck['name']} - {format_money(truck['price'])}{suffix}\n"
+    keyboard = []
+    for truck in TRANSPORT_TRUCKS:
+        count = trucks_owned.get(truck["code"], 0)
+        if count > 0:
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"Выбрать {truck['name']}",
+                    callback_data=f"tc_set_truck_{truck['code']}"
+                )
+            ])
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"Купить {truck['name']} за {format_money(truck['price'])}",
+                callback_data=f"tc_buy_truck_{truck['code']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="Назад", callback_data="tc_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+async def build_transport_orders(uid: int):
+    company = await _get_transport_company(uid)
+    if not company:
+        return await build_transport_menu(uid)
+    office = get_transport_office_config(company["office_code"])
+    if not office:
+        text = "🚛 <b>Заказы</b>\n\nСначала купите офис, чтобы брать заказы."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Офисы", callback_data="tc_offices")],
+            [InlineKeyboardButton(text="Назад", callback_data="tc_menu")]
+        ])
+        return text, keyboard
+    async with aiosqlite.connect(DB_PATH) as db:
+        trucks_owned = await _get_transport_trucks(db, company["id"])
+        order = await _get_transport_order(db, company["id"])
+    if not trucks_owned:
+        text = "🚛 <b>Заказы</b>\n\nСначала купите фуру."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Фуры", callback_data="tc_trucks")],
+            [InlineKeyboardButton(text="Назад", callback_data="tc_menu")]
+        ])
+        return text, keyboard
+    active_truck = get_transport_truck_config(company["active_truck_code"])
+    if not active_truck:
+        text = "🚛 <b>Заказы</b>\n\nВыберите активную фуру в меню фур."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Фуры", callback_data="tc_trucks")],
+            [InlineKeyboardButton(text="Назад", callback_data="tc_menu")]
+        ])
+        return text, keyboard
+    if order:
+        cargo = get_transport_cargo_config(order["cargo_code"])
+        cargo_name = cargo["name"] if cargo else order["cargo_code"]
+        remaining = max(0, order["ends_at"] - int(time.time()))
+        text = "🚛 <b>Активный заказ</b>\n\n"
+        text += f"Груз: <b>{cargo_name}</b>\n"
+        text += f"Доход: <b>{format_money(order['income'])}</b>\n"
+        text += f"Риск: <b>{order['risk']}%</b>\n"
+        if remaining > 0:
+            text += f"До завершения: {format_duration(remaining)}\n"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Обновить", callback_data="tc_orders")],
+                [InlineKeyboardButton(text="Назад", callback_data="tc_menu")]
+            ])
+        else:
+            text += "Заказ готов к завершению.\n"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Завершить заказ", callback_data="tc_finish")],
+                [InlineKeyboardButton(text="Назад", callback_data="tc_menu")]
+            ])
+        return text, keyboard
+    text = "🚛 <b>Взять заказ</b>\n\n"
+    text += f"Офис: <b>{office['name']}</b>\n"
+    text += f"Фура: <b>{active_truck['name']}</b>\n\n"
+    text += f"Время выполнения: {format_duration(TRANSPORT_ORDER_DURATION)}\n\n"
+    keyboard = []
+    for cargo in TRANSPORT_CARGO:
+        income, risk = _calc_transport_order(cargo, office, active_truck)
+        text += f"{cargo['name']} - доход {format_money(income)}, риск {risk}%\n"
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"Взять: {cargo['name']}",
+                callback_data=f"tc_take_{cargo['code']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="Назад", callback_data="tc_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+@router.message(F.text.lower().in_(["тк", "транспортная компания", "транс комп", "транс-комп", "транспортнаякомпания"]))
+async def transport_company_cmd(msg: Message):
+    text, reply_markup = await build_transport_menu(msg.from_user.id)
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.message(F.text.lower() == "моя тк")
+async def transport_company_my_cmd(msg: Message):
+    text, reply_markup = await build_transport_menu(msg.from_user.id)
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "tc_menu")
+async def transport_company_menu_cb(cb: CallbackQuery):
+    text, reply_markup = await build_transport_menu(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "tc_create")
+async def transport_company_create_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    company = await _get_transport_company(uid)
+    if company:
+        await cb.answer("У вас уже есть ТК.", show_alert=True)
+        return
+    user = await get_user(uid)
+    if user["balance"] < TRANSPORT_CREATE_COST:
+        await cb.answer("Недостаточно денег для создания ТК.", show_alert=True)
+        return
+    creating_transport_company[uid] = True
+    await cb.message.answer("Введите название ТК или напишите 'отмена'.")
+@router.callback_query(F.data == "tc_offices")
+async def transport_company_offices_cb(cb: CallbackQuery):
+    text, reply_markup = await build_transport_offices(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data.startswith("tc_buy_office_"))
+async def transport_company_buy_office_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    code = cb.data.replace("tc_buy_office_", "")
+    office = get_transport_office_config(code)
+    if not office:
+        await cb.answer("Офис не найден.", show_alert=True)
+        return
+    company = await _get_transport_company(uid)
+    if not company:
+        await cb.answer("Сначала создайте ТК.", show_alert=True)
+        return
+    if company["office_code"] == code:
+        await cb.answer("Офис уже выбран.", show_alert=True)
+        return
+    user = await get_user(uid)
+    if user["balance"] < office["price"]:
+        await cb.answer("Недостаточно денег.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE id = ?",
+            (office["price"], uid)
+        )
+        await db.execute(
+            "UPDATE transport_companies SET office_code = ? WHERE owner_user_id = ?",
+            (code, uid)
+        )
+        await db.commit()
+    await cb.answer(f"Офис куплен: {office['name']}", show_alert=True)
+    text, reply_markup = await build_transport_offices(uid)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "tc_trucks")
+async def transport_company_trucks_cb(cb: CallbackQuery):
+    text, reply_markup = await build_transport_trucks(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data.startswith("tc_buy_truck_"))
+async def transport_company_buy_truck_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    code = cb.data.replace("tc_buy_truck_", "")
+    truck = get_transport_truck_config(code)
+    if not truck:
+        await cb.answer("Фура не найдена.", show_alert=True)
+        return
+    company = await _get_transport_company(uid)
+    if not company:
+        await cb.answer("Сначала создайте ТК.", show_alert=True)
+        return
+    user = await get_user(uid)
+    if user["balance"] < truck["price"]:
+        await cb.answer("Недостаточно денег.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE id = ?",
+            (truck["price"], uid)
+        )
+        await db.execute(
+            "INSERT INTO transport_trucks (company_id, truck_code, count) "
+            "VALUES (?, ?, 1) "
+            "ON CONFLICT(company_id, truck_code) DO UPDATE SET count = count + 1",
+            (company["id"], code)
+        )
+        if not company["active_truck_code"]:
+            await db.execute(
+                "UPDATE transport_companies SET active_truck_code = ? WHERE owner_user_id = ?",
+                (code, uid)
+            )
+        await db.commit()
+    await cb.answer(f"Фура куплена: {truck['name']}", show_alert=True)
+    text, reply_markup = await build_transport_trucks(uid)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data.startswith("tc_set_truck_"))
+async def transport_company_set_truck_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    code = cb.data.replace("tc_set_truck_", "")
+    truck = get_transport_truck_config(code)
+    if not truck:
+        await cb.answer("Фура не найдена.", show_alert=True)
+        return
+    company = await _get_transport_company(uid)
+    if not company:
+        await cb.answer("Сначала создайте ТК.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT count FROM transport_trucks WHERE company_id = ? AND truck_code = ?",
+            (company["id"], code)
+        )
+        row = await cursor.fetchone()
+        if not row or int(row[0] or 0) <= 0:
+            await cb.answer("У вас нет этой фуры.", show_alert=True)
+            return
+        await db.execute(
+            "UPDATE transport_companies SET active_truck_code = ? WHERE owner_user_id = ?",
+            (code, uid)
+        )
+        await db.commit()
+    await cb.answer(f"Активная фура: {truck['name']}", show_alert=True)
+    text, reply_markup = await build_transport_trucks(uid)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "tc_orders")
+async def transport_company_orders_cb(cb: CallbackQuery):
+    text, reply_markup = await build_transport_orders(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data.startswith("tc_take_"))
+async def transport_company_take_order_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    code = cb.data.replace("tc_take_", "")
+    cargo = get_transport_cargo_config(code)
+    if not cargo:
+        await cb.answer("Заказ не найден.", show_alert=True)
+        return
+    company = await _get_transport_company(uid)
+    if not company:
+        await cb.answer("Сначала создайте ТК.", show_alert=True)
+        return
+    office = get_transport_office_config(company["office_code"])
+    if not office:
+        await cb.answer("Сначала купите офис.", show_alert=True)
+        return
+    active_truck = get_transport_truck_config(company["active_truck_code"])
+    if not active_truck:
+        await cb.answer("Выберите активную фуру.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        order = await _get_transport_order(db, company["id"])
+        if order:
+            await cb.answer("У вас уже есть активный заказ.", show_alert=True)
+            return
+        trucks_owned = await _get_transport_trucks(db, company["id"])
+        if trucks_owned.get(active_truck["code"], 0) <= 0:
+            await cb.answer("У вас нет выбранной фуры.", show_alert=True)
+            return
+        income, risk = _calc_transport_order(cargo, office, active_truck)
+        now = int(time.time())
+        await db.execute(
+            "INSERT INTO transport_orders (company_id, cargo_code, income, risk, started_at, ends_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (company["id"], code, income, risk, now, now + TRANSPORT_ORDER_DURATION)
+        )
+        await db.commit()
+    await cb.answer("Заказ принят.", show_alert=True)
+    text, reply_markup = await build_transport_orders(uid)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "tc_finish")
+async def transport_company_finish_order_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    company = await _get_transport_company(uid)
+    if not company:
+        await cb.answer("Сначала создайте ТК.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        order = await _get_transport_order(db, company["id"])
+        if not order:
+            await cb.answer("Активного заказа нет.", show_alert=True)
+            return
+        now = int(time.time())
+        if order["ends_at"] > now:
+            remaining = order["ends_at"] - now
+            await cb.answer(f"До завершения: {format_duration(remaining)}", show_alert=True)
+            return
+        success = random.random() >= (order["risk"] / 100)
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "DELETE FROM transport_orders WHERE company_id = ?",
+            (company["id"],)
+        )
+        if success:
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE id = ?",
+                (order["income"], uid)
+            )
+        await db.commit()
+    if success:
+        await cb.answer(f"Заказ выполнен! Доход: {format_money(order['income'])}", show_alert=True)
+    else:
+        await cb.answer("Заказ провален из-за риска. Доход не получен.", show_alert=True)
+    text, reply_markup = await build_transport_menu(uid)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+def get_construction_office(level: int):
+    for office in CONSTRUCTION_OFFICES:
+        if office["level"] == level:
+            return office
+    return None
+def get_construction_project(code: str):
+    for project in CONSTRUCTION_PROJECTS:
+        if project["code"] == code:
+            return project
+    return None
+async def _get_construction_company(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, name, office_level FROM construction_companies WHERE owner_user_id = ?",
+            (uid,)
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "office_level": int(row["office_level"] or 0)
+    }
+async def _get_construction_resources(db: aiosqlite.Connection, company_id: int):
+    cursor = await db.execute(
+        "SELECT workers, materials, land FROM construction_resources WHERE company_id = ?",
+        (company_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        await db.execute(
+            "INSERT INTO construction_resources (company_id, workers, materials, land) VALUES (?, 0, 0, 0)",
+            (company_id,)
+        )
+        await db.commit()
+        return {"workers": 0, "materials": 0, "land": 0}
+    return {"workers": int(row[0] or 0), "materials": int(row[1] or 0), "land": int(row[2] or 0)}
+async def _get_construction_project(db: aiosqlite.Connection, company_id: int):
+    cursor = await db.execute(
+        "SELECT project_code, income, risk, started_at, ends_at FROM construction_projects WHERE company_id = ?",
+        (company_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "project_code": row[0],
+        "income": int(row[1] or 0),
+        "risk": int(row[2] or 0),
+        "started_at": int(row[3] or 0),
+        "ends_at": int(row[4] or 0),
+    }
+def _calc_construction_income(project: dict, office: dict):
+    mult = office["income_mult"] if office else 1.0
+    income = int(project["base_income"] * mult)
+    risk = int(project["base_risk"] + (office["risk_add"] if office else 0))
+    return max(1, income), min(95, max(0, risk))
+async def build_construction_menu(uid: int):
+    company = await _get_construction_company(uid)
+    if not company:
+        text = "🏗️ <b>Строительная компания</b>\n\n"
+        text += "У вас нет строительной компании.\n"
+        text += f"Стоимость создания: <b>{format_money(CONSTRUCTION_CREATE_COST)}</b>\n"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Создать СК", callback_data="sc_create")],
+            [InlineKeyboardButton(text="Назад", callback_data="back_to_menu")]
+        ])
+        return text, keyboard
+    async with aiosqlite.connect(DB_PATH) as db:
+        resources = await _get_construction_resources(db, company["id"])
+        project = await _get_construction_project(db, company["id"])
+    office = get_construction_office(company["office_level"])
+    office_name = office["name"] if office else "Не выбран"
+    text = "🏗️ <b>Строительная компания</b>\n\n"
+    text += f"Название: <b>{html.escape(company['name'])}</b>\n"
+    text += f"Офис: <b>{office_name}</b>\n"
+    text += f"Рабочие: <b>{resources['workers']}</b>\n"
+    text += f"Материалы: <b>{resources['materials']}</b>\n"
+    text += f"Территория: <b>{resources['land']}</b>\n"
+    if project:
+        proj = get_construction_project(project["project_code"])
+        proj_name = proj["name"] if proj else project["project_code"]
+        remaining = max(0, project["ends_at"] - int(time.time()))
+        text += "\nАктивный объект:\n"
+        text += f"• Объект: <b>{proj_name}</b>\n"
+        text += f"• Доход: <b>{format_money(project['income'])}</b>\n"
+        text += f"• Риск: <b>{project['risk']}%</b>\n"
+        if remaining > 0:
+            text += f"• До завершения: {format_duration(remaining)}\n"
+        else:
+            text += "• Готов к завершению\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Офисы", callback_data="sc_offices"),
+            InlineKeyboardButton(text="Ресурсы", callback_data="sc_resources")
+        ],
+        [InlineKeyboardButton(text="Объекты", callback_data="sc_projects")],
+        [InlineKeyboardButton(text="Назад", callback_data="back_to_menu")]
+    ])
+    return text, keyboard
+async def build_construction_offices(uid: int):
+    company = await _get_construction_company(uid)
+    if not company:
+        return await build_construction_menu(uid)
+    current_level = company["office_level"]
+    text = "🏢 <b>Офисы строительной компании</b>\n\n"
+    for office in CONSTRUCTION_OFFICES:
+        bonus = int(round((office["income_mult"] - 1) * 100))
+        current = " (выбран)" if office["level"] == current_level else ""
+        text += (
+            f"Ур. {office['level']}: {office['name']} - {format_money(office['price'])} "
+            f"(+{bonus}% доход, +{office['risk_add']}% риск){current}\n"
+        )
+    keyboard = []
+    for office in CONSTRUCTION_OFFICES:
+        if office["level"] <= current_level:
+            continue
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"Купить ур. {office['level']} за {format_money(office['price'])}",
+                callback_data=f"sc_buy_office_{office['level']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="Назад", callback_data="sc_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+async def build_construction_resources(uid: int):
+    company = await _get_construction_company(uid)
+    if not company:
+        return await build_construction_menu(uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        resources = await _get_construction_resources(db, company["id"])
+    text = "🧱 <b>Ресурсы</b>\n\n"
+    text += f"Рабочие: <b>{resources['workers']}</b>\n"
+    text += f"Материалы: <b>{resources['materials']}</b>\n"
+    text += f"Территория: <b>{resources['land']}</b>\n\n"
+    text += "Покупка ресурсов:\n"
+    text += f"• Рабочие: {format_money(CONSTRUCTION_RESOURCE_PRICES['workers'])} за 1\n"
+    text += f"• Материалы: {format_money(CONSTRUCTION_RESOURCE_PRICES['materials'])} за 1\n"
+    text += f"• Территория: {format_money(CONSTRUCTION_RESOURCE_PRICES['land'])} за 1\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Рабочие x10", callback_data="sc_buy_workers_10"),
+            InlineKeyboardButton(text="Рабочие x50", callback_data="sc_buy_workers_50")
+        ],
+        [
+            InlineKeyboardButton(text="Материалы x100", callback_data="sc_buy_materials_100"),
+            InlineKeyboardButton(text="Материалы x500", callback_data="sc_buy_materials_500")
+        ],
+        [
+            InlineKeyboardButton(text="Территория x1", callback_data="sc_buy_land_1"),
+            InlineKeyboardButton(text="Территория x5", callback_data="sc_buy_land_5")
+        ],
+        [InlineKeyboardButton(text="Назад", callback_data="sc_menu")]
+    ])
+    return text, keyboard
+async def build_construction_projects(uid: int):
+    company = await _get_construction_company(uid)
+    if not company:
+        return await build_construction_menu(uid)
+    office = get_construction_office(company["office_level"])
+    if not office:
+        text = "🏗️ <b>Объекты</b>\n\nСначала купите офис."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Офисы", callback_data="sc_offices")],
+            [InlineKeyboardButton(text="Назад", callback_data="sc_menu")]
+        ])
+        return text, keyboard
+    async with aiosqlite.connect(DB_PATH) as db:
+        project = await _get_construction_project(db, company["id"])
+    if project:
+        proj = get_construction_project(project["project_code"])
+        proj_name = proj["name"] if proj else project["project_code"]
+        remaining = max(0, project["ends_at"] - int(time.time()))
+        text = "🏗️ <b>Активный объект</b>\n\n"
+        text += f"Объект: <b>{proj_name}</b>\n"
+        text += f"Доход: <b>{format_money(project['income'])}</b>\n"
+        text += f"Риск: <b>{project['risk']}%</b>\n"
+        if remaining > 0:
+            text += f"До завершения: {format_duration(remaining)}\n"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Обновить", callback_data="sc_projects")],
+                [InlineKeyboardButton(text="Назад", callback_data="sc_menu")]
+            ])
+        else:
+            text += "Объект готов к сдаче.\n"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Сдать объект", callback_data="sc_finish")],
+                [InlineKeyboardButton(text="Назад", callback_data="sc_menu")]
+            ])
+        return text, keyboard
+    text = "🏗️ <b>Выберите объект</b>\n\n"
+    text += f"Офис: <b>{office['name']}</b>\n\n"
+    keyboard = []
+    for proj in CONSTRUCTION_PROJECTS:
+        if proj["min_level"] > company["office_level"]:
+            continue
+        income, risk = _calc_construction_income(proj, office)
+        text += (
+            f"{proj['name']} | "
+            f"Рабочие {proj['workers']}, Материалы {proj['materials']}, Территория {proj['land']} | "
+            f"Доход {format_money(income)} | Риск {risk}% | Время {format_duration(proj['duration'])}\n"
+        )
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"Начать: {proj['name']}",
+                callback_data=f"sc_start_{proj['code']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="Назад", callback_data="sc_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+@router.message(F.text.lower().in_(["ск", "строительная компания", "стройкомп", "строй-комп", "строительнаякомпания"]))
+async def construction_company_cmd(msg: Message):
+    text, reply_markup = await build_construction_menu(msg.from_user.id)
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.message(F.text.lower() == "моя ск")
+async def construction_company_my_cmd(msg: Message):
+    text, reply_markup = await build_construction_menu(msg.from_user.id)
+    await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "sc_menu")
+async def construction_company_menu_cb(cb: CallbackQuery):
+    text, reply_markup = await build_construction_menu(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "sc_create")
+async def construction_company_create_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    company = await _get_construction_company(uid)
+    if company:
+        await cb.answer("У вас уже есть СК.", show_alert=True)
+        return
+    user = await get_user(uid)
+    if user["balance"] < CONSTRUCTION_CREATE_COST:
+        await cb.answer("Недостаточно денег для создания СК.", show_alert=True)
+        return
+    creating_construction_company[uid] = True
+    await cb.message.answer("Введите название СК или напишите 'отмена'.")
+@router.callback_query(F.data == "sc_offices")
+async def construction_company_offices_cb(cb: CallbackQuery):
+    text, reply_markup = await build_construction_offices(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data.startswith("sc_buy_office_"))
+async def construction_company_buy_office_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    level_str = cb.data.replace("sc_buy_office_", "")
+    if not level_str.isdigit():
+        await cb.answer("Офис не найден.", show_alert=True)
+        return
+    level = int(level_str)
+    office = get_construction_office(level)
+    if not office:
+        await cb.answer("Офис не найден.", show_alert=True)
+        return
+    company = await _get_construction_company(uid)
+    if not company:
+        await cb.answer("Сначала создайте СК.", show_alert=True)
+        return
+    if company["office_level"] >= level:
+        await cb.answer("Офис уже куплен.", show_alert=True)
+        return
+    user = await get_user(uid)
+    if user["balance"] < office["price"]:
+        await cb.answer("Недостаточно денег.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE id = ?",
+            (office["price"], uid)
+        )
+        await db.execute(
+            "UPDATE construction_companies SET office_level = ? WHERE owner_user_id = ?",
+            (level, uid)
+        )
+        await db.commit()
+    await cb.answer(f"Офис улучшен до уровня {level}.", show_alert=True)
+    text, reply_markup = await build_construction_offices(uid)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "sc_resources")
+async def construction_company_resources_cb(cb: CallbackQuery):
+    text, reply_markup = await build_construction_resources(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+async def _buy_construction_resource(uid: int, resource: str, qty: int):
+    company = await _get_construction_company(uid)
+    if not company:
+        return False, "Сначала создайте СК."
+    price_per = CONSTRUCTION_RESOURCE_PRICES.get(resource, 0)
+    if price_per <= 0:
+        return False, "Ресурс не найден."
+    total_cost = price_per * qty
+    user = await get_user(uid)
+    if user["balance"] < total_cost:
+        return False, "Недостаточно денег."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE id = ?",
+            (total_cost, uid)
+        )
+        await db.execute(
+            f"UPDATE construction_resources SET {resource} = {resource} + ? WHERE company_id = ?",
+            (qty, company["id"])
+        )
+        await db.commit()
+    return True, f"Куплено: {resource} x{qty}"
+@router.callback_query(F.data.startswith("sc_buy_workers_"))
+async def construction_company_buy_workers_cb(cb: CallbackQuery):
+    qty = int(cb.data.replace("sc_buy_workers_", "") or 0)
+    success, msg = await _buy_construction_resource(cb.from_user.id, "workers", qty)
+    await cb.answer(msg, show_alert=True)
+    text, reply_markup = await build_construction_resources(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data.startswith("sc_buy_materials_"))
+async def construction_company_buy_materials_cb(cb: CallbackQuery):
+    qty = int(cb.data.replace("sc_buy_materials_", "") or 0)
+    success, msg = await _buy_construction_resource(cb.from_user.id, "materials", qty)
+    await cb.answer(msg, show_alert=True)
+    text, reply_markup = await build_construction_resources(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data.startswith("sc_buy_land_"))
+async def construction_company_buy_land_cb(cb: CallbackQuery):
+    qty = int(cb.data.replace("sc_buy_land_", "") or 0)
+    success, msg = await _buy_construction_resource(cb.from_user.id, "land", qty)
+    await cb.answer(msg, show_alert=True)
+    text, reply_markup = await build_construction_resources(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "sc_projects")
+async def construction_company_projects_cb(cb: CallbackQuery):
+    text, reply_markup = await build_construction_projects(cb.from_user.id)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data.startswith("sc_start_"))
+async def construction_company_start_project_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    code = cb.data.replace("sc_start_", "")
+    project = get_construction_project(code)
+    if not project:
+        await cb.answer("Объект не найден.", show_alert=True)
+        return
+    company = await _get_construction_company(uid)
+    if not company:
+        await cb.answer("Сначала создайте СК.", show_alert=True)
+        return
+    office = get_construction_office(company["office_level"])
+    if not office or company["office_level"] < project["min_level"]:
+        await cb.answer("Недостаточный уровень офиса.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        resources = await _get_construction_resources(db, company["id"])
+        active = await _get_construction_project(db, company["id"])
+        if active:
+            await cb.answer("У вас уже есть активный объект.", show_alert=True)
+            return
+        if resources["workers"] < project["workers"] or resources["materials"] < project["materials"] or resources["land"] < project["land"]:
+            await cb.answer("Недостаточно ресурсов.", show_alert=True)
+            return
+        income, risk = _calc_construction_income(project, office)
+        now = int(time.time())
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "UPDATE construction_resources SET workers = workers - ?, materials = materials - ?, land = land - ? WHERE company_id = ?",
+            (project["workers"], project["materials"], project["land"], company["id"])
+        )
+        await db.execute(
+            "INSERT INTO construction_projects (company_id, project_code, income, risk, started_at, ends_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (company["id"], code, income, risk, now, now + project["duration"])
+        )
+        await db.commit()
+    await cb.answer("Объект в работе.", show_alert=True)
+    text, reply_markup = await build_construction_projects(uid)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+@router.callback_query(F.data == "sc_finish")
+async def construction_company_finish_project_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    company = await _get_construction_company(uid)
+    if not company:
+        await cb.answer("Сначала создайте СК.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        project = await _get_construction_project(db, company["id"])
+        if not project:
+            await cb.answer("Активного объекта нет.", show_alert=True)
+            return
+        now = int(time.time())
+        if project["ends_at"] > now:
+            remaining = project["ends_at"] - now
+            await cb.answer(f"До завершения: {format_duration(remaining)}", show_alert=True)
+            return
+        success = random.random() >= (project["risk"] / 100)
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "DELETE FROM construction_projects WHERE company_id = ?",
+            (company["id"],)
+        )
+        if success:
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE id = ?",
+                (project["income"], uid)
+            )
+        await db.commit()
+    if success:
+        await cb.answer(f"Объект сдан! Доход: {format_money(project['income'])}", show_alert=True)
+    else:
+        await cb.answer("Обрушение! Объект провален, дохода нет.", show_alert=True)
+    text, reply_markup = await build_construction_menu(uid)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
 ORE_CONFIG = {
     "stone": {"name": "Камень", "price": 50_000},
@@ -2103,6 +3038,8 @@ INVESTMENTS = {
 # ========== БЛЭКДЖЕК ==========
 def apply_economy_scaling():
     global TAXI_PARK_UPGRADE_COSTS
+    global TRANSPORT_CREATE_COST
+    global CONSTRUCTION_CREATE_COST
     for data in BUSINESS_DEFS.values():
         data["base_cost"] = scale_price(data.get("base_cost", 0))
     for data in LEGACY_BUSINESS_DEFS.values():
@@ -2123,6 +3060,21 @@ def apply_economy_scaling():
         car["work_max"] = scale_income(car.get("work_max", 0))
         car["park_min"] = scale_income(car.get("park_min", 0))
         car["park_max"] = scale_income(car.get("park_max", 0))
+    TRANSPORT_CREATE_COST = scale_price(TRANSPORT_CREATE_COST)
+    for office in TRANSPORT_OFFICES:
+        office["price"] = scale_price(office.get("price", 0))
+    for truck in TRANSPORT_TRUCKS:
+        truck["price"] = scale_price(truck.get("price", 0))
+    for cargo in TRANSPORT_CARGO:
+        cargo["base_income"] = scale_income(cargo.get("base_income", 0))
+    CONSTRUCTION_CREATE_COST = scale_price(CONSTRUCTION_CREATE_COST)
+    CONSTRUCTION_RESOURCE_PRICES["workers"] = scale_price(CONSTRUCTION_RESOURCE_PRICES.get("workers", 0))
+    CONSTRUCTION_RESOURCE_PRICES["materials"] = scale_price(CONSTRUCTION_RESOURCE_PRICES.get("materials", 0))
+    CONSTRUCTION_RESOURCE_PRICES["land"] = scale_price(CONSTRUCTION_RESOURCE_PRICES.get("land", 0))
+    for office in CONSTRUCTION_OFFICES:
+        office["price"] = scale_price(office.get("price", 0))
+    for project in CONSTRUCTION_PROJECTS:
+        project["base_income"] = scale_income(project.get("base_income", 0))
     for pickaxe in PICKAXE_CONFIG:
         pickaxe["price"] = scale_price(pickaxe.get("price", 0))
     for boat in FISHING_BOATS:
@@ -2756,6 +3708,61 @@ async def update_db_structure():
             await db.execute("CREATE TABLE IF NOT EXISTS user_taxi_park (user_id INTEGER PRIMARY KEY, level INTEGER DEFAULT 1, last_collect_ts INTEGER DEFAULT 0)")
             await db.execute("CREATE TABLE IF NOT EXISTS user_taxi_park_cars (user_id INTEGER, car_code TEXT, count INTEGER DEFAULT 0, PRIMARY KEY (user_id, car_code))")
             await db.execute("CREATE TABLE IF NOT EXISTS user_fish (user_id INTEGER, fish_code TEXT, count INTEGER DEFAULT 0, PRIMARY KEY (user_id, fish_code))")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS transport_companies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    owner_user_id INTEGER UNIQUE NOT NULL,
+                    office_code TEXT DEFAULT NULL,
+                    active_truck_code TEXT DEFAULT NULL,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS transport_trucks (
+                    company_id INTEGER NOT NULL,
+                    truck_code TEXT NOT NULL,
+                    count INTEGER DEFAULT 0,
+                    PRIMARY KEY (company_id, truck_code)
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS transport_orders (
+                    company_id INTEGER PRIMARY KEY,
+                    cargo_code TEXT NOT NULL,
+                    income INTEGER NOT NULL,
+                    risk INTEGER NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    ends_at INTEGER NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS construction_companies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    owner_user_id INTEGER UNIQUE NOT NULL,
+                    office_level INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS construction_resources (
+                    company_id INTEGER PRIMARY KEY,
+                    workers INTEGER DEFAULT 0,
+                    materials INTEGER DEFAULT 0,
+                    land INTEGER DEFAULT 0
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS construction_projects (
+                    company_id INTEGER PRIMARY KEY,
+                    project_code TEXT NOT NULL,
+                    income INTEGER NOT NULL,
+                    risk INTEGER NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    ends_at INTEGER NOT NULL
+                )
+            """)
             # 4. Таблица для лотереи (уже в правильном месте!)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS lottery_winners (
@@ -4321,7 +5328,7 @@ async def add_referral_action(uid: int, count: int = 1):
 async def handle_referral_start(msg: Message, referral_code: str):
     """Обработка старта с реферальной ссылкой"""
     uid = msg.from_user.id
-    username = msg.from_user.username or msg.from_user.first_name
+    username = html.escape(msg.from_user.username or msg.from_user.first_name)
     user = await get_user(uid)
     if msg.from_user.username and msg.from_user.username != user.get('username'):
         await update_username(uid, msg.from_user.username)
@@ -5180,6 +6187,62 @@ def split_long_message(text: str, max_len: int = 3500):
     if current:
         chunks.append(current)
     return chunks
+def split_html_message(text: str, max_len: int = 3500):
+    if len(text) <= max_len:
+        return [text]
+    tag_re = re.compile(r"(<\/?b>|<\/?code>)")
+    tokens = tag_re.split(text)
+    chunks = []
+    current = ""
+    stack = []
+    def open_tags():
+        return "".join(f"<{t}>" for t in stack)
+    def close_tags():
+        return "".join(f"</{t}>" for t in reversed(stack))
+    def stack_close_len():
+        return sum(len(f"</{t}>") for t in stack)
+    for token in tokens:
+        if token in ("<b>", "</b>", "<code>", "</code>"):
+            token_tag = token.strip("<>/")
+            if token.startswith("</"):
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i] == token_tag:
+                        stack.pop(i)
+                        break
+            else:
+                stack.append(token_tag)
+            if len(current) + len(token) + stack_close_len() > max_len and current:
+                current += close_tags()
+                chunks.append(current)
+                current = open_tags()
+            current += token
+            continue
+        text_part = token
+        while text_part:
+            available = max_len - len(current) - stack_close_len()
+            if available <= 0:
+                current += close_tags()
+                chunks.append(current)
+                current = open_tags()
+                continue
+            if len(text_part) <= available:
+                current += text_part
+                text_part = ""
+                continue
+            split_pos = text_part.rfind("\n", 0, available)
+            if split_pos == -1:
+                split_pos = text_part.rfind(" ", 0, available)
+            if split_pos == -1:
+                split_pos = available
+            current += text_part[:split_pos]
+            text_part = text_part[split_pos:]
+            current += close_tags()
+            chunks.append(current)
+            current = open_tags()
+    if current:
+        current += close_tags()
+        chunks.append(current)
+    return chunks
 def format_duration(seconds: int) -> str:
     if seconds <= 0:
         return "менее минуты"
@@ -5320,6 +6383,19 @@ Murasaki — Lord of Empires
 <code>https://t.me/{(await msg.bot.get_me()).username}?start={user['referral_code']}</code>
 🎯 <b>Удачи в зарабатывании!</b>
 """
+    tag_placeholders = {
+        "<b>": "__TAG_B_OPEN__",
+        "</b>": "__TAG_B_CLOSE__",
+        "<code>": "__TAG_CODE_OPEN__",
+        "</code>": "__TAG_CODE_CLOSE__",
+    }
+    safe_text = welcome_text
+    for tag, placeholder in tag_placeholders.items():
+        safe_text = safe_text.replace(tag, placeholder)
+    safe_text = html.escape(safe_text)
+    for tag, placeholder in tag_placeholders.items():
+        safe_text = safe_text.replace(placeholder, tag)
+    welcome_text = safe_text
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎣 Рыбалка", callback_data="show_fishing")],
         [InlineKeyboardButton(text="🪐 Планеты", callback_data="show_planets")],
@@ -5335,7 +6411,7 @@ Murasaki — Lord of Empires
          InlineKeyboardButton(text="🐉 Боссы", callback_data="show_bosses")],
         [InlineKeyboardButton(text="🛒 Военный магазин", callback_data="show_weapons_shop")]
     ])
-    chunks = split_long_message(welcome_text)
+    chunks = split_html_message(welcome_text)
     if edit:
         try:
             await msg.edit_text(chunks[0], parse_mode="HTML", reply_markup=kb)
@@ -6920,10 +7996,54 @@ async def bonus_text_cmd(msg: Message):
 @router.message(F.text.lower().startswith(("работа", "раб", "work")))
 async def work_text_cmd(msg: Message):
     await process_work(msg)
-@router.message(F.text.lower().in_(["ежедневная", "ежедневка", "daily", "дэйли"]))
-@router.message(Command("daily", "ежедневная"))
+@router.message(F.text.lower().in_(["ежедневная", "ежедневка", "ежедневный", "ежеднев", "daily", "дэйли"]))
+@router.message(Command("daily", "ежедневная", "ежедневный", "ежеднев"))
 async def daily_reward_cmd(msg: Message):
-    await msg.reply("Ежедневный бонус отключен.", parse_mode="HTML")
+    await process_daily_reward(msg)
+async def process_daily_reward(msg: Message):
+    uid = msg.from_user.id
+    now = int(time.time())
+    day_seconds = 24 * 3600
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            "SELECT balance, last_daily_claim, daily_streak FROM users WHERE id = ?",
+            (uid,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await db.rollback()
+            await msg.reply("Ошибка: пользователь не найден.", parse_mode="HTML")
+            return
+        last_claim = int(row[1] or 0)
+        streak = int(row[2] or 0)
+        if last_claim and now - last_claim < day_seconds:
+            remaining = day_seconds - (now - last_claim)
+            next_streak = min(30, max(1, streak + 1))
+            next_reward = get_daily_reward_amount(next_streak)
+            await db.rollback()
+            await msg.reply(
+                "⏳ <b>Ежедневный бонус уже получен</b>\n\n"
+                f"До следующего: {format_duration(remaining)}\n"
+                f"Следующая награда (день {next_streak}/30): {format_money(next_reward)}",
+                parse_mode="HTML"
+            )
+            return
+        if last_claim and now - last_claim >= 2 * day_seconds:
+            streak = 0
+        streak = min(30, streak + 1)
+        reward = get_daily_reward_amount(streak)
+        await db.execute(
+            "UPDATE users SET balance = balance + ?, last_daily_claim = ?, daily_streak = ? WHERE id = ?",
+            (reward, now, streak, uid)
+        )
+        await db.commit()
+    text = "✅ <b>Ежедневный бонус получен!</b>\n\n"
+    text += f"День: <b>{streak}/30</b>\n"
+    text += f"Награда: <b>{format_money(reward)}</b>\n"
+    if last_claim and now - last_claim >= 2 * day_seconds:
+        text += "\n⚠️ Серия была сброшена из-за пропуска.\n"
+    await msg.reply(text, parse_mode="HTML")
 @router.message(F.text.lower().startswith(("кд", "cd", "кулдаун")))
 async def cd_text_cmd(msg: Message):
     await check_bonus_cd(msg)
@@ -7477,7 +8597,8 @@ async def get_bonus_cb(cb: CallbackQuery):
     await cb.answer()
 @router.callback_query(F.data == "get_daily")
 async def get_daily_callback(cb: CallbackQuery):
-    await cb.answer("Ежедневный бонус отключен.", show_alert=True)
+    await process_daily_reward(cb.message)
+    await cb.answer()
 @router.callback_query(F.data == "play_crash")
 async def play_crash_callback(cb: CallbackQuery):
     """Обработка нажатия на кнопку Краш"""
@@ -8590,6 +9711,8 @@ async def economy_cmd(msg: Message):
     await msg.answer(text, parse_mode="HTML", reply_markup=markup)
 # "... (MVP)
 creating_clan = {}
+creating_transport_company = {}
+creating_construction_company = {}
 @router.message(F.text.lower().startswith("создать клан "))
 async def create_clan_name(msg: Message):
     """Создание клана с названием"""
@@ -8690,6 +9813,117 @@ async def create_clan_name_from_prompt(msg: Message):
     except Exception as e:
         logger.error(f"Ошибка create_clan_name_from_prompt: {e}")
         await msg.reply("Ошибка создания клана.")
+@router.message(lambda msg: bool(msg.text) and creating_transport_company.get(msg.from_user.id))
+async def create_transport_company_name_from_prompt(msg: Message):
+    uid = msg.from_user.id
+    if not creating_transport_company.get(uid):
+        return
+    name = msg.text.strip() if msg.text else ""
+    if not name:
+        return
+    cancel_words = {"otmena", "отмена"}
+    if name.lower() in cancel_words:
+        creating_transport_company.pop(uid, None)
+        await msg.reply("Создание ТК отменено.")
+        return
+    if name.startswith("/"):
+        await msg.reply("Название ТК не должно начинаться с команды. Напишите другое имя.")
+        return
+    if len(name) < 3 or len(name) > 30:
+        await msg.reply("Название ТК должно быть от 3 до 30 символов.")
+        return
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            balance = (await cursor.fetchone())[0]
+            if balance < TRANSPORT_CREATE_COST:
+                await db.rollback()
+                await msg.reply("Недостаточно денег для создания ТК.")
+                return
+            cursor = await db.execute(
+                "SELECT 1 FROM transport_companies WHERE owner_user_id = ?",
+                (uid,)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("У вас уже есть транспортная компания.")
+                return
+            now = int(time.time())
+            await db.execute(
+                "INSERT INTO transport_companies (name, owner_user_id, created_at) VALUES (?, ?, ?)",
+                (name, uid, now)
+            )
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE id = ?",
+                (TRANSPORT_CREATE_COST, uid)
+            )
+            await db.commit()
+        creating_transport_company.pop(uid, None)
+        await msg.reply(f"Транспортная компания '{name}' создана!")
+        text, reply_markup = await build_transport_menu(uid)
+        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Ошибка create_transport_company_name_from_prompt: {e}")
+        await msg.reply("Ошибка создания ТК.")
+@router.message(lambda msg: bool(msg.text) and creating_construction_company.get(msg.from_user.id))
+async def create_construction_company_name_from_prompt(msg: Message):
+    uid = msg.from_user.id
+    if not creating_construction_company.get(uid):
+        return
+    name = msg.text.strip() if msg.text else ""
+    if not name:
+        return
+    cancel_words = {"otmena", "отмена"}
+    if name.lower() in cancel_words:
+        creating_construction_company.pop(uid, None)
+        await msg.reply("Создание СК отменено.")
+        return
+    if name.startswith("/"):
+        await msg.reply("Название СК не должно начинаться с команды. Напишите другое имя.")
+        return
+    if len(name) < 3 or len(name) > 30:
+        await msg.reply("Название СК должно быть от 3 до 30 символов.")
+        return
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            balance = (await cursor.fetchone())[0]
+            if balance < CONSTRUCTION_CREATE_COST:
+                await db.rollback()
+                await msg.reply("Недостаточно денег для создания СК.")
+                return
+            cursor = await db.execute(
+                "SELECT 1 FROM construction_companies WHERE owner_user_id = ?",
+                (uid,)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("У вас уже есть строительная компания.")
+                return
+            now = int(time.time())
+            cursor = await db.execute(
+                "INSERT INTO construction_companies (name, owner_user_id, created_at) VALUES (?, ?, ?)",
+                (name, uid, now)
+            )
+            company_id = cursor.lastrowid
+            await db.execute(
+                "INSERT INTO construction_resources (company_id, workers, materials, land) VALUES (?, 0, 0, 0)",
+                (company_id,)
+            )
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE id = ?",
+                (CONSTRUCTION_CREATE_COST, uid)
+            )
+            await db.commit()
+        creating_construction_company.pop(uid, None)
+        await msg.reply(f"Строительная компания '{name}' создана!")
+        text, reply_markup = await build_construction_menu(uid)
+        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Ошибка create_construction_company_name_from_prompt: {e}")
+        await msg.reply("Ошибка создания СК.")
 # ========== ОБНОВЛЕНИЕ ЮЗЕРНЕЙМА ==========
 @router.message()
 async def update_username_handler(msg: Message):
