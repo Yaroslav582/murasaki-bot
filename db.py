@@ -67,6 +67,25 @@ async def init_db() -> None:
                     income_boost_until_ts INTEGER DEFAULT 0,
                     total_wagered_today BIGINT DEFAULT 0,
                     wagered_reset_ts INTEGER DEFAULT 0,
+                    pickaxe_level INTEGER DEFAULT 0,
+                    mine_last_ts INTEGER DEFAULT 0,
+                    ore_stone BIGINT DEFAULT 0,
+                    ore_coal BIGINT DEFAULT 0,
+                    ore_copper BIGINT DEFAULT 0,
+                    ore_iron BIGINT DEFAULT 0,
+                    ore_emerald BIGINT DEFAULT 0,
+                    ore_diamond BIGINT DEFAULT 0,
+                    ore_ancient BIGINT DEFAULT 0,
+                    fishing_boat_level INTEGER DEFAULT 0,
+                    fishing_rod_level INTEGER DEFAULT 0,
+                    fishing_tackle_level INTEGER DEFAULT 0,
+                    fishing_last_ts INTEGER DEFAULT 0,
+                    fishing_exp INTEGER DEFAULT 0,
+                    fishing_level INTEGER DEFAULT 1,
+                    fishing_location INTEGER DEFAULT 1,
+                    fish_caught_total INTEGER DEFAULT 0,
+                    taxi_active_car TEXT,
+                    taxi_last_ts INTEGER DEFAULT 0,
                     specialization TEXT DEFAULT NULL,
                     specialization_changed_ts INTEGER DEFAULT 0
                 )
@@ -92,6 +111,17 @@ async def init_db() -> None:
                     reward_remaining BIGINT DEFAULT 0,
                     rep_remaining INTEGER DEFAULT 0,
                     created_ts INTEGER DEFAULT 0
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_fish (
+                    user_id INTEGER,
+                    fish_code TEXT,
+                    count INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, fish_code)
                 )
                 """
             )
@@ -199,6 +229,111 @@ async def init_db() -> None:
                     amount BIGINT,
                     end_time INTEGER,
                     successful BOOLEAN DEFAULT NULL
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_taxi_cars (
+                    user_id INTEGER,
+                    car_code TEXT,
+                    count INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, car_code)
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_taxi_park (
+                    user_id INTEGER PRIMARY KEY,
+                    level INTEGER DEFAULT 1,
+                    last_collect_ts INTEGER DEFAULT 0
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_taxi_park_cars (
+                    user_id INTEGER,
+                    car_code TEXT,
+                    count INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, car_code)
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transport_companies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    owner_user_id INTEGER UNIQUE NOT NULL,
+                    office_code TEXT DEFAULT NULL,
+                    active_truck_code TEXT DEFAULT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transport_trucks (
+                    company_id INTEGER NOT NULL,
+                    truck_code TEXT NOT NULL,
+                    count INTEGER DEFAULT 0,
+                    PRIMARY KEY (company_id, truck_code)
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transport_orders (
+                    company_id INTEGER PRIMARY KEY,
+                    cargo_code TEXT NOT NULL,
+                    income INTEGER NOT NULL,
+                    risk INTEGER NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    ends_at INTEGER NOT NULL
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS construction_companies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    owner_user_id INTEGER UNIQUE NOT NULL,
+                    office_level INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS construction_resources (
+                    company_id INTEGER PRIMARY KEY,
+                    workers INTEGER DEFAULT 0,
+                    materials INTEGER DEFAULT 0,
+                    land INTEGER DEFAULT 0
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS construction_projects (
+                    company_id INTEGER PRIMARY KEY,
+                    project_code TEXT NOT NULL,
+                    income INTEGER NOT NULL,
+                    risk INTEGER NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    ends_at INTEGER NOT NULL
                 )
                 """
             )
