@@ -67,7 +67,7 @@ def cleanup_lock_file():
 check_single_instance()
 print("🔥 ФАЙЛ ЗАПУЩЕН")
 # ========== НАСТРОЙКИ ==========
-TOKEN = "7558734655:AAEUBQ2FiU-I3838E5q7XO1AmrBIMKBaYK8"
+TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA"
 ADMIN_IDS = {1162907446}
 CREATOR_ID = 1162907446
 # ========== НАСТРОЙКА ПУТИ К БД (RAILWAY VOLUMES) ==========
