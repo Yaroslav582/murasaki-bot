@@ -67,7 +67,7 @@ def cleanup_lock_file():
 check_single_instance()
 print("🔥 ФАЙЛ ЗАПУЩЕН")
 # ========== НАСТРОЙКИ ==========
-TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA"
+TOKEN = "7558734655:AAEUBQ2FiU-I3838E5q7XO1AmrBIMKBaYK8"
 ADMIN_IDS = {1162907446}
 CREATOR_ID = 1162907446
 # ========== НАСТРОЙКА ПУТИ К БД (RAILWAY VOLUMES) ==========
@@ -722,6 +722,40 @@ logger = logging.getLogger(__name__)
 # Включить подробные логи
 logging.getLogger('aiogram').setLevel(logging.DEBUG)
 router = Router()
+
+@router.message(Command("боссы", "bosses", "страны", "countries", "шахта", "mine"))
+@router.message(F.text.lower().in_([
+    "боссы", "/боссы", "bosses", "/bosses",
+    "страны", "/страны", "countries", "/countries",
+    "шахта", "/шахта", "mine", "/mine"
+]))
+async def quick_command_router(msg: Message):
+    text = (msg.text or "").strip().lower()
+    if text in {"боссы", "/боссы", "bosses", "/bosses"}:
+        text, reply_markup = await build_bosses_panel(msg.from_user.id)
+        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+        return
+    if text in {"страны", "/страны", "countries", "/countries"}:
+        await show_country_selection(msg)
+        return
+    if text in {"шахта", "/шахта", "mine", "/mine"}:
+        text, reply_markup = await build_mine_panel(msg.from_user.id)
+        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+        return
+
+@router.message(lambda msg: bool(msg.text) and (
+    globals().get("creating_transport_company", {}).get(msg.from_user.id)
+    or globals().get("creating_construction_company", {}).get(msg.from_user.id)
+))
+async def handle_company_name_prompt_early(msg: Message):
+    uid = msg.from_user.id
+    name = msg.text.strip()
+    if globals().get("creating_transport_company", {}).get(uid):
+        await _create_transport_company_from_name(uid, name, msg)
+        return
+    if globals().get("creating_construction_company", {}).get(uid):
+        await _create_construction_company_from_name(uid, name, msg)
+        return
 @router.message(F.text.lower().startswith("купить планету"))
 async def buy_planet_cmd(msg: Message):
     try:
@@ -1887,6 +1921,8 @@ async def transport_company_create_cb(cb: CallbackQuery):
         await cb.answer("Недостаточно денег для создания ТК.", show_alert=True)
         return
     creating_transport_company[uid] = True
+    logger.info(f"TC create prompt set uid={uid}")
+    await cb.answer()
     await cb.message.answer("Введите название ТК или напишите 'отмена'.")
 @router.callback_query(F.data == "tc_offices")
 async def transport_company_offices_cb(cb: CallbackQuery):
@@ -2310,6 +2346,8 @@ async def construction_company_create_cb(cb: CallbackQuery):
         await cb.answer("Недостаточно денег для создания СК.", show_alert=True)
         return
     creating_construction_company[uid] = True
+    logger.info(f"SC create prompt set uid={uid}")
+    await cb.answer()
     await cb.message.answer("Введите название СК или напишите 'отмена'.")
 @router.callback_query(F.data == "sc_offices")
 async def construction_company_offices_cb(cb: CallbackQuery):
@@ -8675,8 +8713,11 @@ async def all_investment_callbacks(cb: CallbackQuery):
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu_callback(cb: CallbackQuery):
     """Вернуться в главное меню"""
+    try:
+        await cb.answer()
+    except TelegramBadRequest:
+        pass
     await send_welcome_message(cb.message, force_menu=True, edit=True)
-    await cb.answer()
 # ========== СУЩЕСТВУЮЩИЕ CALLBACK ОБРАБОТЧИКИ ==========
 @router.callback_query(F.data == "copy_ref_link")
 async def copy_ref_link_cb(cb: CallbackQuery):
@@ -9187,9 +9228,12 @@ async def coin_flip_cb(cb: CallbackQuery):
     await cb.message.edit_text(text, parse_mode="HTML")
     await cb.answer()
 # ========== НОВЫЕ MESSAGE ХЕНДЛЕРЫ ==========
-@router.message(F.text.lower().in_(["страны", "countries"]))
+@router.message(Command("countries"))
+@router.message(Command("страны"))
+@router.message(F.text.lower().in_(["страны", "countries", "/страны", "/countries", "🌍 страны"]))
 async def countries_command(msg: Message):
     """Команда 'страны'"""
+    logger.info(f"CMD countries hit uid={msg.from_user.id} text={msg.text!r}")
     await show_country_selection(msg)
 async def show_my_country_msg(msg: Message):
     uid = msg.from_user.id
@@ -9670,9 +9714,12 @@ async def war_confirm_token_msg(msg: Message):
 @router.message(F.text.lower() == "да")
 async def war_confirm_yes_msg(msg: Message):
     await _handle_war_confirm(msg, None)
-@router.message(F.text.lower().in_(["боссы", "bosses"]))
+@router.message(Command("bosses"))
+@router.message(Command("боссы"))
+@router.message(F.text.lower().in_(["боссы", "bosses", "/боссы", "/bosses", "🐉 боссы", "👹 боссы"]))
 async def bosses_command(msg: Message):
     """Команда 'боссы'"""
+    logger.info(f"CMD bosses hit uid={msg.from_user.id} text={msg.text!r}")
     text, reply_markup = await build_bosses_panel(msg.from_user.id)
     await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
 # Глобальная переменная для создания клана (MVP)
@@ -9844,6 +9891,113 @@ async def economy_cmd(msg: Message):
 creating_clan = {}
 creating_transport_company = {}
 creating_construction_company = {}
+
+
+async def _create_transport_company_from_name(uid: int, name: str, msg: Message):
+    if not name:
+        return
+    logger.info(f"TC create attempt uid={uid} name='{name}'")
+    cancel_words = {"otmena", "nazad", "отмена", "назад"}
+    if name.lower() in cancel_words:
+        creating_transport_company.pop(uid, None)
+        await msg.reply("Создание ТК отменено.")
+        return
+    if name.startswith("/"):
+        await msg.reply("Название ТК не должно начинаться с команды. Напишите другое имя.")
+        return
+    if len(name) < 3 or len(name) > 30:
+        await msg.reply("Название ТК должно быть от 3 до 30 символов.")
+        return
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            balance = (await cursor.fetchone())[0]
+            if balance < TRANSPORT_CREATE_COST:
+                await db.rollback()
+                await msg.reply("Недостаточно денег для создания ТК.")
+                return
+            cursor = await db.execute(
+                "SELECT 1 FROM transport_companies WHERE owner_user_id = ?",
+                (uid,)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("У вас уже есть транспортная компания.")
+                return
+            now = int(time.time())
+            await db.execute(
+                "INSERT INTO transport_companies (name, owner_user_id, created_at) VALUES (?, ?, ?)",
+                (name, uid, now)
+            )
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE id = ?",
+                (TRANSPORT_CREATE_COST, uid)
+            )
+            await db.commit()
+        creating_transport_company.pop(uid, None)
+        await msg.reply(f"Транспортная компания '{name}' создана!")
+        text, reply_markup = await build_transport_menu(uid)
+        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Ошибка create_transport_company_name_from_prompt: {e}")
+        await msg.reply("Ошибка создания ТК.")
+
+
+async def _create_construction_company_from_name(uid: int, name: str, msg: Message):
+    if not name:
+        return
+    logger.info(f"SC create attempt uid={uid} name='{name}'")
+    cancel_words = {"otmena", "nazad", "отмена", "назад"}
+    if name.lower() in cancel_words:
+        creating_construction_company.pop(uid, None)
+        await msg.reply("Создание СК отменено.")
+        return
+    if name.startswith("/"):
+        await msg.reply("Название СК не должно начинаться с команды. Напишите другое имя.")
+        return
+    if len(name) < 3 or len(name) > 30:
+        await msg.reply("Название СК должно быть от 3 до 30 символов.")
+        return
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
+            balance = (await cursor.fetchone())[0]
+            if balance < CONSTRUCTION_CREATE_COST:
+                await db.rollback()
+                await msg.reply("Недостаточно денег для создания СК.")
+                return
+            cursor = await db.execute(
+                "SELECT 1 FROM construction_companies WHERE owner_user_id = ?",
+                (uid,)
+            )
+            if await cursor.fetchone():
+                await db.rollback()
+                await msg.reply("У вас уже есть строительная компания.")
+                return
+            now = int(time.time())
+            cursor = await db.execute(
+                "INSERT INTO construction_companies (name, owner_user_id, created_at) VALUES (?, ?, ?)",
+                (name, uid, now)
+            )
+            company_id = cursor.lastrowid
+            await db.execute(
+                "INSERT INTO construction_resources (company_id, workers, materials, land) VALUES (?, 0, 0, 0)",
+                (company_id,)
+            )
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE id = ?",
+                (CONSTRUCTION_CREATE_COST, uid)
+            )
+            await db.commit()
+        creating_construction_company.pop(uid, None)
+        await msg.reply(f"Строительная компания '{name}' создана!")
+        text, reply_markup = await build_construction_menu(uid)
+        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Ошибка create_construction_company_name_from_prompt: {e}")
+        await msg.reply("Ошибка создания СК.")
 @router.message(F.text.lower().startswith("создать клан "))
 async def create_clan_name(msg: Message):
     """Создание клана с названием"""
@@ -9950,116 +10104,70 @@ async def create_transport_company_name_from_prompt(msg: Message):
     if not creating_transport_company.get(uid):
         return
     name = msg.text.strip() if msg.text else ""
-    if not name:
-        return
-    cancel_words = {"otmena", "отмена"}
-    if name.lower() in cancel_words:
-        creating_transport_company.pop(uid, None)
-        await msg.reply("Создание ТК отменено.")
-        return
-    if name.startswith("/"):
-        await msg.reply("Название ТК не должно начинаться с команды. Напишите другое имя.")
-        return
-    if len(name) < 3 or len(name) > 30:
-        await msg.reply("Название ТК должно быть от 3 до 30 символов.")
-        return
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
-            balance = (await cursor.fetchone())[0]
-            if balance < TRANSPORT_CREATE_COST:
-                await db.rollback()
-                await msg.reply("Недостаточно денег для создания ТК.")
-                return
-            cursor = await db.execute(
-                "SELECT 1 FROM transport_companies WHERE owner_user_id = ?",
-                (uid,)
-            )
-            if await cursor.fetchone():
-                await db.rollback()
-                await msg.reply("У вас уже есть транспортная компания.")
-                return
-            now = int(time.time())
-            await db.execute(
-                "INSERT INTO transport_companies (name, owner_user_id, created_at) VALUES (?, ?, ?)",
-                (name, uid, now)
-            )
-            await db.execute(
-                "UPDATE users SET balance = balance - ? WHERE id = ?",
-                (TRANSPORT_CREATE_COST, uid)
-            )
-            await db.commit()
-        creating_transport_company.pop(uid, None)
-        await msg.reply(f"Транспортная компания '{name}' создана!")
-        text, reply_markup = await build_transport_menu(uid)
-        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Ошибка create_transport_company_name_from_prompt: {e}")
-        await msg.reply("Ошибка создания ТК.")
+    await _create_transport_company_from_name(uid, name, msg)
+
+
+@router.message(F.text.lower().startswith(("создать тк ", "тк ")))
+async def create_transport_company_inline_cmd(msg: Message):
+    text = msg.text.strip()
+    lower = text.lower()
+    if lower.startswith("создать тк "):
+        name = text[len("создать тк "):].strip()
+    else:
+        name = text[3:].strip()
+    uid = msg.from_user.id
+    await _create_transport_company_from_name(uid, name, msg)
+
+
+@router.message(F.text.lower() == "создать тк")
+async def create_transport_company_prompt_cmd(msg: Message):
+    uid = msg.from_user.id
+    creating_transport_company[uid] = True
+    logger.info(f"TC create prompt set via text uid={uid}")
+    await msg.reply("Введите название ТК или напишите 'отмена'.")
 @router.message(lambda msg: bool(msg.text) and creating_construction_company.get(msg.from_user.id))
 async def create_construction_company_name_from_prompt(msg: Message):
     uid = msg.from_user.id
     if not creating_construction_company.get(uid):
         return
     name = msg.text.strip() if msg.text else ""
-    if not name:
-        return
-    cancel_words = {"otmena", "отмена"}
-    if name.lower() in cancel_words:
-        creating_construction_company.pop(uid, None)
-        await msg.reply("Создание СК отменено.")
-        return
-    if name.startswith("/"):
-        await msg.reply("Название СК не должно начинаться с команды. Напишите другое имя.")
-        return
-    if len(name) < 3 or len(name) > 30:
-        await msg.reply("Название СК должно быть от 3 до 30 символов.")
-        return
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute("SELECT balance FROM users WHERE id = ?", (uid,))
-            balance = (await cursor.fetchone())[0]
-            if balance < CONSTRUCTION_CREATE_COST:
-                await db.rollback()
-                await msg.reply("Недостаточно денег для создания СК.")
-                return
-            cursor = await db.execute(
-                "SELECT 1 FROM construction_companies WHERE owner_user_id = ?",
-                (uid,)
-            )
-            if await cursor.fetchone():
-                await db.rollback()
-                await msg.reply("У вас уже есть строительная компания.")
-                return
-            now = int(time.time())
-            cursor = await db.execute(
-                "INSERT INTO construction_companies (name, owner_user_id, created_at) VALUES (?, ?, ?)",
-                (name, uid, now)
-            )
-            company_id = cursor.lastrowid
-            await db.execute(
-                "INSERT INTO construction_resources (company_id, workers, materials, land) VALUES (?, 0, 0, 0)",
-                (company_id,)
-            )
-            await db.execute(
-                "UPDATE users SET balance = balance - ? WHERE id = ?",
-                (CONSTRUCTION_CREATE_COST, uid)
-            )
-            await db.commit()
-        creating_construction_company.pop(uid, None)
-        await msg.reply(f"Строительная компания '{name}' создана!")
-        text, reply_markup = await build_construction_menu(uid)
-        await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Ошибка create_construction_company_name_from_prompt: {e}")
-        await msg.reply("Ошибка создания СК.")
+    await _create_construction_company_from_name(uid, name, msg)
+
+
+@router.message(F.text.lower().startswith(("создать ск ", "ск ")))
+async def create_construction_company_inline_cmd(msg: Message):
+    text = msg.text.strip()
+    lower = text.lower()
+    if lower.startswith("создать ск "):
+        name = text[len("создать ск "):].strip()
+    else:
+        name = text[3:].strip()
+    uid = msg.from_user.id
+    await _create_construction_company_from_name(uid, name, msg)
+
+
+@router.message(F.text.lower() == "создать ск")
+async def create_construction_company_prompt_cmd(msg: Message):
+    uid = msg.from_user.id
+    creating_construction_company[uid] = True
+    logger.info(f"SC create prompt set via text uid={uid}")
+    await msg.reply("Введите название СК или напишите 'отмена'.")
 # ========== ОБНОВЛЕНИЕ ЮЗЕРНЕЙМА ==========
-@router.message()
+@router.message(F.text & ~F.text.lower().in_([
+    "страны", "/страны", "countries", "/countries", "🌍 страны",
+    "боссы", "/боссы", "bosses", "/bosses", "🐉 боссы", "👹 боссы",
+    "шахта", "/шахта", "mine", "/mine"
+]))
 async def update_username_handler(msg: Message):
     uid = msg.from_user.id
     username = msg.from_user.username
+    if msg.text:
+        if creating_transport_company.get(uid):
+            await _create_transport_company_from_name(uid, msg.text.strip(), msg)
+            return
+        if creating_construction_company.get(uid):
+            await _create_construction_company_from_name(uid, msg.text.strip(), msg)
+            return
     await auto_accumulate_bitcoin(uid)
     if username:
         await update_username(uid, username)
@@ -14813,12 +14921,15 @@ async def build_mine_sell_menu(uid: int):
         ])
     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="mine_menu")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
-@router.message(Command("шахта", "mine"))
+@router.message(Command("mine"))
+@router.message(Command("шахта"))
 async def mine_cmd(msg: Message):
+    logger.info(f"CMD mine hit uid={msg.from_user.id} text={msg.text!r}")
     text, reply_markup = await build_mine_panel(msg.from_user.id)
     await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
-@router.message(F.text.lower().startswith(("шахта", "mine")))
+@router.message(F.text.lower().startswith(("шахта", "mine", "/шахта", "/mine")))
 async def mine_text_cmd(msg: Message):
+    logger.info(f"CMD mine text hit uid={msg.from_user.id} text={msg.text!r}")
     text, reply_markup = await build_mine_panel(msg.from_user.id)
     await msg.answer(text, parse_mode="HTML", reply_markup=reply_markup)
 @router.callback_query(F.data == "mine_menu")
