@@ -67,32 +67,35 @@ def cleanup_lock_file():
 check_single_instance()
 print("🔥 ФАЙЛ ЗАПУЩЕН")
 # ========== НАСТРОЙКИ ==========
-TOKEN = "8424494037:AAHrtN5irOGb7SzLQicLHCPQt9p5o8FF_sA"
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN env var is required")
 ADMIN_IDS = {1162907446}
 CREATOR_ID = 1162907446
 # ========== НАСТРОЙКА ПУТИ К БД (RAILWAY VOLUMES) ==========
 def get_db_path():
-    """Определяет путь к БД в зависимости от окружения"""
-    # Если запущено на Railway (проверяем переменную окружения)
-    if os.getenv('RAILWAY_ENVIRONMENT'):
-        # Путь к volume на Railway
-        data_dir = '/data'
-        # Создаем директорию если её нет
-        if not os.path.exists(data_dir):
-            try:
-                os.makedirs(data_dir, exist_ok=True)
-                print(f"✅ Создана директория: {data_dir}")
-            except Exception as e:
-                print(f"⚠️ Не удалось создать {data_dir}: {e}")
-                # Используем текущую директорию как fallback
-                return "murasaki_NEW.db"
-        db_path = os.path.join(data_dir, 'murasaki_NEW.db')
-        print(f"🗄️ Railway БД: {db_path}")
+    """Get DB path based on environment."""
+    env_path = os.getenv("DB_PATH")
+    if env_path:
+        return env_path
+
+    data_dir = None
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        data_dir = "/data"
+    elif os.getenv("RENDER"):
+        data_dir = os.getenv("RENDER_DISK_PATH", "/data")
+
+    if data_dir:
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+        except Exception as e:
+            print(f"WARN: could not create {data_dir}: {e}")
+            return "murasaki_NEW.db"
+        db_path = os.path.join(data_dir, "murasaki_NEW.db")
         return db_path
-    else:
-        # Локальная разработка
-        print("💻 Локальная БД: murasaki_NEW.db")
-        return "murasaki_NEW.db"
+
+    print("Local DB: murasaki_NEW.db")
+    return "murasaki_NEW.db"
 DB_PATH = get_db_path()
 HELP_COMMANDS = {
     "Профиль и старт": [
