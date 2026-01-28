@@ -16,6 +16,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.enums import ChatType
+from aiohttp import web
 import sys
 import os
 import db
@@ -1036,7 +1037,7 @@ BOSS_LIFETIME = 24 * 60 * 60  # 24 часа жизни босса
 ORE_MINE_COOLDOWN = 120  # 2 минуты между копанием
 FISHING_COOLDOWN = 5  # 5 секунд между попытками рыбалки
 TAXI_COOLDOWN = 300  # 5 ????? ????? ?????????
-INCOME_MULTIPLIER = 1.0
+INCOME_MULTIPLIER = 1 / 1.5
 PRICE_MULTIPLIER = 0.8
 COUNTRY_INCOME_MULTIPLIER = 2 * INCOME_MULTIPLIER
 
@@ -11747,7 +11748,26 @@ async def periodic_population_growth():
             logger.error(f"Error in periodic_population_growth: {e}")
         await asyncio.sleep(3600)
 
+async def start_health_server() -> web.AppRunner:
+    """Start lightweight HTTP server for Koyeb health checks."""
+    app = web.Application()
+
+    async def health_handler(_request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/healthz", health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info(f"Health server started on port {port}")
+    return runner
+
 async def main():
+    health_runner = None
 
     # Инициализируем БД
     await init_db()
@@ -11763,6 +11783,7 @@ async def main():
     # Запускаем проверку мировых событий
     asyncio.create_task(periodic_world_events())
     asyncio.create_task(periodic_population_growth())
+    health_runner = await start_health_server()
     # Логируем запуск
     logger.info("✅ Бот запущен! Используйте команды:")
     logger.info("  /start или 'меню' - главное меню")
@@ -11783,6 +11804,8 @@ async def main():
     finally:
         # Закрываем сессию бота для избежания предупреждений
         await bot.close()
+        if health_runner:
+            await health_runner.cleanup()
 async def update_population(country_id):
     import random
     now = int(time.time())
